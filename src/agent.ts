@@ -421,6 +421,10 @@ export class WorkflowAgent {
       // Per-call model wins over any sessionOptions.model.
       ...(resolvedModel ? { model: resolvedModel } : {}),
     });
+    // createAgentSession loads configured extensions, but session_start hooks only
+    // run after binding. Many extensions register or activate tools there, so bind
+    // headlessly to expose the same generic tool set to workflow subagents.
+    await session.bindExtensions({});
 
     let removeAbortListener: (() => void) | undefined;
     let removeHistoryListener: (() => void) | undefined;

@@ -1,13 +1,11 @@
 /**
- * Real-session integration test for issue #26 — provider usage-limit handling.
+ * Real-session integration tests for WorkflowAgent.run.
  *
- * Every other test injects a fake agent runner; this one drives the REAL
- * `WorkflowAgent.run` → `createAgentSession` path and uses the pi SDK's built-in
- * FAUX provider to end a turn in a "usage limit reached" error (stopReason
- * "error" + errorMessage), exactly as a real provider buries a quota exhaustion.
- * It is the contract guard for the load-bearing SDK assumption behind the fix:
- * a usage limit surfaces as an error-status assistant message, not a thrown error.
- * No network call is made and NO provider quota is consumed.
+ * Most tests inject a fake agent runner; these drive the REAL
+ * `WorkflowAgent.run` → `createAgentSession` path and use the pi SDK's built-in
+ * FAUX provider, so no network call is made and NO provider quota is consumed.
+ * The usage-limit cases guard the load-bearing SDK assumption behind issue #26:
+ * quota exhaustion surfaces as an error-status assistant message, not a thrown error.
  */
 
 import assert from "node:assert/strict";
@@ -16,6 +14,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { DefaultResourceLoader, defineTool, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
@@ -106,6 +106,48 @@ test("a successful real turn whose text merely mentions 'rate limit' is NOT misc
     const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
     const text = await agent.run("do the task", { label: "ok" });
     assert.ok(typeof text === "string" && text.includes("Done."), `expected normal text, got ${String(text)}`);
+  }));
+
+test("a real subagent session binds extensions so session_start-registered tools become active", () =>
+  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+    let sessionStartRan = false;
+    let activeAfterRegistration: string[] = [];
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          pi.on("session_start", () => {
+            sessionStartRan = true;
+            pi.registerTool(
+              defineTool({
+                name: "late_session_tool",
+                description: "Tool registered from session_start",
+                parameters: Type.Object({}),
+                async execute() {
+                  return { content: [{ type: "text", text: "late tool result" }] };
+                },
+              }),
+            );
+            activeAfterRegistration = pi.getActiveTools();
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never, resourceLoader } });
+    const text = await agent.run("do the task", { label: "extension-bind" });
+
+    assert.equal(text, "ok");
+    assert.equal(sessionStartRan, true, "subagents must emit session_start by binding extensions");
+    assert.ok(
+      activeAfterRegistration.includes("late_session_tool"),
+      `expected late_session_tool to be active, got ${activeAfterRegistration.join(", ")}`,
+    );
   }));
 
 test("through the manager: a usage limit pauses the run (not fails) and resume replays the journal", () =>
