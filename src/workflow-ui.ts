@@ -6,7 +6,7 @@
  *        ◀── (saved items in runs view) ──enter──▶ saved detail
  *
  * Keys: ↑/↓ (or j/k) select · enter/→ drill in · esc/← back (esc at top closes)
- *       On runs: p pause · x stop · r restart · s save · q quit
+ *       On runs: p pause · x stop · d remove · r restart · s save · q quit
  *       On saved: x delete · q quit
  *
  * The state machine and line rendering are pure and unit-tested; the pi-tui
@@ -465,7 +465,7 @@ function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLi
       const itemKind = model.saved().length > 0 ? state.itemKindAt(model, state.cursor) : "run";
       parts.push("↑/↓ select", "enter open", "esc back");
       if (itemKind === "run") {
-        parts.push("p pause", "x stop", "r restart", "s save");
+        parts.push("p pause", "x stop", "d remove", "r restart", "s save");
       } else {
         parts.push("x delete");
       }
@@ -492,6 +492,7 @@ export type NavAction =
   | { type: "stop" }
   | { type: "restart" }
   | { type: "save" }
+  | { type: "deleteRun" }
   | { type: "deleteSaved" }
   | { type: "none" };
 
@@ -521,6 +522,10 @@ export function keyToAction(keyId: string | undefined, kind: ViewKind, itemKind?
     case "x":
       if (kind === "savedDetail" || itemKind === "saved") return { type: "deleteSaved" };
       return { type: "stop" };
+    case "d":
+    case "delete":
+      if (kind === "runs" && itemKind === "run") return { type: "deleteRun" };
+      return { type: "none" };
     case "r":
       return { type: "restart" };
     case "s":
@@ -614,6 +619,11 @@ export function openWorkflowNavigator(
           case "stop": {
             const id = state.activeRunId(model);
             if (id) ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
+            break;
+          }
+          case "deleteRun": {
+            const id = state.activeRunId(model);
+            if (id) ui.notify(manager.deleteRun(id) ? `Removed ${id}` : `No run ${id}`, "info");
             break;
           }
           case "restart": {

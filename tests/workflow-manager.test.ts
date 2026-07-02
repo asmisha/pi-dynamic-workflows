@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -346,6 +346,44 @@ test(
     assert.equal(persisted?.status, "aborted");
     assert.equal(persisted?.pauseReason, undefined);
     assert.equal(persisted?.resetHint, undefined);
+  }),
+);
+
+test(
+  "live-locked runs not owned by this manager are hidden and not mutated",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    const runId = "external-live";
+    const persistence = manager.getPersistence();
+    persistence.save({
+      runId,
+      workflowName: "other_session",
+      script: oneAgentScript,
+      status: "running",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    writeFileSync(
+      join(persistence.getRunsDir(), `${runId}.lock`),
+      JSON.stringify({
+        runId,
+        runPath: join(persistence.getRunsDir(), `${runId}.json`),
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        token: "other-manager",
+      }),
+    );
+
+    assert.equal(
+      manager.listRuns().some((r) => r.runId === runId),
+      false,
+    );
+    assert.equal(manager.stop(runId), false);
+    assert.equal(manager.deleteRun(runId), false);
+    assert.equal(persistence.load(runId)?.status, "running");
   }),
 );
 
@@ -1277,6 +1315,11 @@ test(
 
     da.resolve("done");
     await promise.catch(() => {});
+    assert.equal(
+      manager.listRuns().find((r) => r.runId === runId),
+      undefined,
+      "deleted run should not be recreated when the aborted execution unwinds",
+    );
   }),
 );
 

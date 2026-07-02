@@ -440,7 +440,10 @@ export class WorkflowAgent {
     try {
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
       if (options.signal) {
-        const onAbort = () => void session.abort();
+        const onAbort = () => {
+          session.abortBash();
+          void session.abort();
+        };
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }

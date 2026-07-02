@@ -387,6 +387,12 @@ test("keyToAction maps keys per view and itemKind", () => {
   assert.deepEqual(keyToAction("s", "runs", "run"), { type: "save" });
   assert.deepEqual(keyToAction("s", "runs", "saved"), { type: "none" });
 
+  // 'd' / Delete = remove run from the top-level runs list only
+  assert.deepEqual(keyToAction("d", "runs", "run"), { type: "deleteRun" });
+  assert.deepEqual(keyToAction("delete", "runs", "run"), { type: "deleteRun" });
+  assert.deepEqual(keyToAction("d", "runs", "saved"), { type: "none" });
+  assert.deepEqual(keyToAction("d", "phases"), { type: "none" });
+
   // 'p' and 'r' unchanged
   assert.deepEqual(keyToAction("p", "runs"), { type: "pause" });
   assert.deepEqual(keyToAction("r", "runs"), { type: "restart" });
@@ -653,10 +659,12 @@ test("renderNavigator footer hint changes based on item under cursor", () => {
   state.cursor = 0;
   const runText = renderNavigator(state, model, 80).join("\n");
   assert.notEqual(runText.indexOf("x stop"), -1, "run item should show x stop");
+  assert.notEqual(runText.indexOf("d remove"), -1, "run item should show d remove");
 
   // Cursor on a saved item (position 1)
   state.cursor = 1;
   const savedText = renderNavigator(state, model, 80).join("\n");
   assert.notEqual(savedText.indexOf("x delete"), -1, "saved item should show x delete");
   assert.equal(savedText.indexOf("x stop"), -1, "saved item should NOT show x stop");
+  assert.equal(savedText.indexOf("d remove"), -1, "saved item should NOT show d remove");
 });

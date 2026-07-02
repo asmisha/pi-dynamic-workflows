@@ -32,6 +32,8 @@ export interface ManagedRun {
   journal: JournalEntry[];
   /** Cross-process execution lease for this run, when it is actively executing. */
   lease?: RunLease;
+  /** True after the user removes the run; suppresses final persistence from the unwinding execution. */
+  deleted?: boolean;
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -390,6 +392,11 @@ export class WorkflowManager extends EventEmitter {
         },
       });
 
+      if (managed.deleted) {
+        this.releaseRunLease(managed);
+        return result;
+      }
+
       managed.status = "completed";
       managed.result = result;
       this.emit("complete", { runId: managed.runId, result });
@@ -425,6 +432,11 @@ export class WorkflowManager extends EventEmitter {
         managed.status = "failed";
       }
       managed.error = workflowError;
+      if (managed.deleted) {
+        this.releaseRunLease(managed);
+        throw workflowError;
+      }
+
       if (usageLimitPaused) {
         this.emit("paused", {
           runId: managed.runId,
@@ -451,6 +463,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private persistRun(managed: ManagedRun) {
+    if (managed.deleted) return;
     try {
       this.persistence.save({
         runId: managed.runId,
@@ -566,6 +579,11 @@ export class WorkflowManager extends EventEmitter {
     return true;
   }
 
+  private hasLiveExternalOwner(runId: string): boolean {
+    const lock = this.persistence.getRunLock(runId);
+    return Boolean(lock?.alive && !this.runs.has(runId));
+  }
+
   /**
    * Stop a running or paused workflow.
    */
@@ -582,17 +600,18 @@ export class WorkflowManager extends EventEmitter {
       return true;
     }
 
-    // A paused run may only exist on disk after a quota checkpoint, manual pause,
-    // or crash recovery. There is no live controller to abort; mark the persisted
-    // checkpoint aborted so it leaves the active task panel and cannot resume.
+    // A paused/running checkpoint with a live lock but no in-memory run belongs
+    // to another manager/Pi session. This manager cannot safely stop it, and the
+    // UI filters it out; leave it alone.
     const persisted = this.persistence.load(runId);
     if (!persisted || (persisted.status !== "running" && persisted.status !== "paused")) return false;
+    if (this.hasLiveExternalOwner(runId)) return false;
 
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
     try {
-      const latest = this.persistence.load(runId);
-      if (!latest || (latest.status !== "running" && latest.status !== "paused")) return false;
+      const latest = this.persistence.load(runId) ?? persisted;
+      if (latest.status !== "running" && latest.status !== "paused") return false;
       this.persistence.save({ ...latest, status: "aborted", pauseReason: undefined, resetHint: undefined });
       this.emit("stopped", { runId });
       return true;
@@ -617,7 +636,7 @@ export class WorkflowManager extends EventEmitter {
    * reappear when you switch back. Unbound (tests/legacy) returns everything.
    */
   listRuns(): PersistedRunState[] {
-    const all = this.persistence.list();
+    const all = this.persistence.list().filter((r) => !this.hasLiveExternalOwner(r.runId));
     return this.sessionId ? all.filter((r) => r.sessionId === this.sessionId) : all;
   }
 
@@ -634,13 +653,27 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * Delete a persisted run.
+   * Delete a persisted run. If this manager owns it, abort it first so the
+   * deleted record is not recreated while the execution unwinds. Live runs owned
+   * by another manager/Pi session are ignored; listRuns() filters them out.
    */
   deleteRun(runId: string): boolean {
     const managed = this.runs.get(runId);
-    if (managed) this.releaseRunLease(managed);
-    this.runs.delete(runId);
-    return this.persistence.delete(runId);
+    if (managed) {
+      managed.deleted = true;
+      managed.controller.abort();
+      managed.status = "aborted";
+      this.releaseRunLease(managed);
+      this.runs.delete(runId);
+      this.persistence.delete(runId);
+      this.emit("stopped", { runId });
+      return true;
+    }
+
+    if (this.hasLiveExternalOwner(runId)) return false;
+    const deleted = this.persistence.delete(runId);
+    if (deleted) this.emit("stopped", { runId });
+    return deleted;
   }
 
   /**

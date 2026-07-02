@@ -70,6 +70,8 @@ export interface RunPersistence {
   list(): PersistedRunState[];
   /** Delete a persisted run. */
   delete(runId: string): boolean;
+  /** Inspect the current run lock, if any. */
+  getRunLock(runId: string): RunLockInfo | null;
   /**
    * Acquire an exclusive cross-process lease for a run. Returns null when another
    * live process owns the run; stale/corrupt lock files are removed and retried.
@@ -84,6 +86,13 @@ export interface RunPersistence {
 export interface RunLease {
   runId: string;
   token: string;
+}
+
+export interface RunLockInfo extends RunLease {
+  runPath: string;
+  pid: number;
+  startedAt: string;
+  alive: boolean;
 }
 
 interface LockFile {
@@ -248,6 +257,12 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       } catch {
         return deleted;
       }
+    },
+
+    getRunLock(runId: string): RunLockInfo | null {
+      const lock = readLock(runId) ?? readLockAt(legacyLockPath(runId));
+      if (!lock || lock.runId !== runId) return null;
+      return { ...lock, alive: pidIsAlive(lock.pid) };
     },
 
     acquireRunLease(runId: string): RunLease | null {
