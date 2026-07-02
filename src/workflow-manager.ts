@@ -34,6 +34,8 @@ export interface ManagedRun {
   lease?: RunLease;
   /** True after the user removes the run; suppresses final persistence from the unwinding execution. */
   deleted?: boolean;
+  /** True once the run's execution fully unwound (final state persisted, lease released). */
+  finalized?: boolean;
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -103,6 +105,11 @@ export class WorkflowManager extends EventEmitter {
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
+  /** Short-TTL cache for listRuns(): the task panel re-renders on every run event,
+   * and an uncached list re-reads + re-parses every persisted run file each time. */
+  private runsCache?: { at: number; runs: PersistedRunState[] };
+  /** Pending debounced persists, keyed by runId (journal saves are coalesced). */
+  private persistTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -115,7 +122,20 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
-    this.persistence = createRunPersistence(this.cwd);
+    // Wrap the persistence writers so ANY save/delete (including direct calls via
+    // getPersistence()) invalidates the listRuns() cache.
+    const persistence = createRunPersistence(this.cwd);
+    this.persistence = {
+      ...persistence,
+      save: (state, opts) => {
+        this.runsCache = undefined;
+        persistence.save(state, opts);
+      },
+      delete: (runId) => {
+        this.runsCache = undefined;
+        return persistence.delete(runId);
+      },
+    };
     this.recoverStaleRuns();
   }
 
@@ -329,10 +349,12 @@ export class WorkflowManager extends EventEmitter {
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
         onAgentJournal: (entry) => {
-          // Append (crash-safe-ish): keep the latest entry per index, then persist.
-          managed.journal = managed.journal.filter((e) => e.index !== entry.index);
-          managed.journal.push(entry);
-          this.persistRun(managed);
+          // Keep the latest entry per index, then persist (debounced: journal flushes
+          // rewrite the whole run file, so per-agent-completion writes are coalesced).
+          const existing = managed.journal.findIndex((e) => e.index === entry.index);
+          if (existing >= 0) managed.journal[existing] = entry;
+          else managed.journal.push(entry);
+          this.schedulePersist(managed);
         },
         onLog: (message) => {
           managed.snapshot.logs.push(message);
@@ -392,7 +414,8 @@ export class WorkflowManager extends EventEmitter {
         },
       });
 
-      if (managed.deleted) {
+      if (managed.deleted || managed.finalized) {
+        managed.finalized = true;
         this.releaseRunLease(managed);
         return result;
       }
@@ -403,6 +426,7 @@ export class WorkflowManager extends EventEmitter {
 
       // Persist final state
       this.persistRun(managed);
+      managed.finalized = true;
       this.releaseRunLease(managed);
 
       return result;
@@ -418,10 +442,12 @@ export class WorkflowManager extends EventEmitter {
 
       const usageLimitPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
+      let abortedByHost = false;
       if (managed.controller.signal.aborted) {
         // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
         if (managed.status === "running") {
           managed.status = "aborted";
+          abortedByHost = true; // Esc/external abort: no pause()/stop() emitted an event
         }
       } else if (usageLimitPaused) {
         // Provider quota/usage limit: NOT a failure. Checkpoint the run as paused so
@@ -432,7 +458,11 @@ export class WorkflowManager extends EventEmitter {
         managed.status = "failed";
       }
       managed.error = workflowError;
-      if (managed.deleted) {
+      if (managed.deleted || managed.finalized) {
+        // Removed, or already finalized by pause()/stop() (which persisted the
+        // final state and released the lease) — do not persist again: another
+        // process may have legitimately taken the run over since.
+        managed.finalized = true;
         this.releaseRunLease(managed);
         throw workflowError;
       }
@@ -444,12 +474,19 @@ export class WorkflowManager extends EventEmitter {
           error: workflowError,
           resetHint: workflowError.resetHint,
         });
-      } else {
+      } else if (abortedByHost) {
+        // Host abort (Esc / external signal): the run was stopped, not failed —
+        // pause()/stop() paths already emitted their own event before this unwind.
+        this.emit("stopped", { runId: managed.runId });
+      } else if (!managed.controller.signal.aborted) {
         this.emit("error", { runId: managed.runId, error: workflowError });
       }
 
-      // Persist final state
+      // Persist final state. The lease is held until here — pause()/stop() do not
+      // release it early, so another process cannot resume this run and have its
+      // state clobbered by this late persist.
       this.persistRun(managed);
+      managed.finalized = true;
       this.releaseRunLease(managed);
 
       throw workflowError;
@@ -462,53 +499,82 @@ export class WorkflowManager extends EventEmitter {
     managed.lease = undefined;
   }
 
+  /**
+   * Debounced persist for hot-path saves (journal flushes). Coalesces a burst of
+   * agent completions into one full-file write; status transitions persist
+   * immediately via persistRun() (which cancels any pending flush).
+   */
+  private schedulePersist(managed: ManagedRun): void {
+    if (managed.deleted || managed.finalized) return;
+    if (this.persistTimers.has(managed.runId)) return;
+    const timer = setTimeout(() => {
+      this.persistTimers.delete(managed.runId);
+      if (managed.deleted || managed.finalized) return;
+      this.persistRun(managed);
+    }, 250);
+    (timer as { unref?: () => void }).unref?.();
+    this.persistTimers.set(managed.runId, timer);
+  }
+
+  private cancelScheduledPersist(runId: string): void {
+    const timer = this.persistTimers.get(runId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.persistTimers.delete(runId);
+  }
+
   private persistRun(managed: ManagedRun) {
     if (managed.deleted) return;
+    this.cancelScheduledPersist(managed.runId);
     try {
-      this.persistence.save({
-        runId: managed.runId,
-        workflowName: managed.snapshot.name,
-        // Persist the real script + journal so the run can be resumed. Runs live
-        // in workflow run storage — protect via directory permissions, not blanking.
-        script: managed.script,
-        args: managed.args,
-        sessionId: this.sessionId,
-        journal: managed.journal,
-        status: managed.status,
-        // Why a usage-limit pause happened, so the navigator / a future cold start
-        // can show it and (eventually) re-arm resume after the budget refills.
-        pauseReason:
-          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
-            ? "usage_limit"
+      this.persistence.save(
+        {
+          runId: managed.runId,
+          workflowName: managed.snapshot.name,
+          // Persist the real script + journal so the run can be resumed. Runs live
+          // in workflow run storage — protect via directory permissions, not blanking.
+          script: managed.script,
+          args: managed.args,
+          sessionId: this.sessionId,
+          journal: managed.journal,
+          status: managed.status,
+          // Why a usage-limit pause happened, so the navigator / a future cold start
+          // can show it and (eventually) re-arm resume after the budget refills.
+          pauseReason:
+            managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+              ? "usage_limit"
+              : undefined,
+          resetHint:
+            managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+              ? managed.error.resetHint
+              : undefined,
+          phases: managed.snapshot.phases,
+          currentPhase: managed.snapshot.currentPhase,
+          agents: managed.snapshot.agents.map((a) => ({
+            ...a,
+            startedAt: managed.startedAt.toISOString(),
+            endedAt: new Date().toISOString(),
+          })),
+          logs: managed.snapshot.logs,
+          result: managed.result?.result,
+          tokenUsage: managed.snapshot.tokenUsage
+            ? {
+                input: managed.snapshot.tokenUsage.input,
+                output: managed.snapshot.tokenUsage.output,
+                total: managed.snapshot.tokenUsage.total,
+                cost: managed.snapshot.tokenUsage.cost,
+                cacheRead: managed.snapshot.tokenUsage.cacheRead,
+                cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
+              }
             : undefined,
-        resetHint:
-          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
-            ? managed.error.resetHint
-            : undefined,
-        phases: managed.snapshot.phases,
-        currentPhase: managed.snapshot.currentPhase,
-        agents: managed.snapshot.agents.map((a) => ({
-          ...a,
           startedAt: managed.startedAt.toISOString(),
-          endedAt: new Date().toISOString(),
-        })),
-        logs: managed.snapshot.logs,
-        result: managed.result?.result,
-        tokenUsage: managed.snapshot.tokenUsage
-          ? {
-              input: managed.snapshot.tokenUsage.input,
-              output: managed.snapshot.tokenUsage.output,
-              total: managed.snapshot.tokenUsage.total,
-              cost: managed.snapshot.tokenUsage.cost,
-              cacheRead: managed.snapshot.tokenUsage.cacheRead,
-              cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
-            }
-          : undefined,
-        startedAt: managed.startedAt.toISOString(),
-        updatedAt: new Date().toISOString(),
-        completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
-        durationMs: managed.result?.durationMs,
-      });
+          updatedAt: new Date().toISOString(),
+          completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
+          durationMs: managed.result?.durationMs,
+          // Skip the .bak sidecar while the run is hot; final states keep the backup.
+        },
+        { backup: managed.status !== "running" },
+      );
     } catch (err) {
       // Persistence is best-effort: the run is still healthy in memory.
       // Log so an operator debugging state-loss has a lead, but never crash
@@ -527,7 +593,11 @@ export class WorkflowManager extends EventEmitter {
     managed.controller.abort();
     managed.status = "paused";
     this.emit("paused", { runId });
+    // Persist the final paused state and release the lease NOW so the run is
+    // immediately resumable; `finalized` suppresses the unwinding execution's
+    // own late persist, which could otherwise clobber a subsequent resume.
     this.persistRun(managed);
+    managed.finalized = true;
     this.releaseRunLease(managed);
     return true;
   }
@@ -595,7 +665,10 @@ export class WorkflowManager extends EventEmitter {
       managed.controller.abort();
       managed.status = "aborted";
       this.emit("stopped", { runId });
+      // Same contract as pause(): persist the final state, mark finalized so the
+      // unwinding execution's late persist is suppressed, release the lease.
       this.persistRun(managed);
+      managed.finalized = true;
       this.releaseRunLease(managed);
       return true;
     }
@@ -636,7 +709,18 @@ export class WorkflowManager extends EventEmitter {
    * reappear when you switch back. Unbound (tests/legacy) returns everything.
    */
   listRuns(): PersistedRunState[] {
-    const all = this.persistence.list().filter((r) => !this.hasLiveExternalOwner(r.runId));
+    const now = Date.now();
+    // 300ms TTL: the task panel calls this on every run event; without a cache
+    // each call re-reads and re-parses every persisted run file plus a lock file
+    // and a pid liveness probe per run. Writers invalidate via the wrapped
+    // persistence, so the TTL only bounds staleness from OTHER processes.
+    if (!this.runsCache || now - this.runsCache.at > 300) {
+      this.runsCache = {
+        at: now,
+        runs: this.persistence.list().filter((r) => !this.hasLiveExternalOwner(r.runId)),
+      };
+    }
+    const all = this.runsCache.runs;
     return this.sessionId ? all.filter((r) => r.sessionId === this.sessionId) : all;
   }
 
@@ -663,6 +747,7 @@ export class WorkflowManager extends EventEmitter {
       managed.deleted = true;
       managed.controller.abort();
       managed.status = "aborted";
+      this.cancelScheduledPersist(runId);
       this.releaseRunLease(managed);
       this.runs.delete(runId);
       this.persistence.delete(runId);

@@ -1,17 +1,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
-  createEffortState,
   createWorkflowStorage,
   createWorkflowTool,
   installResultDelivery,
   installTaskPanel,
-  installWorkflowEditor,
   loadWorkflowSettings,
   registerAllSavedWorkflows,
-  registerBuiltinWorkflows,
-  registerEffortCommand,
   registerWorkflowCommands,
   registerWorkflowModelsCommand,
+  registerWorkflowProgressCommands,
   saveWorkflowSettingsForCwd,
   WorkflowManager,
 } from "../src/index.js";
@@ -32,19 +29,13 @@ export default function extension(pi: ExtensionAPI) {
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });
   pi.registerTool(workflowTool);
-  // Standing /effort opt-in (off|high|ultra): auto-arms a workflow for substantive
-  // messages, like CC's ultracode. Shared with the editor's input hook below and
-  // with the explicit /workflows run <prompt> manual trigger.
-  const effort = createEffortState();
-  registerWorkflowCommands(pi, manager, { storage, cwd, effort });
+  registerWorkflowCommands(pi, manager, { storage, cwd });
   registerWorkflowModelsCommand(pi);
-  registerBuiltinWorkflows(pi, { cwd });
+  registerWorkflowProgressCommands(pi, {
+    load: () => loadWorkflowSettings({ cwd }),
+    save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, cwd),
+  });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
-  registerEffortCommand(pi, effort);
-  // "Workflows mode": type `workflow(s)` to arm a forced workflow (animated),
-  // Backspace right after the word disarms it. Registers the `input` hook now;
-  // the editor itself is installed once the UI is available (session_start).
-  let editorInstalled = false;
 
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
     // Tell the manager the session's main model so "explore" agents auto-tier
@@ -70,18 +61,7 @@ export default function extension(pi: ExtensionAPI) {
     }
     // Deliver a background run's result into the conversation when it finishes.
     installResultDelivery(pi, manager);
-    // Live "workflows running" panel below the input (focus + enter to open).
-    // Pass a live settings loader so /workflows-progress (compact|detailed) takes
-    // effect without a restart.
+    // Live "workflows running" panel below the input.
     installTaskPanel(pi, manager, ctx.ui, { storage, cwd, loadSettings: () => loadWorkflowSettings({ cwd }) });
-    if (!editorInstalled) {
-      installWorkflowEditor(pi, ctx.ui, effort, {
-        settingsStore: {
-          load: () => loadWorkflowSettings({ cwd }),
-          save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, cwd),
-        },
-      });
-      editorInstalled = true;
-    }
   });
 }

@@ -579,9 +579,9 @@ test(
     const ac = new AbortController();
     const da = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
-    let errorEmitted = false;
-    manager.on("error", () => {
-      errorEmitted = true;
+    let stoppedEmitted = false;
+    manager.on("stopped", () => {
+      stoppedEmitted = true;
     });
 
     // runSync with externalSignal links the abort controller to the manager
@@ -612,7 +612,7 @@ test(
       assert.ok((err as WorkflowError).recoverable, "abort error should be recoverable");
     }
 
-    assert.equal(errorEmitted, true, "manager should emit 'error' event on abort");
+    assert.equal(stoppedEmitted, true, "manager should emit 'stopped' event on host abort");
   }),
 );
 
@@ -1468,15 +1468,19 @@ test(
 );
 
 test(
-  "manager emits 'error' event on abort with WorkflowError",
+  "host abort yields a WorkflowError rejection and a 'stopped' event (not 'error')",
   withTempCwd(async (cwd) => {
     const ac = new AbortController();
     const da = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
 
-    let capturedError: { runId: string; error: WorkflowError } | null = null;
-    manager.on("error", (ev: { runId: string; error: WorkflowError }) => {
-      capturedError = ev;
+    let stoppedEvent: { runId: string } | null = null;
+    let errorEmitted = false;
+    manager.on("stopped", (ev: { runId: string }) => {
+      stoppedEvent = ev;
+    });
+    manager.on("error", () => {
+      errorEmitted = true;
     });
 
     const runPromise = manager.runSync(oneAgentScript, undefined, {
@@ -1486,15 +1490,17 @@ test(
     ac.abort();
     da.resolve("done");
 
+    let thrown: unknown;
     try {
       await runPromise;
-    } catch {
-      /* expected */
+    } catch (err) {
+      thrown = err;
     }
 
-    assert.ok(capturedError, "error event should fire on abort");
-    assert.ok(capturedError?.error instanceof WorkflowError, "error should be instance of WorkflowError");
-    assert.equal(capturedError?.error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.ok(thrown instanceof WorkflowError, "rejection should be a WorkflowError");
+    assert.equal((thrown as WorkflowError).code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.ok(stoppedEvent, "stopped event should fire on host abort");
+    assert.equal(errorEmitted, false, "host abort is a stop, not an error");
   }),
 );
 

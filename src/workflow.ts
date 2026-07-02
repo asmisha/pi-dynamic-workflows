@@ -17,7 +17,6 @@ import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CO
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
-import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 export interface WorkflowMetaPhase {
   title: string;
@@ -102,7 +101,6 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     phase?: string;
     result: unknown;
     tokens?: number;
-    worktree?: string;
     model?: string;
     error?: string;
     errorCode?: WorkflowErrorCode;
@@ -155,7 +153,6 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * no configured entry it falls back to the session's main model.
    */
   tier?: string;
-  isolation?: "worktree";
   /**
    * Name of a registered subagent definition (`.pi/agents/<name>.md`, project >
    * user). Binds that definition's tool allow/denylist, model, and body prompt
@@ -423,19 +420,6 @@ export async function runWorkflow<T = unknown>(
 
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
 
-      // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
-      // Precedence: explicit call-site isolation > agentDef isolation.
-      // Note: passing { isolation: undefined } falls through ?? to the def's value — there
-      // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
-      // or override with a def that has no isolation field if opt-out is needed.
-      let worktree: Worktree | undefined;
-      const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
-      if (resolvedIsolation === "worktree") {
-        worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
-        if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
-      }
-      const runCwd = worktree?.isolated ? worktree.cwd : undefined;
-
       // Captured from the subagent's real session usage; falls back to an
       // estimate when the provider reports no usage (total === 0). Usage is reset
       // per retry attempt so a failed attempt does not double-count the next one.
@@ -453,103 +437,104 @@ export async function runWorkflow<T = unknown>(
         shared.spent += tokens;
         return tokens;
       };
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        usage = undefined;
+        // Per-attempt abort scope: fires on run abort AND on timeout, so a timed-out
+        // attempt's session is actually torn down instead of running (and consuming
+        // tokens/RAM outside the concurrency cap) until it finishes naturally.
+        const attemptController = new AbortController();
+        const onRunAbort = () => attemptController.abort();
+        if (options.signal?.aborted) attemptController.abort();
+        else options.signal?.addEventListener("abort", onRunAbort, { once: true });
+        try {
+          throwIfAborted();
 
-      try {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          usage = undefined;
-          try {
-            throwIfAborted();
-
-            // Run agent with timeout
-            const result = await withTimeout(
-              agentRunner.run(prompt, {
-                label,
-                schema: agentOptions.schema,
-                signal: options.signal,
-                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
-                model: modelSpec,
-                tier: agentOptions.tier,
-                modelRegistry: options.modelRegistry,
-                toolNames: agentDef?.tools,
-                disallowedToolNames: agentDef?.disallowedTools,
-                cwd: runCwd,
-                onModelResolved: (id: string) => {
-                  displayModel = id;
-                },
-                onModelFallback: (spec: string) => {
-                  // Make the silent degrade visible in /workflows, not just console.
-                  log(`${label}: model "${spec}" unavailable — using the session default`);
-                },
-                onUsage: (u: AgentUsage) => {
-                  usage = u;
-                },
-                onHistory: (history: AgentHistoryEntry[]) => {
-                  options.onAgentHistory?.({ label, phase: assignedPhase, history });
-                },
-              }),
-              timeout,
+          // Run agent with timeout; timeout aborts the attempt's session.
+          const result = await withTimeout(
+            agentRunner.run(prompt, {
               label,
-            );
+              schema: agentOptions.schema,
+              signal: attemptController.signal,
+              instructions: buildAgentInstructions(meta, assignedPhase, agentOptions, agentDef),
+              model: modelSpec,
+              tier: agentOptions.tier,
+              modelRegistry: options.modelRegistry,
+              toolNames: agentDef?.tools,
+              disallowedToolNames: agentDef?.disallowedTools,
+              onModelResolved: (id: string) => {
+                displayModel = id;
+              },
+              onModelFallback: (spec: string) => {
+                // Make the silent degrade visible in /workflows, not just console.
+                log(`${label}: model "${spec}" unavailable — using the session default`);
+              },
+              onUsage: (u: AgentUsage) => {
+                usage = u;
+              },
+              onHistory: (history: AgentHistoryEntry[]) => {
+                options.onAgentHistory?.({ label, phase: assignedPhase, history });
+              },
+            }),
+            timeout,
+            label,
+            () => attemptController.abort(),
+          );
 
-            throwIfAborted();
-            if (isEmptyTextAgentResult(result, agentOptions.schema)) {
-              throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
-                recoverable: true,
-                agentLabel: label,
-              });
-            }
-
-            const tokens = recordTokens(result);
-            options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
-            options.onAgentEnd?.({
-              label,
-              phase: assignedPhase,
-              result,
-              tokens,
-              worktree: runCwd,
-              model: displayModel,
+          throwIfAborted();
+          if (isEmptyTextAgentResult(result, agentOptions.schema)) {
+            throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
+              recoverable: true,
+              agentLabel: label,
             });
-            return result;
-          } catch (error) {
-            if (options.signal?.aborted) throw error;
-
-            const workflowError = wrapError(error, { agentLabel: label });
-            logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
-            const tokens = recordTokens(null);
-
-            if (workflowError.recoverable && attempt < maxAttempts) {
-              log(
-                `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
-              );
-              continue;
-            }
-
-            options.onAgentEnd?.({
-              label,
-              phase: assignedPhase,
-              result: null,
-              tokens,
-              worktree: runCwd,
-              model: displayModel,
-              error: workflowError.message,
-              errorCode: workflowError.code,
-              recoverable: workflowError.recoverable,
-            });
-
-            if (workflowError.recoverable) {
-              log(
-                `agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`,
-              );
-              return null;
-            }
-            throw workflowError;
           }
+
+          const tokens = recordTokens(result);
+          options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
+          options.onAgentEnd?.({
+            label,
+            phase: assignedPhase,
+            result,
+            tokens,
+            model: displayModel,
+          });
+          return result;
+        } catch (error) {
+          if (options.signal?.aborted) throw error;
+
+          const workflowError = wrapError(error, { agentLabel: label });
+          logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
+          const tokens = recordTokens(null);
+
+          if (workflowError.recoverable && attempt < maxAttempts) {
+            log(
+              `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
+            );
+            continue;
+          }
+
+          options.onAgentEnd?.({
+            label,
+            phase: assignedPhase,
+            result: null,
+            tokens,
+            model: displayModel,
+            error: workflowError.message,
+            errorCode: workflowError.code,
+            recoverable: workflowError.recoverable,
+          });
+
+          if (workflowError.recoverable) {
+            log(
+              `agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`,
+            );
+            return null;
+          }
+          throw workflowError;
+        } finally {
+          options.signal?.removeEventListener("abort", onRunAbort);
         }
-        return null;
-      } finally {
-        // Always tear down the worktree, even on timeout/abort.
-        if (worktree?.isolated) await removeWorktree(worktree);
       }
+      return null;
     });
   };
 
@@ -660,7 +645,7 @@ export async function runWorkflow<T = unknown>(
           { length: reviewers },
           (_v, i) => () =>
             agent(
-              `Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.${lenses.length ? ` Focus lens: ${lenses[i % lenses.length]}.` : ""}\n\n${claim}`,
+              `Try to refute this claim using the available tools; real=false if unsure.${lenses.length ? ` Lens: ${lenses[i % lenses.length]}.` : ""}\n\n${claim}`,
               { label: `verify ${i + 1}`, schema: VERIFY_SCHEMA },
             ),
         ),
@@ -688,7 +673,7 @@ export async function runWorkflow<T = unknown>(
                 { length: judges },
                 (_v, j) => () =>
                   agent(
-                    `Score this candidate from 0 to 1 on: ${rubric}. Reply with the score.\n\nCandidate:\n${text}`,
+                    `Score 0-1 on: ${rubric}. 0=unusable, 0.5=acceptable, 1=flawless; use the full range.\n\nCandidate:\n${text}`,
                     {
                       label: `judge ${idx + 1}.${j + 1}`,
                       schema: JUDGE_SCHEMA,
@@ -751,11 +736,14 @@ export async function runWorkflow<T = unknown>(
     properties: { complete: { type: "boolean" }, missing: { type: "array", items: { type: "string" } } },
     required: ["complete"],
   };
-  const completenessCheck = (taskArgs: unknown, results: unknown) =>
-    agent(
-      `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
+  const completenessCheck = (taskArgs: unknown, results: unknown) => {
+    const json = JSON.stringify(results);
+    const clipped = json.length > 4000 ? `${json.slice(0, 4000)}…(truncated)` : json;
+    return agent(
+      `List what is still MISSING for the task (uncovered aspects, unverified claims, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${clipped}`,
       { label: "completeness critic", schema: COMPLETENESS_SCHEMA },
     );
+  };
 
   // Thin bounded-retry / validation-gate combinators. Sugar over the for-loop +
   // agent() pattern, but each attempt is a real agent() call so it auto-journals
@@ -1065,22 +1053,21 @@ function hashAgentCall(
 }
 
 function buildAgentInstructions(
+  meta: WorkflowMeta,
   phase: string | undefined,
   options: AgentOptions,
   def: AgentDefinition | undefined,
-  resolvedIsolation?: "worktree",
 ): string | undefined {
   const lines: string[] = [];
   // A resolved agentType binds a real role prompt (the definition body). Only
   // fall back to the prose hint when the agentType named no known definition.
   if (def?.prompt) lines.push(def.prompt);
   else if (options.agentType) lines.push(`Act as workflow subagent type: ${options.agentType}`);
-  if (phase) lines.push(`Workflow phase: ${phase}`);
-  // Use resolvedIsolation so the annotation fires whether isolation came from
-  // the call site or from the agentDef's isolation field.
-  if (resolvedIsolation) lines.push(`Requested isolation: ${resolvedIsolation}`);
+  // Minimal parent context so the subagent knows what larger task it serves.
+  const context = `You are a subagent in workflow "${meta.name}" (${meta.description})${phase ? `, phase "${phase}"` : ""}.`;
+  lines.push(context);
   // Note: options.model is applied for real via the session, not injected as prose.
-  return lines.length ? lines.join("\n\n") : undefined;
+  return lines.join("\n\n");
 }
 
 function isEmptyTextAgentResult(result: unknown, schema: TSchema | undefined): boolean {
@@ -1102,15 +1089,27 @@ function normalizeAgentRetries(value: unknown): number {
 }
 
 /**
- * Run a promise with a timeout.
+ * Run a promise with a timeout. `onTimeout` fires before the rejection so the
+ * caller can abort the underlying work (otherwise a timed-out subagent session
+ * would keep running — and consuming tokens — outside the concurrency cap).
  */
-async function withTimeout<T>(promise: Promise<T>, ms: number | null, label: string): Promise<T> {
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number | null,
+  label: string,
+  onTimeout?: () => void,
+): Promise<T> {
   if (ms === null) return promise;
 
   let timeoutId: NodeJS.Timeout | undefined;
 
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch {
+        // aborting is best-effort; the timeout error is the real signal
+      }
       reject(
         new WorkflowError(
           `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,

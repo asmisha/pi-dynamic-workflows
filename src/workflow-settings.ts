@@ -7,13 +7,10 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from "./config.js";
+import { MAX_AGENT_RETRIES, MAX_CONCURRENCY } from "./config.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {
-  keywordTriggerEnabled?: boolean;
-  /** Literal keyword that arms workflows mode from interactive input. */
-  keywordTriggerWord?: string;
   defaultAgentTimeoutMs?: number | null;
   /** Default max concurrent agents per run. Clamped to the runtime maximum. */
   defaultConcurrency?: number;
@@ -106,11 +103,6 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const raw = value as Record<string, unknown>;
   const settings: WorkflowSettings = {};
-  if (typeof raw.keywordTriggerEnabled === "boolean") {
-    settings.keywordTriggerEnabled = raw.keywordTriggerEnabled;
-  }
-  const keywordTriggerWord = normalizeKeywordTriggerWord(raw.keywordTriggerWord);
-  if (keywordTriggerWord !== undefined) settings.keywordTriggerWord = keywordTriggerWord;
   if (raw.defaultAgentTimeoutMs === null) {
     settings.defaultAgentTimeoutMs = null;
   } else if (

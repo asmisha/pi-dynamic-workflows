@@ -316,6 +316,8 @@ export class WorkflowAgent {
   private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
   private registry?: ModelRegistry;
+  /** Lazily built once per agent instance (one per run) instead of per subagent. */
+  private settingsManager?: SettingsManager;
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
@@ -402,15 +404,15 @@ export class WorkflowAgent {
     }
 
     const agentDir = getAgentDir();
+    // Use a real SettingsManager to inherit the user's default provider/model
+    // settings (inMemory() would miss ~/.pi/settings.json and could route to an
+    // unauthed model). Built once per run, not once per subagent.
+    this.settingsManager ??= SettingsManager.create(this.cwd, agentDir);
     const { session } = await createAgentSession({
       cwd: runCwd,
       agentDir,
       sessionManager: SessionManager.inMemory(),
-      // Use real SettingsManager to inherit user's default provider/model settings.
-      // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
-      // would fall back to the first available model (e.g. openai-codex) which may
-      // not have valid auth, causing silent empty responses.
-      settingsManager: SettingsManager.create(this.cwd, agentDir),
+      settingsManager: this.settingsManager,
       customTools,
       // Per-run modelRegistry wins over the constructor's shared registry, same
       // precedence as resolveModel() above.
@@ -433,7 +435,9 @@ export class WorkflowAgent {
     const maybeEmitHistory = () => {
       if (!options.onHistory) return;
       const now = Date.now();
-      if (now - lastHistoryEmit < 250) return;
+      // 1s throttle: each emit walks the full message array and triggers a host
+      // render; with 8-16 concurrent agents a tighter cadence hammers the CPU.
+      if (now - lastHistoryEmit < 1000) return;
       lastHistoryEmit = now;
       emitHistory();
     };
@@ -513,13 +517,7 @@ export class WorkflowAgent {
 
     if (structured) {
       parts.push(
-        [
-          "Final output contract:",
-          "- Your final action MUST be a structured_output tool call.",
-          "- The structured_output arguments are the return value of this subagent.",
-          "- Do not emit a prose final answer instead of structured_output.",
-          "- If you need to inspect files or run commands first, do so, then call structured_output exactly once.",
-        ].join("\n"),
+        "Finish by calling structured_output exactly once with the result as its arguments — no prose final answer.",
       );
     }
 

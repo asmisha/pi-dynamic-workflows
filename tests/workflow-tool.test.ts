@@ -77,8 +77,8 @@ test("createWorkflowTool promptGuidelines mention model routing", () => {
 test("createWorkflowTool promptGuidelines keep budget and timeout unbounded by default", () => {
   const tool = createWorkflowTool();
   const all = tool.promptGuidelines.join(" ");
-  assert.match(all, /do not set tokenBudget or agentTimeoutMs/i);
-  assert.match(all, /defaults are unbounded/i);
+  assert.match(all, /don't set tokenBudget\/agentTimeoutMs/i);
+  assert.match(all, /unless the user asks/i);
 });
 
 test("createWorkflowTool schema describes unbounded default timeout", () => {
@@ -103,7 +103,7 @@ test("createWorkflowTool promptGuidelines mention retry and concurrency controls
 
   assert.match(all, /low concurrency/i);
   assert.match(all, /agentRetries/i);
-  assert.match(all, /null handling/i);
+  assert.match(all, /null/i);
 });
 
 // ─── modelRoutingGuideline ──────────────────────────────────────────────────────
@@ -117,8 +117,8 @@ test("modelRoutingGuideline mentions all three tier names", () => {
 
 test("modelRoutingGuideline describes each tier purpose", () => {
   const text = modelRoutingGuideline();
-  assert.ok(text.includes("lightweight"), "should contain lightweight");
-  assert.ok(text.includes("balanced"), "should contain balanced");
+  assert.ok(text.includes("exploration"), "should contain exploration");
+  assert.ok(text.includes("analysis"), "should contain analysis");
   assert.ok(text.includes("synthesis"), "should contain synthesis");
 });
 
@@ -135,11 +135,10 @@ test("modelRoutingGuideline explains tier vs model priority", () => {
 test("modelRoutingGuideline references the model scope (auth-independent)", () => {
   const text = modelRoutingGuideline();
   // With auth configured it lists the available models; on a fresh/CI machine
-  // with no models it falls back to a generic line. Accept either so the test
-  // doesn't depend on the runner's authenticated providers.
+  // with no models the list is simply omitted. Either way tiers are explained.
   assert.ok(
-    text.includes("route only to these") || text.includes("models the user has configured"),
-    "should explain which models are in scope (listed or fallback)",
+    text.includes("Available models:") || text.includes("/workflows-models"),
+    "should explain which models are in scope (listed or via tier config)",
   );
 });
 
@@ -167,7 +166,7 @@ test("createWorkflowTool with custom cwd creates tool", () => {
 test("modelRoutingGuideline advertises models from an injected registry", () => {
   const registry = fakeRegistry([{ provider: "router", id: "shared-model" }]);
   const text = modelRoutingGuideline(registry);
-  assert.match(text, /route only to these/i);
+  assert.match(text, /available models/i);
   assert.match(text, /router\/shared-model/);
 });
 

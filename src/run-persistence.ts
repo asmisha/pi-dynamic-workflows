@@ -62,8 +62,8 @@ export interface PersistedRunState {
 }
 
 export interface RunPersistence {
-  /** Save current run state. */
-  save(state: PersistedRunState): void;
+  /** Save current run state. `backup: false` skips the .bak sidecar (hot-path saves). */
+  save(state: PersistedRunState, opts?: { backup?: boolean }): void;
   /** Load a persisted run by ID. */
   load(runId: string): PersistedRunState | null;
   /** List all persisted runs. */
@@ -178,20 +178,24 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
   };
 
   return {
-    save(state: PersistedRunState) {
+    save(state: PersistedRunState, opts?: { backup?: boolean }) {
       ensureDir();
       state.updatedAt = new Date().toISOString();
       const path = primaryRunPath(state.runId);
-      const json = JSON.stringify(state, null, 2);
+      // Compact JSON: run files are rewritten on every journal flush and can carry
+      // large agent results — pretty-printing inflates every write by ~30%.
+      const json = JSON.stringify(state);
       // Atomic write: a crash mid-write can't corrupt the live file (tmp+rename is
       // atomic on the same filesystem). A .bak from the previous good save is the
       // recovery fallback if the primary is somehow truncated.
       _writeFileSync(`${path}.tmp`, json);
       _renameSync(`${path}.tmp`, path);
-      try {
-        _writeFileSync(`${path}.bak`, json);
-      } catch {
-        // backup is best-effort; the primary write already succeeded
+      if (opts?.backup !== false) {
+        try {
+          _writeFileSync(`${path}.bak`, json);
+        } catch {
+          // backup is best-effort; the primary write already succeeded
+        }
       }
     },
 

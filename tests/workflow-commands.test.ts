@@ -2,9 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createEffortState, effortDirective } from "../src/effort-command.js";
-import { registerWorkflowCommands } from "../src/workflow-commands.js";
-import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "../src/workflow-editor.js";
+import { buildForcedWorkflowPrompt, registerWorkflowCommands, WORKFLOW_TOOL_NAME } from "../src/workflow-commands.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
 
 type Handler = (args: string, ctx: any) => Promise<void>;
@@ -131,14 +129,6 @@ test("/workflows run adds the workflow tool when absent and does not depend on t
   await h.run("run summarize the auth module");
   assert.deepEqual(h.activeTools, ["bash", "read", WORKFLOW_TOOL_NAME]);
   assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("summarize the auth module"));
-});
-
-test("/workflows run carries standing effort directives", async () => {
-  const effort = createEffortState();
-  effort.level = "ultra";
-  const h = harness({}, { effort });
-  await h.run("run do X");
-  assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("do X", effortDirective("ultra")));
 });
 
 test("/workflows stop <id> calls manager.stop", async () => {

@@ -208,9 +208,8 @@ test("buildPrompt injects structured output contract when schema is used", () =>
   const agent = new WorkflowAgent({ cwd: "/tmp" });
   const built: string = (agent as unknown as WorkflowAgentPrivates).buildPrompt("return result", { label: "t" }, true);
   assert.ok(built.includes("structured_output"), "should mention structured_output");
-  assert.ok(built.includes("Final output contract:"), "should include contract header");
-  assert.ok(built.includes("Do not emit a prose final answer"), "should discourage prose");
-  assert.ok(built.includes("call structured_output exactly once"), "should enforce single call");
+  assert.ok(built.includes("no prose final answer"), "should discourage prose");
+  assert.ok(built.includes("calling structured_output exactly once"), "should enforce single call");
 });
 
 test("buildPrompt works without base instructions", () => {
@@ -240,7 +239,7 @@ test("buildPrompt includes both instructions when both base and per-call are set
   assert.ok(built.indexOf("Focus on security.") < built.indexOf("Task label: reviewer"), "per-call before label");
   assert.ok(built.indexOf("Task label: reviewer") < built.indexOf("check this file"), "label before prompt");
   assert.ok(
-    built.indexOf("check this file") < built.indexOf("Final output contract:"),
+    built.indexOf("check this file") < built.indexOf("calling structured_output exactly once"),
     "prompt before structured contract",
   );
 });

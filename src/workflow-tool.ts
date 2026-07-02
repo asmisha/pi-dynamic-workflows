@@ -32,19 +32,12 @@ import { loadWorkflowSettings } from "./workflow-settings.js";
 export function modelRoutingGuideline(registry?: ModelRegistry | (() => ModelRegistry | undefined)): string {
   const resolvedRegistry = typeof registry === "function" ? registry() : registry;
   const available = listAvailableModelSpecs(resolvedRegistry);
-  const list = available.length
-    ? `The user's currently available models (route only to these) are: ${available.join(", ")}.`
-    : "Use models the user has configured.";
-  return [
-    "For workflow, the user configures per-tier models (/workflows-models), so TAG EVERY agent with opts.tier by role so those models are actually used.",
-    "opts.tier accepts 'small', 'medium', or 'big' and is enforced at runtime.",
-    "Small tier: lightweight exploration/search/inventory agents.",
-    "Medium tier: balanced analysis agents.",
-    "Big tier: synthesis/judgment/decision agents spanning the full context.",
-    "An agent with no opts.tier and no opts.model falls back to the user's medium tier; do not rely on that — tag agents explicitly so small/big are used where they fit.",
-    "If the user named a specific model, use opts.model with that exact provider/id; opts.model always takes precedence over opts.tier.",
-    list,
-  ].join(" ");
+  const list = available.length ? ` Available models: ${available.join(", ")}.` : "";
+  return (
+    "Tag EVERY agent with opts.tier — 'small' (exploration/search), 'medium' (analysis), 'big' (synthesis/judgment); " +
+    "the user maps tiers to models via /workflows-models and untagged agents fall back to medium. " +
+    `If the user names a model, pass opts.model with that exact provider/id (overrides tier).${list}`
+  );
 }
 
 /**
@@ -61,17 +54,13 @@ export function agentTypeGuideline(cwd: string = process.cwd()): string | undefi
   }
   if (!types.length) return undefined;
   const list = types.map((t) => (t.description ? `${t.name} (${t.description})` : t.name)).join(", ");
-  return `For workflow, opts.agentType routes an agent to a named definition that binds its tools, model, and role prompt. Available agentTypes: ${list}. An explicit opts.model still overrides the definition's model.`;
+  return `opts.agentType routes an agent to a named definition binding tools, model, and role prompt. Available: ${list}. An explicit opts.model overrides the definition's model.`;
 }
 
 const workflowToolSchema = Type.Object({
   script: Type.String({
-    description: [
-      "Required raw JavaScript workflow script, with no Markdown fences.",
-      "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }",
-      "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once.",
-      "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
-    ].join(" "),
+    description:
+      "Raw JavaScript workflow script (no Markdown fences). Must start with the meta export and call agent() at least once — see the workflow guidelines.",
   }),
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
@@ -79,7 +68,7 @@ const workflowToolSchema = Type.Object({
   background: Type.Optional(
     Type.Boolean({
       description:
-        "Run the workflow in the background. Default: true — the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when it finishes. Set to false only when you need the result inline in this same turn (the call will block until the workflow completes).",
+        "Default true: return immediately with a run ID; the result is delivered back when the run finishes. false blocks for the result inline.",
     }),
   ),
   maxAgents: Type.Optional(
@@ -169,28 +158,20 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     // until the next one.
     get promptGuidelines() {
       return [
-        "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
-        "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
-        "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description', phases: [{ title: 'Phase name' }] }`; meta.name and meta.description are required non-empty strings.",
-        "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
-        "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
-        "For workflow, prefer the built-in quality helpers when they fit (each is built on agent()/parallel() and returns plain data): verify(item, {reviewers, threshold, lens}) for adversarial fact-checking; judgePanel(attempts, {judges, rubric}) to score N candidates and return the best; loopUntilDry({round, key, consecutiveEmpty}) to keep finding until rounds stop yielding new items; completenessCheck(args, results) as a final 'what's missing' critic.",
-        "For workflow, when meta.phases declares more than one phase, call phase('Exact Title') at the start of each phase's work (or set opts.phase on each agent) so every agent groups under the correct phase; never declare a phase you don't switch into — a declared phase with no agents shows as 0/0 and any agent you forgot to move stays in the previous phase.",
-        "For workflow, do not set tokenBudget or agentTimeoutMs unless the user explicitly asks to cap spend or time; the defaults are unbounded.",
-        "For workflow, to bound spend: pass tokenBudget for a hard run-wide cap; carve a per-phase ceiling with phase('Name', {budget: N}) (that phase throws at its sub-budget without touching the run total — wrap its work in try/catch so later phases proceed); use retry(thunk, {attempts, until}) for bounded retry, and gate(thunk, validator, {attempts}) when a validator's feedback should steer the next attempt. To degrade gracefully, branch on budget.remaining() to skip optional rounds or choose a lighter tier.",
-        "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
-        "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
-        "For workflow, pipeline(items, ...stages) runs each item through stages sequentially, while different items may run concurrently. Each stage receives (previousValue, originalItem, index).",
-        "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable.",
-        "For workflow, use low concurrency and agentRetries for unstable provider/transport fan-out runs; retries apply only to recoverable agent failures and still require explicit null handling after exhaustion.",
-        "For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.",
-        "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.",
-        "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
+        "Use workflow only when the user explicitly asks for a workflow, fan-out, or multi-agent orchestration — for decomposable work (repo inspection, independent checks, multi-perspective review, fan-out/fan-in synthesis), not a single quick read/edit.",
+        [
+          "script is one raw JavaScript string — no fences, no prose, no TypeScript/imports/require/fs/Date.now()/Math.random()/new Date(). Skeleton:",
+          "export const meta = { name: 'short_snake_case', description: 'non-empty', phases: [{ title: 'Phase' }] }",
+          "phase('Phase')",
+          "const results = await parallel(items.map(item => () => agent('task + context + paths', { label: 'unique 2-4 words', tier: 'small' })))",
+          "return { ok: true, verdict: '...', results }",
+        ].join("\n"),
+        "Globals: agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(msg), args, cwd, budget, workflow('saved-name', args) (nests one level; global caps hold). Helpers built on agent(): verify(item,{reviewers,lens}), judgePanel(attempts,{judges,rubric}), loopUntilDry({round,key}), completenessCheck(args,results), retry(thunk,{attempts,until}), gate(thunk,validator,{attempts}), checkpoint(prompt,opts).",
+        "parallel() takes thunks — items.map(item => () => agent(...)) — never bare promises. Results keep input order; failed branches return null and log: check for nulls before synthesizing. pipeline() runs stages sequentially per item, items concurrently; each stage gets (prev, original, index).",
+        "Subagents have NO parent context: each prompt must carry the task, relevant paths, and the expected output. For machine-readable output pass a plain JSON Schema via opts.schema (not TypeScript/TypeBox). With multiple phases, call phase('Exact Title') before each phase's work so agents group correctly. End with a synthesis agent when combining results; return a compact JSON-serializable value.",
         modelRoutingGuideline(() => manager.getModelRegistry()),
         agentTypeGuideline(),
-        "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
-        "For workflow, runs are background by default: the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when the run finishes. Pass background: false only when you must use the result inline in this same turn (it will block).",
-        "For workflow, you may call `await workflow('saved-name', argsObject)` to run a saved workflow inline and use its result; nesting is one level deep only, and the global 16-concurrent / 1000-total caps hold across the nesting.",
+        "Runs are background by default (run ID now, result delivered when finished); background: false only when the result is needed inline this turn. Don't set tokenBudget/agentTimeoutMs unless the user asks to cap spend/time; to bound spend use tokenBudget, phase('Name', {budget: N}) (wrap in try/catch), or branch on budget.remaining(). Use low concurrency + agentRetries for flaky provider fan-outs.",
       ].filter((g): g is string => typeof g === "string" && g.length > 0);
     },
     parameters: workflowToolSchema,

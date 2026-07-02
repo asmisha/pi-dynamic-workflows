@@ -5,10 +5,8 @@
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { recomputeWorkflowSnapshot, renderWorkflowText, type WorkflowSnapshot } from "./display.js";
-import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
-import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import { openWorkflowNavigator } from "./workflow-ui.js";
@@ -26,6 +24,22 @@ const USAGE =
   "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
+
+/** The exact name of the workflow tool that `/workflows run` forces. */
+export const WORKFLOW_TOOL_NAME = "workflow";
+
+/** Compact directive appended to a `/workflows run <prompt>` message. */
+export function buildForcedWorkflowPrompt(text: string): string {
+  return [
+    text,
+    "",
+    "---",
+    "Handle this request ONLY by calling the `workflow` tool: write a script that",
+    "fans the task out across subagents with agent()/parallel()/pipeline().",
+    "No prose answer, no subagent tool, no skills — even a small task gets a",
+    "minimal workflow with at least one agent().",
+  ].join("\n");
+}
 
 function summarizeRun(run: PersistedRunState): string {
   const icon = STATUS_ICON[run.status] ?? "?";
@@ -107,11 +121,10 @@ export interface WorkflowCommandOptions {
   storage?: WorkflowStorage;
   /** Working directory for saved workflows registered via `save`. */
   cwd?: string;
-  /** Standing effort mode; when high/ultra, `/workflows run` carries its directive too. */
-  effort?: EffortState;
 }
 
 /** Register the `/workflows` command against the shared manager. Idempotent. */
+
 export function registerWorkflowCommands(
   pi: ExtensionAPI,
   manager: WorkflowManager,
@@ -153,9 +166,7 @@ export function registerWorkflowCommands(
             // ignore — the forced directive is the real forcing primitive
           }
 
-          const effort = opts.effort;
-          const extra = effort && effort.level !== "off" ? effortDirective(effort.level) : undefined;
-          const forced = buildForcedWorkflowPrompt(prompt, extra);
+          const forced = buildForcedWorkflowPrompt(prompt);
           ctx.ui.notify(`Forcing workflow: ${prompt.slice(0, 60)}${prompt.length > 60 ? "…" : ""}`, "info");
           try {
             await pi.sendMessage(

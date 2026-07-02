@@ -382,7 +382,17 @@ export function installTaskPanel(
   ui.setWidget(
     "workflow-tasks",
     (tui: TUI, theme: Theme) => {
-      const onEvent = () => tui.requestRender();
+      // Coalesce render requests: run events arrive in bursts (log/agent/token
+      // events from up to 16 concurrent agents); one render per ~100ms is plenty.
+      let renderTimer: ReturnType<typeof setTimeout> | undefined;
+      const onEvent = () => {
+        if (renderTimer) return;
+        renderTimer = setTimeout(() => {
+          renderTimer = undefined;
+          tui.requestRender();
+        }, 100);
+        (renderTimer as { unref?: () => void }).unref?.();
+      };
       for (const ev of RUN_EVENTS) manager.on(ev, onEvent);
       const onRunEnd = ({ runId }: { runId: string }) => clearTokenSamples(runId);
       for (const ev of RUN_END_EVENTS) manager.on(ev, onRunEnd);
@@ -406,6 +416,7 @@ export function installTaskPanel(
         invalidate: () => {},
         dispose: () => {
           clearInterval(timer);
+          if (renderTimer) clearTimeout(renderTimer);
           for (const ev of RUN_EVENTS) manager.off(ev, onEvent);
           for (const ev of RUN_END_EVENTS) manager.off(ev, onRunEnd);
         },

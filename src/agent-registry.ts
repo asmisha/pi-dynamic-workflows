@@ -13,7 +13,6 @@
  *
  * Bound today: `tools` (allowlist), `disallowedTools` (denylist), `model`,
  * and the markdown body (`prompt`). Parsed-but-ignored for now (documented): `mcp`, `skills`, `background`.
- * Wired: `isolation` ("worktree") → createWorktree() in workflow.ts.
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -33,8 +32,6 @@ export interface AgentDefinition {
   disallowedTools?: string[];
   /** Model spec (`provider/modelId` or bare id) for this subagent. */
   model?: string;
-  /** Isolation mode. When "worktree", agents using this type run in a git worktree. */
-  isolation?: "worktree";
   /** Markdown body, prepended to the subagent's task as role guidance. */
   prompt: string;
   /** Where the definition was loaded from (project wins over user). */
@@ -77,8 +74,6 @@ export function parseAgentDefinition(
     tools: toStringArray(fm.tools),
     disallowedTools: toStringArray(fm.disallowedTools),
     model: typeof fm.model === "string" ? fm.model.trim() || undefined : undefined,
-    isolation:
-      typeof fm.isolation === "string" && fm.isolation.toLowerCase().trim() === "worktree" ? "worktree" : undefined,
     prompt,
     source,
   };
@@ -160,7 +155,6 @@ export function agentDefinitionKey(def: AgentDefinition | undefined): string | n
     tools: def.tools ?? null,
     disallowedTools: def.disallowedTools ?? null,
     model: def.model ?? null,
-    isolation: def.isolation ?? null,
     prompt: def.prompt,
   });
 }
