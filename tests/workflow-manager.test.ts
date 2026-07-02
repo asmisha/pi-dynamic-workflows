@@ -322,6 +322,34 @@ test(
 );
 
 test(
+  "stop aborts a persisted paused workflow with no in-memory runner",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    manager.getPersistence().save({
+      runId: "persisted-paused",
+      workflowName: "old_checkpoint",
+      script: oneAgentScript,
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "Resets in ~3h",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    assert.equal(manager.getRun("persisted-paused"), undefined, "run exists only in persistence");
+    assert.equal(manager.stop("persisted-paused"), true);
+
+    const persisted = manager.listRuns().find((r) => r.runId === "persisted-paused");
+    assert.equal(persisted?.status, "aborted");
+    assert.equal(persisted?.pauseReason, undefined);
+    assert.equal(persisted?.resetHint, undefined);
+  }),
+);
+
+test(
   "pause pauses a running workflow",
   withTempCwd(async (cwd) => {
     const da = deferredAgent();

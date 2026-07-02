@@ -214,10 +214,8 @@ export function registerWorkflowCommands(
         }
         case "stop": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
-          ctx.ui.notify(
-            manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id} (not running)`,
-            manager.getRun(id) ? "info" : "warning",
-          );
+          const stopped = manager.stop(id);
+          ctx.ui.notify(stopped ? `Stopped ${id}` : `Cannot stop ${id} (not running)`, stopped ? "info" : "warning");
           return;
         }
         case "pause": {

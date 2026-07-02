@@ -567,18 +567,38 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * Stop a running workflow.
+   * Stop a running or paused workflow.
    */
   stop(runId: string): boolean {
     const managed = this.runs.get(runId);
-    if (!managed || (managed.status !== "running" && managed.status !== "paused")) return false;
+    if (managed) {
+      if (managed.status !== "running" && managed.status !== "paused") return false;
 
-    managed.controller.abort();
-    managed.status = "aborted";
-    this.emit("stopped", { runId });
-    this.persistRun(managed);
-    this.releaseRunLease(managed);
-    return true;
+      managed.controller.abort();
+      managed.status = "aborted";
+      this.emit("stopped", { runId });
+      this.persistRun(managed);
+      this.releaseRunLease(managed);
+      return true;
+    }
+
+    // A paused run may only exist on disk after a quota checkpoint, manual pause,
+    // or crash recovery. There is no live controller to abort; mark the persisted
+    // checkpoint aborted so it leaves the active task panel and cannot resume.
+    const persisted = this.persistence.load(runId);
+    if (!persisted || (persisted.status !== "running" && persisted.status !== "paused")) return false;
+
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) return false;
+    try {
+      const latest = this.persistence.load(runId);
+      if (!latest || (latest.status !== "running" && latest.status !== "paused")) return false;
+      this.persistence.save({ ...latest, status: "aborted", pauseReason: undefined, resetHint: undefined });
+      this.emit("stopped", { runId });
+      return true;
+    } finally {
+      this.persistence.releaseRunLease(lease);
+    }
   }
 
   /**

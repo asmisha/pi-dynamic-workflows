@@ -352,12 +352,12 @@ test("/workflows stop <id> shows Cannot stop when manager returns false", async 
   assert.equal(h.notified.find((n) => n.message.includes("Cannot stop"))?.type, "warning");
 });
 
-test("/workflows stop <id> notifies info (not warning) when stopped a real run", async () => {
-  const h = harness({ stop: () => true, getRun: () => ({}) });
+test("/workflows stop <id> notifies info (not warning) when manager stops it", async () => {
+  const h = harness({ stop: () => true, getRun: () => undefined });
   await h.run("stop run-active");
   const stopMsg = h.notified.find((n) => n.message.includes("Stopped"));
   assert.ok(stopMsg, "should notify Stopped");
-  assert.equal(stopMsg?.type, "info", "should be info when run was actually running");
+  assert.equal(stopMsg?.type, "info", "should be info when stop succeeds");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
