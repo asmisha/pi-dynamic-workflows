@@ -3,9 +3,16 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import { forkSessionForSubagent, listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
+import {
+  forceCompactionEnabled,
+  forkSessionForSubagent,
+  listAvailableModelSpecs,
+  resolveAgentModelSpec,
+  resolveSubagentSession,
+  WorkflowAgent,
+} from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
@@ -758,4 +765,145 @@ test("forkSessionForSubagent throws a recoverable WorkflowError for a missing fi
       return true;
     },
   );
+});
+
+test("resolveSubagentSession defaults to an in-memory temp session", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-matrix-"));
+  try {
+    const { sessionManager, cleanup } = resolveSubagentSession({}, root);
+    try {
+      assert.equal(sessionManager.isPersisted(), false);
+      assert.equal(sessionManager.getSessionFile(), undefined);
+    } finally {
+      cleanup();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveSubagentSession creates and continues a persisted sessionPath", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-matrix-"));
+  try {
+    const target = join(root, "persisted.jsonl");
+    const first = resolveSubagentSession({ sessionPath: target }, root);
+    try {
+      assert.equal(first.sessionManager.isPersisted(), true);
+      assert.equal(first.sessionManager.getSessionFile(), target);
+      first.sessionManager.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "persist me" }],
+      } as Parameters<SessionManager["appendMessage"]>[0]);
+      first.sessionManager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "persisted" }],
+        stopReason: "stop",
+      } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+      assert.equal(existsSync(target), true);
+    } finally {
+      first.cleanup();
+    }
+
+    const second = resolveSubagentSession({ sessionPath: target }, root);
+    try {
+      const text = JSON.stringify(second.sessionManager.buildSessionContext().messages);
+      assert.ok(text.includes("persist me"), "existing sessionPath is continued");
+    } finally {
+      second.cleanup();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveSubagentSession can fork into a new persistent sessionPath", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-matrix-"));
+  try {
+    const sourceDir = join(root, "source");
+    const source = SessionManager.create(root, sourceDir);
+    source.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "forked context" }],
+    } as Parameters<SessionManager["appendMessage"]>[0]);
+    source.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "ready" }],
+      stopReason: "stop",
+    } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+    const sourcePath = source.getSessionFile();
+    assert.ok(sourcePath);
+    const sourceBytes = readFileSync(sourcePath as string, "utf-8");
+
+    const target = join(root, "child.jsonl");
+    const fork = resolveSubagentSession({ forkFrom: sourcePath as string, sessionPath: target }, root);
+    try {
+      assert.equal(fork.sessionManager.getSessionFile(), target);
+      assert.equal(existsSync(target), true, "fork is persisted at the requested path immediately");
+      const text = JSON.stringify(fork.sessionManager.buildSessionContext().messages);
+      assert.ok(text.includes("forked context"));
+      assert.equal(readFileSync(sourcePath as string, "utf-8"), sourceBytes, "source session is not mutated");
+    } finally {
+      fork.cleanup();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveSubagentSession rejects forkFrom + existing sessionPath", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-matrix-"));
+  try {
+    const sourceDir = join(root, "source");
+    const source = SessionManager.create(root, sourceDir);
+    source.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "source" }],
+    } as Parameters<SessionManager["appendMessage"]>[0]);
+    source.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "ready" }],
+      stopReason: "stop",
+    } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+    const sourcePath = source.getSessionFile();
+    assert.ok(sourcePath);
+
+    const target = join(root, "existing.jsonl");
+    const existing = resolveSubagentSession({ sessionPath: target }, root);
+    existing.sessionManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "existing" }],
+    } as Parameters<SessionManager["appendMessage"]>[0]);
+    existing.sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "ready" }],
+      stopReason: "stop",
+    } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+    existing.cleanup();
+
+    assert.throws(
+      () => resolveSubagentSession({ forkFrom: sourcePath as string, sessionPath: target }, root),
+      (err: unknown) => {
+        assert.ok(err instanceof WorkflowError);
+        assert.equal(err.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.equal(err.recoverable, false);
+        assert.match(err.message, /already exists/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("forceCompactionEnabled keeps subagent auto-compaction enabled without needing persisted settings", () => {
+  const settings = {
+    getCompactionEnabled: () => false,
+    getCompactionSettings() {
+      return { enabled: this.getCompactionEnabled(), reserveTokens: 1, keepRecentTokens: 2 };
+    },
+  } as SettingsManager;
+
+  const patched = forceCompactionEnabled(settings);
+  assert.equal(patched.getCompactionEnabled(), true);
+  assert.equal(patched.getCompactionSettings().enabled, true);
 });

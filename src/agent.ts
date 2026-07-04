@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
   AuthStorage,
@@ -20,6 +20,7 @@ import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import { resolveWorkflowSessionPath } from "./workflow-paths.js";
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -263,6 +264,93 @@ export function forkSessionForSubagent(
   }
 }
 
+/** How a subagent's session is sourced and persisted. */
+export interface SubagentSessionSpec {
+  /** Fork this Pi session file (JSONL) as starting context. Never mutated. */
+  forkFrom?: string;
+  /** Persist the subagent's own session here (see resolveWorkflowSessionPath rules). */
+  sessionPath?: string;
+}
+
+/**
+ * Resolve the session manager for a subagent run:
+ *   - neither arg          → temp in-memory session (default; nothing persisted)
+ *   - forkFrom only        → fork into a throwaway temp dir (cleaned up after)
+ *   - sessionPath, exists  → continue that persisted session (appends to it)
+ *   - sessionPath, new     → create a new persisted session at that exact path
+ *   - both, path new       → fork forkFrom and persist the fork at sessionPath
+ *   - both, path exists    → validation error: refusing to clobber an existing
+ *                            session with a fork (delete it or drop one arg)
+ */
+export function resolveSubagentSession(
+  spec: SubagentSessionSpec,
+  cwd: string,
+): { sessionManager: SessionManager; cleanup: () => void } {
+  const noop = () => {};
+  const target = spec.sessionPath ? resolveWorkflowSessionPath(spec.sessionPath) : undefined;
+
+  if (!spec.forkFrom && !target) {
+    return { sessionManager: SessionManager.inMemory(cwd), cleanup: noop };
+  }
+  if (spec.forkFrom && !target) {
+    return forkSessionForSubagent(spec.forkFrom, cwd);
+  }
+  if (!target) throw new Error("unreachable");
+
+  if (spec.forkFrom && existsSync(target)) {
+    throw new WorkflowError(
+      `Validation: sessionPath "${target}" already exists — cannot fork "${spec.forkFrom}" into an existing session. Continue it without forkFrom, or pick a new sessionPath.`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    if (spec.forkFrom) {
+      // Fork writes a generated filename; move it onto the requested path.
+      const forked = SessionManager.forkFrom(spec.forkFrom, cwd, dirname(target));
+      const generated = forked.getSessionFile();
+      if (generated && generated !== target) renameSync(generated, target);
+      forked.setSessionFile(target);
+      return { sessionManager: forked, cleanup: noop };
+    }
+    if (existsSync(target)) {
+      // Continue the existing persisted session in the run's cwd.
+      return { sessionManager: SessionManager.open(target, undefined, cwd), cleanup: noop };
+    }
+    // New persisted session at the exact requested path (the SDK's --session flow:
+    // create in the parent dir, then pin the explicit file path).
+    const manager = SessionManager.create(cwd, dirname(target));
+    manager.setSessionFile(target);
+    return { sessionManager: manager, cleanup: noop };
+  } catch (error) {
+    if (error instanceof WorkflowError) throw error;
+    throw new WorkflowError(
+      `Cannot use sessionPath "${target}": ${error instanceof Error ? error.message : error}`,
+      WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      { recoverable: true },
+    );
+  }
+}
+
+/**
+ * Force auto-compaction ON for a subagent's settings view without writing to the
+ * user's settings file. Headless subagents cannot compact manually, so surviving
+ * a context overflow (SDK: compact + auto-retry) and the threshold compaction
+ * must not depend on the user's interactive setting.
+ */
+export function forceCompactionEnabled(settings: SettingsManager): SettingsManager {
+  const originalGetCompactionSettings = settings.getCompactionSettings.bind(settings);
+  const patched = settings as SettingsManager & {
+    getCompactionEnabled: () => boolean;
+    getCompactionSettings: typeof settings.getCompactionSettings;
+  };
+  patched.getCompactionEnabled = () => true;
+  patched.getCompactionSettings = () => ({ ...originalGetCompactionSettings(), enabled: true });
+  return settings;
+}
+
 /** Real token/cost usage for a single subagent run, read from the SDK session. */
 export interface AgentUsage {
   input: number;
@@ -310,10 +398,18 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   cwd?: string;
   /**
    * Fork this Pi session file (JSONL) so the subagent starts with that
-   * conversation's full context. The source file is never mutated — the fork
-   * lives in a throwaway temp dir that is removed when the subagent finishes.
+   * conversation's full context. The source file is never mutated. Without
+   * `sessionPath` the fork lives in a throwaway temp dir; with it, the fork is
+   * persisted at that path.
    */
-  sessionFile?: string;
+  forkFrom?: string;
+  /**
+   * Persist the subagent's session at this path. An existing file is continued
+   * (its context is inherited and new turns append); a missing file is created.
+   * Bare names/relative paths resolve under ~/.pi/workflows/sessions/. Combined
+   * with `forkFrom` the path must not exist yet (validation error otherwise).
+   */
+  sessionPath?: string;
   /**
    * Restrict the subagent's coding tools to these names (an agentType
    * definition's `tools` allowlist). Undefined = all coding tools. The
@@ -443,17 +539,19 @@ export class WorkflowAgent {
     const agentDir = getAgentDir();
     // Use a real SettingsManager to inherit the user's default provider/model
     // settings (inMemory() would miss ~/.pi/settings.json and could route to an
-    // unauthed model). Built once per run, not once per subagent.
-    this.settingsManager ??= SettingsManager.create(this.cwd, agentDir);
-    // With options.sessionFile the subagent starts from a FORK of that session
-    // (inheriting its context); otherwise a fresh in-memory session.
-    const forked = options.sessionFile ? forkSessionForSubagent(options.sessionFile, runCwd) : undefined;
+    // unauthed model). Built once per run, not once per subagent. Compaction is
+    // force-enabled so subagents survive context overflow (compact + auto-retry
+    // inside session.prompt()) even when the user disabled it interactively.
+    this.settingsManager ??= forceCompactionEnabled(SettingsManager.create(this.cwd, agentDir));
+    // Session source/persistence matrix: temp in-memory by default; forkFrom
+    // inherits another session's context; sessionPath persists/continues one.
+    const forked = resolveSubagentSession({ forkFrom: options.forkFrom, sessionPath: options.sessionPath }, runCwd);
     const session = await (async () => {
       try {
         const created = await createAgentSession({
           cwd: runCwd,
           agentDir,
-          sessionManager: forked?.sessionManager ?? SessionManager.inMemory(),
+          sessionManager: forked.sessionManager,
           settingsManager: this.settingsManager,
           customTools,
           // Per-run modelRegistry wins over the constructor's shared registry, same
@@ -471,7 +569,7 @@ export class WorkflowAgent {
         await created.session.bindExtensions({});
         return created.session;
       } catch (error) {
-        forked?.cleanup();
+        forked.cleanup();
         throw error;
       }
     })();

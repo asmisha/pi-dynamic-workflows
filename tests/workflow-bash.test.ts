@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { type JournalEntry, MAX_BASH_OUTPUT_CHARS, runWorkflow } from "../src/workflow.js";
+import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 
 function fakeAgent() {
   return {
@@ -26,25 +26,36 @@ function withTempDir(fn: (dir: string) => Promise<void>): () => Promise<void> {
 }
 
 test(
-  "bash() runs a command and returns stdout + exit code",
+  "bash() runs a command and returns pid, exit code, and output file paths",
   withTempDir(async (dir) => {
-    const script = `export const meta = { name: 'bash_basic', description: 'bash stdout' }
+    const script = `export const meta = { name: 'bash_basic', description: 'bash stdout files' }
 const r = await bash('echo hello-workflow')
-return { out: r.stdout.trim(), code: r.exitCode, truncated: r.truncated }`;
-    const result = await runWorkflow(script, { cwd: dir, agent: fakeAgent(), persistLogs: false });
-    // Spread: vm-realm objects don't deepStrictEqual host literals.
-    assert.deepEqual({ ...(result.result as object) }, { out: "hello-workflow", code: 0, truncated: false });
+return { pidType: typeof r.pid, code: r.exitCode, stdoutFile: r.stdoutFile, stderrFile: r.stderrFile }`;
+    const result = (await runWorkflow(script, { cwd: dir, agent: fakeAgent(), persistLogs: false })).result as {
+      pidType: string;
+      code: number;
+      stdoutFile: string;
+      stderrFile: string;
+    };
+    assert.equal(result.pidType, "number");
+    assert.equal(result.code, 0);
+    assert.equal(readFileSync(result.stdoutFile, "utf-8").trim(), "hello-workflow");
+    assert.equal(readFileSync(result.stderrFile, "utf-8"), "");
   }),
 );
 
 test(
-  "bash() returns non-zero exit codes and stderr instead of throwing",
+  "bash() returns non-zero exit codes and stores stderr instead of throwing",
   withTempDir(async (dir) => {
     const script = `export const meta = { name: 'bash_exit', description: 'bash exit code' }
 const r = await bash('echo boom >&2; exit 3')
-return { code: r.exitCode, err: r.stderr.trim() }`;
-    const result = await runWorkflow(script, { cwd: dir, agent: fakeAgent(), persistLogs: false });
-    assert.deepEqual({ ...(result.result as object) }, { code: 3, err: "boom" });
+return { code: r.exitCode, stderrFile: r.stderrFile }`;
+    const result = (await runWorkflow(script, { cwd: dir, agent: fakeAgent(), persistLogs: false })).result as {
+      code: number;
+      stderrFile: string;
+    };
+    assert.equal(result.code, 3);
+    assert.equal(readFileSync(result.stderrFile, "utf-8").trim(), "boom");
   }),
 );
 
@@ -55,19 +66,21 @@ test(
 const here = await bash('pwd')
 await bash('mkdir -p sub')
 const there = await bash('pwd', { cwd: cwd + '/sub' })
-return { here: here.stdout.trim(), there: there.stdout.trim() }`;
+return { hereFile: here.stdoutFile, thereFile: there.stdoutFile }`;
     const result = (await runWorkflow(script, { cwd: dir, agent: fakeAgent(), persistLogs: false })).result as {
-      here: string;
-      there: string;
+      hereFile: string;
+      thereFile: string;
     };
+    const here = readFileSync(result.hereFile, "utf-8").trim();
+    const there = readFileSync(result.thereFile, "utf-8").trim();
     // Compare realpath-insensitively (macOS /tmp -> /private/tmp symlink).
-    assert.ok(result.here.endsWith(dir.split("/").pop() as string));
-    assert.equal(result.there, `${result.here}/sub`);
+    assert.ok(here.endsWith(dir.split("/").pop() as string));
+    assert.equal(there, `${here}/sub`);
   }),
 );
 
 test(
-  "bash() output pipes into agent() prompts",
+  "bash() output paths pipe into agent() prompts",
   withTempDir(async (dir) => {
     const prompts: string[] = [];
     const runner = {
@@ -76,14 +89,17 @@ test(
         return "analyzed";
       },
     };
-    const script = `export const meta = { name: 'bash_pipe', description: 'pipe bash to agent' }
+    const script = `export const meta = { name: 'bash_pipe', description: 'pipe bash files to agent' }
 const r = await bash('printf "alpha\\nbeta"')
-const verdict = await agent('Analyze this output:\\n' + r.stdout, { label: 'analyzer' })
+const verdict = await agent('Analyze stdout file: ' + r.stdoutFile + '\\nStderr file: ' + r.stderrFile, { label: 'analyzer' })
 return verdict`;
     const result = await runWorkflow(script, { cwd: dir, agent: runner, persistLogs: false });
     assert.equal(result.result, "analyzed");
     assert.equal(prompts.length, 1);
-    assert.ok(prompts[0].includes("alpha\nbeta"), "agent prompt should carry the bash stdout");
+    assert.match(prompts[0], /Analyze stdout file:/);
+    const stdoutPath = prompts[0].match(/Analyze stdout file: (.*)\nStderr file:/)?.[1];
+    assert.ok(stdoutPath);
+    assert.equal(readFileSync(stdoutPath, "utf-8"), "alpha\nbeta");
   }),
 );
 
@@ -94,8 +110,8 @@ test(
     const journal: JournalEntry[] = [];
     const script = `export const meta = { name: 'bash_resume', description: 'bash journal replay' }
 const r = await bash('echo ran >> ' + args.marker + '; echo did-run')
-const a = await agent('summarize: ' + r.stdout.trim(), { label: 'sum' })
-return { out: r.stdout.trim(), a }`;
+const a = await agent('summarize stdout file: ' + r.stdoutFile, { label: 'sum' })
+return { stdoutFile: r.stdoutFile, a }`;
 
     const first = await runWorkflow(script, {
       cwd: dir,
@@ -104,7 +120,8 @@ return { out: r.stdout.trim(), a }`;
       args: { marker },
       onAgentJournal: (e) => journal.push(e),
     });
-    assert.equal((first.result as { out: string }).out, "did-run");
+    const firstResult = first.result as { stdoutFile: string; a: string };
+    assert.equal(readFileSync(firstResult.stdoutFile, "utf-8").trim(), "did-run");
     assert.equal(readFileSync(marker, "utf-8").trim(), "ran", "command ran once");
     assert.equal(journal.length, 2, "bash + agent journal entries");
 
@@ -132,7 +149,7 @@ test(
     const journal: JournalEntry[] = [];
     const script = (cmd: string) => `export const meta = { name: 'bash_bust', description: 'bash cache bust' }
 const r = await bash('${cmd} >> ' + args.marker + '; echo ok')
-const a = await agent('after bash', { label: 'after' })
+const a = await agent('after bash stdout file: ' + r.stdoutFile, { label: 'after' })
 return a`;
 
     await runWorkflow(script("echo one"), {
@@ -161,17 +178,15 @@ return a`;
 );
 
 test(
-  "bash() caps captured output and flags truncation",
+  "bash() stores full output without truncating in-memory results",
   withTempDir(async (dir) => {
-    const script = `export const meta = { name: 'bash_cap', description: 'bash output cap' }
+    const script = `export const meta = { name: 'bash_full_output', description: 'bash full output file' }
 const r = await bash('yes a | head -c 250000')
-return { len: r.stdout.length, truncated: r.truncated }`;
+return { stdoutFile: r.stdoutFile }`;
     const result = (await runWorkflow(script, { cwd: dir, agent: fakeAgent(), persistLogs: false })).result as {
-      len: number;
-      truncated: boolean;
+      stdoutFile: string;
     };
-    assert.ok(result.len <= MAX_BASH_OUTPUT_CHARS, "stdout capped");
-    assert.equal(result.truncated, true);
+    assert.equal(readFileSync(result.stdoutFile, "utf-8").length, 250_000);
   }),
 );
 

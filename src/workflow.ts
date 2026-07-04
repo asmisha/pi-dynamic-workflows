@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { closeSync, mkdirSync, openSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
@@ -18,6 +21,7 @@ import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CO
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowMetaPhase {
   title: string;
@@ -169,24 +173,30 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   /** Run this agent in a different working directory (tools + session bind to it). */
   cwd?: string;
   /**
-   * Fork this Pi session file (JSONL) so the agent starts with that
-   * conversation's full context. The source file is never mutated.
+   * Fork this Pi session file (JSONL) as the agent's starting context. The source
+   * file is never mutated. Without `sessionPath`, the fork is temporary.
    */
-  sessionFile?: string;
+  forkFrom?: string;
+  /**
+   * Persist/continue this agent's working session at this path. Existing files
+   * are continued; missing files are created. Relative paths land under
+   * ~/.pi/workflows/sessions/. Combined with `forkFrom`, the target must not
+   * already exist.
+   */
+  sessionPath?: string;
 }
 
-/** Result of a workflow-level bash() call. */
+/** Result of a workflow-level bash() call. Full output is stored on disk. */
 export interface WorkflowBashResult {
-  stdout: string;
-  stderr: string;
+  /** PID of the spawned bash process. */
+  pid: number | null;
   /** Process exit code; null when killed by a signal. */
   exitCode: number | null;
-  /** True when stdout/stderr were cut at the output cap. */
-  truncated: boolean;
+  /** File containing full stdout. */
+  stdoutFile: string;
+  /** File containing full stderr. */
+  stderrFile: string;
 }
-
-/** Max captured chars per stream for a workflow bash() call (journal-size guard). */
-export const MAX_BASH_OUTPUT_CHARS = 200_000;
 
 /** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
 export interface CheckpointOptions {
@@ -483,7 +493,8 @@ export async function runWorkflow<T = unknown>(
               toolNames: agentDef?.tools,
               disallowedToolNames: agentDef?.disallowedTools,
               cwd: agentOptions.cwd,
-              sessionFile: agentOptions.sessionFile,
+              forkFrom: agentOptions.forkFrom,
+              sessionPath: agentOptions.sessionPath,
               onModelResolved: (id: string) => {
                 displayModel = id;
               },
@@ -561,9 +572,10 @@ export async function runWorkflow<T = unknown>(
     });
   };
 
-  // Journaled shell step: run a command, cap the output, and cache the result by
-  // call index exactly like agent() — bash output is nondeterministic, so the
-  // journal is what keeps resume's longest-unchanged-prefix contract intact.
+  // Journaled shell step: run a command, write full stdout/stderr to files, and
+  // cache the result by call index exactly like agent(). Bash output is
+  // nondeterministic, so the journal is what keeps resume's longest-unchanged-
+  // prefix contract intact without re-running side effects.
   const bash = async (
     command: string,
     bashOptions: { cwd?: string; timeoutMs?: number | null } = {},
@@ -573,21 +585,26 @@ export async function runWorkflow<T = unknown>(
       throw new TypeError("bash(command, options?) needs a non-empty command string");
     }
     const callIndex = state.callSeq++;
-    const callHash = hashBashCall(command, bashOptions.cwd);
+    const callHash = hashBashCall(command, bashOptions.cwd, bashOptions.timeoutMs ?? null);
     const cached = options.resumeJournal?.get(callIndex);
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       return cached.result as WorkflowBashResult;
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
+    const output = bashOutputFiles(baseCwd, runId, callIndex, options.persistLogs ?? true);
     const result = await runBashCommand(command, {
       cwd: bashOptions.cwd ?? baseCwd,
       timeoutMs: bashOptions.timeoutMs ?? null,
       signal: options.signal,
+      stdoutFile: output.stdoutFile,
+      stderrFile: output.stderrFile,
     });
     throwIfAborted();
     const shortCmd = command.length > 80 ? `${command.slice(0, 80)}…` : command;
-    log(`$ ${shortCmd} (exit ${result.exitCode ?? "signal"}${result.truncated ? ", output truncated" : ""})`);
+    log(
+      `$ ${shortCmd} (pid ${result.pid ?? "?"}, exit ${result.exitCode ?? "signal"}; stdout ${result.stdoutFile}; stderr ${result.stderrFile})`,
+    );
     options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
     return result;
   };
@@ -1104,25 +1121,35 @@ function hashAgentCall(
     agentDef: agentDefKey,
     schema: options.schema ?? null,
     cwd: options.cwd ?? null,
-    sessionFile: options.sessionFile ?? null,
+    forkFrom: options.forkFrom ?? null,
+    sessionPath: options.sessionPath ?? null,
   });
   return createHash("sha256").update(identity).digest("hex");
 }
 
 /** Stable identity hash for a bash() call — a cache miss on resume when it changes. */
-function hashBashCall(command: string, cwd: string | undefined): string {
+function hashBashCall(command: string, cwd: string | undefined, timeoutMs: number | null): string {
   return createHash("sha256")
-    .update(JSON.stringify({ kind: "bash", command, cwd: cwd ?? null }))
+    .update(JSON.stringify({ kind: "bash", command, cwd: cwd ?? null, timeoutMs }))
     .digest("hex");
 }
 
+function bashOutputFiles(cwd: string, runId: string, callIndex: number, persistLogs: boolean) {
+  const dir = persistLogs
+    ? join(workflowProjectPaths(cwd).runsDir, `${runId}-bash`)
+    : join(tmpdir(), `pi-workflow-bash-${runId}`);
+  mkdirSync(dir, { recursive: true });
+  const stem = String(callIndex).padStart(4, "0");
+  return { stdoutFile: join(dir, `${stem}.stdout`), stderrFile: join(dir, `${stem}.stderr`) };
+}
+
 /**
- * Spawn a shell command in its own process group, capture capped output, and
- * kill the whole tree on workflow abort or timeout (SIGTERM, then SIGKILL).
+ * Spawn a shell command in its own process group, redirect full stdout/stderr to
+ * files, and kill the whole tree on workflow abort or timeout (SIGTERM, then SIGKILL).
  */
 function runBashCommand(
   command: string,
-  opts: { cwd: string; timeoutMs: number | null; signal?: AbortSignal },
+  opts: { cwd: string; timeoutMs: number | null; signal?: AbortSignal; stdoutFile: string; stderrFile: string },
 ): Promise<WorkflowBashResult> {
   return new Promise((resolve, reject) => {
     const abortError = () =>
@@ -1132,41 +1159,45 @@ function runBashCommand(
       return;
     }
 
-    const child = spawn("/bin/bash", ["-c", command], {
-      cwd: opts.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      // Own process group so an abort can kill the whole tree, not just the shell.
-      detached: process.platform !== "win32",
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let truncated = false;
-    const collect = (current: string, chunk: Buffer): string => {
-      if (current.length >= MAX_BASH_OUTPUT_CHARS) {
-        truncated = true;
-        return current;
+    let stdoutFd: number | undefined;
+    let stderrFd: number | undefined;
+    let fdsClosed = false;
+    const closeFds = () => {
+      if (fdsClosed) return;
+      fdsClosed = true;
+      for (const fd of [stdoutFd, stderrFd]) {
+        if (fd === undefined) continue;
+        try {
+          closeSync(fd);
+        } catch {
+          // already closed
+        }
       }
-      const next = current + chunk.toString();
-      if (next.length > MAX_BASH_OUTPUT_CHARS) {
-        truncated = true;
-        return next.slice(0, MAX_BASH_OUTPUT_CHARS);
-      }
-      return next;
     };
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = collect(stdout, chunk);
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = collect(stderr, chunk);
-    });
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      stdoutFd = openSync(opts.stdoutFile, "w");
+      stderrFd = openSync(opts.stderrFile, "w");
+      child = spawn("/bin/bash", ["-c", command], {
+        cwd: opts.cwd,
+        stdio: ["ignore", stdoutFd, stderrFd],
+        // Own process group so an abort can kill the whole tree, not just the shell.
+        detached: process.platform !== "win32",
+      });
+    } catch (error) {
+      closeFds();
+      reject(error);
+      return;
+    }
+    const pid = child.pid ?? null;
 
     const killTree = () => {
-      const pid = child.pid;
-      if (!pid) return;
+      const childPid = child.pid;
+      if (!childPid) return;
       const signalTree = (sig: NodeJS.Signals) => {
         try {
-          if (process.platform !== "win32") process.kill(-pid, sig);
+          if (process.platform !== "win32") process.kill(-childPid, sig);
           else child.kill(sig);
         } catch {
           try {
@@ -1195,6 +1226,7 @@ function runBashCommand(
     const cleanup = () => {
       opts.signal?.removeEventListener("abort", onAbort);
       if (timer) clearTimeout(timer);
+      closeFds();
     };
 
     child.on("error", (err) => {
@@ -1215,7 +1247,7 @@ function runBashCommand(
         );
         return;
       }
-      resolve({ stdout, stderr, exitCode: code, truncated });
+      resolve({ pid, exitCode: code, stdoutFile: opts.stdoutFile, stderrFile: opts.stderrFile });
     });
   });
 }

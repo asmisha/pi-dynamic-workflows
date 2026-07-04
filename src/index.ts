@@ -1,5 +1,11 @@
-export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
-export { forkSessionForSubagent, listAvailableModelSpecs, WorkflowAgent } from "./agent.js";
+export type { AgentRunOptions, AgentRunResult, SubagentSessionSpec, WorkflowAgentOptions } from "./agent.js";
+export {
+  forceCompactionEnabled,
+  forkSessionForSubagent,
+  listAvailableModelSpecs,
+  resolveSubagentSession,
+  WorkflowAgent,
+} from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
@@ -62,17 +68,19 @@ export type {
   WorkflowRunOptions,
   WorkflowRunResult,
 } from "./workflow.js";
-export { MAX_BASH_OUTPUT_CHARS, parseWorkflowScript, runWorkflow } from "./workflow.js";
+export { parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { buildForcedWorkflowPrompt, registerWorkflowCommands, WORKFLOW_TOOL_NAME } from "./workflow-commands.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {
+  resolveWorkflowSessionPath,
   WORKFLOW_HOME_RELATIVE_DIR,
   WORKFLOW_PROJECTS_SUBDIR,
   workflowHomeDir,
   workflowProjectKey,
   workflowProjectPaths,
+  workflowSessionsDir,
   workflowUserSavedDir,
 } from "./workflow-paths.js";
 export { registerWorkflowProgressCommands } from "./workflow-progress-commands.js";

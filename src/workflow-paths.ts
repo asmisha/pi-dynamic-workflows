@@ -8,7 +8,7 @@
 
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { WORKFLOW_RUNS_DIR, WORKFLOW_SAVED_DIR } from "./config.js";
 
 export const WORKFLOW_HOME_RELATIVE_DIR = ".pi/workflows";
@@ -30,6 +30,30 @@ export function workflowHomeDir(): string {
 
 export function workflowUserSavedDir(): string {
   return join(workflowHomeDir(), "saved");
+}
+
+/** Dedicated home for persisted subagent sessions (~/.pi/workflows/sessions). */
+export function workflowSessionsDir(): string {
+  return join(workflowHomeDir(), "sessions");
+}
+
+/**
+ * Session persistence path rules for agent({ sessionPath }):
+ *   - absolute path → used as-is
+ *   - `~/...`       → home-expanded
+ *   - anything else (bare name or relative path) → lands under the dedicated
+ *     sessions dir (~/.pi/workflows/sessions/) so persisted subagent sessions
+ *     never scatter across project checkouts
+ * A `.jsonl` extension is appended when missing so the file is always a valid
+ * Pi session file target. Resolution is deterministic, so the same input
+ * yields the same path across resumes (resume-journal identity relies on it).
+ */
+export function resolveWorkflowSessionPath(raw: string): string {
+  const trimmed = raw.trim();
+  const withExt = trimmed.endsWith(".jsonl") ? trimmed : `${trimmed}.jsonl`;
+  if (withExt.startsWith("~/")) return join(homedir(), withExt.slice(2));
+  if (isAbsolute(withExt)) return withExt;
+  return join(workflowSessionsDir(), withExt);
 }
 
 export function workflowProjectKey(cwd: string): string {

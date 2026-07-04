@@ -117,7 +117,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `agent(prompt, opts)` | Spawn an isolated subagent. Returns its final text, or a validated object with `opts.schema`; recoverable failures return `null` with diagnostics in `/workflows`. |
 | `parallel(thunks)` | Run `() => agent(...)` thunks concurrently; results in input order. |
 | `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`. |
-| `bash(cmd, { cwd?, timeoutMs? })` | Run a shell command; returns `{ stdout, stderr, exitCode, truncated }`. Journaled like `agent()`, so resume replays it. Pipe its output into an `agent()` prompt for analysis. |
+| `bash(cmd, { cwd?, timeoutMs? })` | Run a shell command; returns `{ pid, exitCode, stdoutFile, stderrFile }`. Full stdout/stderr are written to those files and journaled like `agent()`, so resume replays paths without re-running. Pass file paths to `agent()` for analysis. |
 | `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
 | `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. |
 | `workflow(name, args)` | Run a saved workflow inline (shares the global caps). |
@@ -130,10 +130,13 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `model` | Exact `provider/modelId` (always wins over `tier`). |
 | `agentType` | A named definition (`.pi/agents/<name>.md`) binding tools + model + role prompt. |
 | `cwd` | Run this agent in a different working directory (tools + session bind to it). |
-| `sessionFile` | Fork an existing Pi session file (JSONL) so the agent starts with that conversation's context. The source file is never mutated. |
+| `forkFrom` | Fork an existing Pi session file (JSONL) as starting context. The source file is never mutated; without `sessionPath`, the fork is temporary. |
+| `sessionPath` | Persist/continue this agent's working session. Existing files are continued; missing files are created. Relative paths resolve under `~/.pi/workflows/sessions/`. Combined with `forkFrom`, the target must not already exist. |
 | `schema` | JSON Schema → the subagent returns a validated object. |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
+
+Subagent sessions are temporary by default. Use `sessionPath` only when a reviewer/worker should keep context across runs; use `forkFrom` when it should start from an existing Pi conversation. Subagent auto-compaction is forced on so context-overflow compaction auto-continues headlessly.
 
 By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 

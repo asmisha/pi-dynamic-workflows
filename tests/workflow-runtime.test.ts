@@ -855,28 +855,28 @@ return { escaped, arr, j, s }`;
   assert.match(r.result.escaped, /blocked/, "constructor escape via vm objects is closed");
 });
 
-// ── per-agent cwd / sessionFile forwarding ─────────────────────────────────────
+// ── per-agent cwd / session forwarding ─────────────────────────────────────────
 
-test("agent opts.cwd and opts.sessionFile are forwarded to the runner", async () => {
-  const seen: Array<{ cwd?: string; sessionFile?: string }> = [];
+test("agent opts.cwd, opts.forkFrom, and opts.sessionPath are forwarded to the runner", async () => {
+  const seen: Array<{ cwd?: string; forkFrom?: string; sessionPath?: string }> = [];
   const runner = {
-    async run(_prompt: string, options: { cwd?: string; sessionFile?: string }) {
-      seen.push({ cwd: options.cwd, sessionFile: options.sessionFile });
+    async run(_prompt: string, options: { cwd?: string; forkFrom?: string; sessionPath?: string }) {
+      seen.push({ cwd: options.cwd, forkFrom: options.forkFrom, sessionPath: options.sessionPath });
       return "ok";
     },
   };
   const script = `export const meta = { name: 'fwd', description: 'cwd/session forwarding' }
 await agent('a', { label: 'plain' })
-await agent('b', { label: 'placed', cwd: '/tmp/elsewhere', sessionFile: '/tmp/parent-session.jsonl' })
+await agent('b', { label: 'placed', cwd: '/tmp/elsewhere', forkFrom: '/tmp/parent-session.jsonl', sessionPath: 'child-session' })
 return 'done'`;
   await runWorkflow(script, { agent: runner, persistLogs: false });
   assert.deepEqual(seen, [
-    { cwd: undefined, sessionFile: undefined },
-    { cwd: "/tmp/elsewhere", sessionFile: "/tmp/parent-session.jsonl" },
+    { cwd: undefined, forkFrom: undefined, sessionPath: undefined },
+    { cwd: "/tmp/elsewhere", forkFrom: "/tmp/parent-session.jsonl", sessionPath: "child-session" },
   ]);
 });
 
-test("changing opts.cwd or opts.sessionFile busts the resume cache", async () => {
+test("changing opts.cwd, opts.forkFrom, or opts.sessionPath busts the resume cache", async () => {
   const journal: JournalEntry[] = [];
   const script = (extra: string) => `export const meta = { name: 'fwd_hash', description: 'hash bust' }
 const r = await agent('task', { label: 'a'${extra} })
@@ -898,12 +898,17 @@ return r`;
   });
   assert.equal(replay.state.calls, 0, "unchanged call must replay");
 
-  // Adding cwd (or sessionFile) changes the call identity -> live re-run.
-  const rerun = countingAgent();
-  await runWorkflow(script(", cwd: '/tmp/x'"), {
-    agent: rerun.runner,
-    persistLogs: false,
-    resumeJournal: new Map(journal.map((e) => [e.index, e])),
-  });
-  assert.equal(rerun.state.calls, 1, "changed cwd must re-run live");
+  for (const [extra, label] of [
+    [", cwd: '/tmp/x'", "cwd"],
+    [", forkFrom: '/tmp/source.jsonl'", "forkFrom"],
+    [", sessionPath: 'persistent-reviewer'", "sessionPath"],
+  ] as const) {
+    const rerun = countingAgent();
+    await runWorkflow(script(extra), {
+      agent: rerun.runner,
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    });
+    assert.equal(rerun.state.calls, 1, `changed ${label} must re-run live`);
+  }
 });
