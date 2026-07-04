@@ -136,7 +136,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
 
-Subagent sessions are temporary by default. Use `sessionPath` only when a reviewer/worker should keep context across runs; use `forkFrom` when it should start from an existing Pi conversation. Subagent auto-compaction is forced on so context-overflow compaction auto-continues headlessly.
+Subagent sessions are temporary by default. Use `sessionPath` only when a reviewer/worker should keep context across runs; use `forkFrom` when it should start from an existing Pi conversation. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle applies normally.
 
 By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 

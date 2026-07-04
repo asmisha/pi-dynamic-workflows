@@ -3,10 +3,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { SessionManager, type SettingsManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
-  forceCompactionEnabled,
   forkSessionForSubagent,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
@@ -893,17 +892,4 @@ test("resolveSubagentSession rejects forkFrom + existing sessionPath", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
-
-test("forceCompactionEnabled keeps subagent auto-compaction enabled without needing persisted settings", () => {
-  const settings = {
-    getCompactionEnabled: () => false,
-    getCompactionSettings() {
-      return { enabled: this.getCompactionEnabled(), reserveTokens: 1, keepRecentTokens: 2 };
-    },
-  } as SettingsManager;
-
-  const patched = forceCompactionEnabled(settings);
-  assert.equal(patched.getCompactionEnabled(), true);
-  assert.equal(patched.getCompactionSettings().enabled, true);
 });

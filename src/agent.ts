@@ -334,23 +334,6 @@ export function resolveSubagentSession(
   }
 }
 
-/**
- * Force auto-compaction ON for a subagent's settings view without writing to the
- * user's settings file. Headless subagents cannot compact manually, so surviving
- * a context overflow (SDK: compact + auto-retry) and the threshold compaction
- * must not depend on the user's interactive setting.
- */
-export function forceCompactionEnabled(settings: SettingsManager): SettingsManager {
-  const originalGetCompactionSettings = settings.getCompactionSettings.bind(settings);
-  const patched = settings as SettingsManager & {
-    getCompactionEnabled: () => boolean;
-    getCompactionSettings: typeof settings.getCompactionSettings;
-  };
-  patched.getCompactionEnabled = () => true;
-  patched.getCompactionSettings = () => ({ ...originalGetCompactionSettings(), enabled: true });
-  return settings;
-}
-
 /** Real token/cost usage for a single subagent run, read from the SDK session. */
 export interface AgentUsage {
   input: number;
@@ -537,12 +520,10 @@ export class WorkflowAgent {
     }
 
     const agentDir = getAgentDir();
-    // Use a real SettingsManager to inherit the user's default provider/model
-    // settings (inMemory() would miss ~/.pi/settings.json and could route to an
-    // unauthed model). Built once per run, not once per subagent. Compaction is
-    // force-enabled so subagents survive context overflow (compact + auto-retry
-    // inside session.prompt()) even when the user disabled it interactively.
-    this.settingsManager ??= forceCompactionEnabled(SettingsManager.create(this.cwd, agentDir));
+    // Use a real SettingsManager to inherit the user's default provider/model,
+    // compaction, and extension settings (inMemory() would miss ~/.pi/settings.json
+    // and could route to an unauthed model). Built once per run, not once per subagent.
+    this.settingsManager ??= SettingsManager.create(this.cwd, agentDir);
     // Session source/persistence matrix: temp in-memory by default; forkFrom
     // inherits another session's context; sessionPath persists/continues one.
     const forked = resolveSubagentSession({ forkFrom: options.forkFrom, sessionPath: options.sessionPath }, runCwd);
@@ -563,9 +544,10 @@ export class WorkflowAgent {
           // Per-call model wins over any sessionOptions.model.
           ...(resolvedModel ? { model: resolvedModel } : {}),
         });
-        // createAgentSession loads configured extensions, but session_start hooks
-        // only run after binding. Many extensions register or activate tools there,
-        // so bind headlessly to expose the same tool set to workflow subagents.
+        // createAgentSession loads configured extensions, but hooks (including
+        // compaction/autocontinue extensions and session_start tool setup) only run
+        // after binding. Bind headlessly so workflow subagents participate in the
+        // same extension lifecycle as normal sessions.
         await created.session.bindExtensions({});
         return created.session;
       } catch (error) {
