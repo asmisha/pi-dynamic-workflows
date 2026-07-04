@@ -854,3 +854,56 @@ return { escaped, arr, j, s }`;
   // where Date.now is neutered -> blocked (the old host-object escape is closed).
   assert.match(r.result.escaped, /blocked/, "constructor escape via vm objects is closed");
 });
+
+// ── per-agent cwd / sessionFile forwarding ─────────────────────────────────────
+
+test("agent opts.cwd and opts.sessionFile are forwarded to the runner", async () => {
+  const seen: Array<{ cwd?: string; sessionFile?: string }> = [];
+  const runner = {
+    async run(_prompt: string, options: { cwd?: string; sessionFile?: string }) {
+      seen.push({ cwd: options.cwd, sessionFile: options.sessionFile });
+      return "ok";
+    },
+  };
+  const script = `export const meta = { name: 'fwd', description: 'cwd/session forwarding' }
+await agent('a', { label: 'plain' })
+await agent('b', { label: 'placed', cwd: '/tmp/elsewhere', sessionFile: '/tmp/parent-session.jsonl' })
+return 'done'`;
+  await runWorkflow(script, { agent: runner, persistLogs: false });
+  assert.deepEqual(seen, [
+    { cwd: undefined, sessionFile: undefined },
+    { cwd: "/tmp/elsewhere", sessionFile: "/tmp/parent-session.jsonl" },
+  ]);
+});
+
+test("changing opts.cwd or opts.sessionFile busts the resume cache", async () => {
+  const journal: JournalEntry[] = [];
+  const script = (extra: string) => `export const meta = { name: 'fwd_hash', description: 'hash bust' }
+const r = await agent('task', { label: 'a'${extra} })
+return r`;
+  const first = countingAgent();
+  await runWorkflow(script(""), {
+    agent: first.runner,
+    persistLogs: false,
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 1);
+
+  // Unchanged call replays from the journal.
+  const replay = countingAgent();
+  await runWorkflow(script(""), {
+    agent: replay.runner,
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+  });
+  assert.equal(replay.state.calls, 0, "unchanged call must replay");
+
+  // Adding cwd (or sessionFile) changes the call identity -> live re-run.
+  const rerun = countingAgent();
+  await runWorkflow(script(", cwd: '/tmp/x'"), {
+    agent: rerun.runner,
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+  });
+  assert.equal(rerun.state.calls, 1, "changed cwd must re-run live");
+});

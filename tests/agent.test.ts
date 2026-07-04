@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import { listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
+import { forkSessionForSubagent, listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
@@ -694,4 +698,64 @@ test("agent() monitors agent count and calls onAgentStart/End for each", async (
   assert.equal(counts.length, 2);
   assert.ok(counts[0] > 0, "first agent tokens");
   assert.ok(counts[1] > 0, "second agent tokens");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// forkSessionForSubagent — session-file inheritance without mutating the source
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("forkSessionForSubagent inherits the source context and never mutates the source", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-fork-test-"));
+  try {
+    const sessionDir = join(root, "sessions");
+    const source = SessionManager.create(root, sessionDir);
+    source.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "the secret context is 42" }],
+    } as Parameters<SessionManager["appendMessage"]>[0]);
+    // The SDK only flushes a session file once an assistant message exists.
+    source.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "understood" }],
+      stopReason: "stop",
+    } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+    const sourcePath = source.getSessionFile();
+    assert.ok(sourcePath, "source session should persist to a file");
+    const sourceBytes = readFileSync(sourcePath as string, "utf-8");
+
+    const { sessionManager, cleanup } = forkSessionForSubagent(sourcePath as string, root);
+    try {
+      const context = sessionManager.buildSessionContext();
+      const text = JSON.stringify(context.messages);
+      assert.ok(text.includes("the secret context is 42"), "fork should carry the source context");
+
+      // Appending to the fork must not touch the source file.
+      sessionManager.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "subagent-only message" }],
+      } as Parameters<SessionManager["appendMessage"]>[0]);
+      assert.equal(readFileSync(sourcePath as string, "utf-8"), sourceBytes, "source file must be unchanged");
+
+      const forkPath = sessionManager.getSessionFile();
+      assert.ok(forkPath && forkPath !== sourcePath, "fork lives in its own file");
+      cleanup();
+      assert.equal(existsSync(forkPath as string), false, "cleanup removes the fork");
+    } finally {
+      cleanup();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("forkSessionForSubagent throws a recoverable WorkflowError for a missing file", () => {
+  assert.throws(
+    () => forkSessionForSubagent("/nonexistent/session.jsonl", "/tmp"),
+    (err: unknown) => {
+      assert.ok(err instanceof WorkflowError);
+      assert.equal(err.recoverable, true);
+      assert.match(err.message, /Cannot fork session file/);
+      return true;
+    },
+  );
 });

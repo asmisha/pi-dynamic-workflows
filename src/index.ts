@@ -1,5 +1,5 @@
 export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
-export { listAvailableModelSpecs, WorkflowAgent } from "./agent.js";
+export { forkSessionForSubagent, listAvailableModelSpecs, WorkflowAgent } from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
@@ -56,12 +56,13 @@ export type {
   AgentOptions,
   JournalEntry,
   SharedRuntime,
+  WorkflowBashResult,
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRunOptions,
   WorkflowRunResult,
 } from "./workflow.js";
-export { parseWorkflowScript, runWorkflow } from "./workflow.js";
+export { MAX_BASH_OUTPUT_CHARS, parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { buildForcedWorkflowPrompt, registerWorkflowCommands, WORKFLOW_TOOL_NAME } from "./workflow-commands.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";

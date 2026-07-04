@@ -117,6 +117,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `agent(prompt, opts)` | Spawn an isolated subagent. Returns its final text, or a validated object with `opts.schema`; recoverable failures return `null` with diagnostics in `/workflows`. |
 | `parallel(thunks)` | Run `() => agent(...)` thunks concurrently; results in input order. |
 | `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`. |
+| `bash(cmd, { cwd?, timeoutMs? })` | Run a shell command; returns `{ stdout, stderr, exitCode, truncated }`. Journaled like `agent()`, so resume replays it. Pipe its output into an `agent()` prompt for analysis. |
 | `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
 | `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. |
 | `workflow(name, args)` | Run a saved workflow inline (shares the global caps). |
@@ -128,6 +129,8 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`). |
 | `model` | Exact `provider/modelId` (always wins over `tier`). |
 | `agentType` | A named definition (`.pi/agents/<name>.md`) binding tools + model + role prompt. |
+| `cwd` | Run this agent in a different working directory (tools + session bind to it). |
+| `sessionFile` | Fork an existing Pi session file (JSONL) so the agent starts with that conversation's context. The source file is never mutated. |
 | `schema` | JSON Schema → the subagent returns a validated object. |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |

@@ -1,3 +1,5 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
@@ -232,6 +234,35 @@ export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
   }
 }
 
+/**
+ * Fork a Pi session file into a throwaway session dir so a subagent can start
+ * with the source conversation's context without ever mutating the source.
+ * Returns the forked manager and a cleanup that removes the temp dir.
+ */
+export function forkSessionForSubagent(
+  sessionFile: string,
+  cwd: string,
+): { sessionManager: SessionManager; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflow-session-fork-"));
+  const cleanup = () => {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort temp cleanup
+    }
+  };
+  try {
+    return { sessionManager: SessionManager.forkFrom(sessionFile, cwd, dir), cleanup };
+  } catch (error) {
+    cleanup();
+    throw new WorkflowError(
+      `Cannot fork session file "${sessionFile}": ${error instanceof Error ? error.message : error}`,
+      WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      { recoverable: true },
+    );
+  }
+}
+
 /** Real token/cost usage for a single subagent run, read from the SDK session. */
 export interface AgentUsage {
   input: number;
@@ -275,8 +306,14 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   onModelFallback?: (requestedSpec: string) => void;
   /** Called with a compact snapshot of this subagent's message/tool history. */
   onHistory?: (history: AgentHistoryEntry[]) => void;
-  /** Run this agent in a different working directory (e.g. an isolated worktree). */
+  /** Run this agent in a different working directory. */
   cwd?: string;
+  /**
+   * Fork this Pi session file (JSONL) so the subagent starts with that
+   * conversation's full context. The source file is never mutated — the fork
+   * lives in a throwaway temp dir that is removed when the subagent finishes.
+   */
+  sessionFile?: string;
   /**
    * Restrict the subagent's coding tools to these names (an agentType
    * definition's `tools` allowlist). Undefined = all coding tools. The
@@ -408,25 +445,36 @@ export class WorkflowAgent {
     // settings (inMemory() would miss ~/.pi/settings.json and could route to an
     // unauthed model). Built once per run, not once per subagent.
     this.settingsManager ??= SettingsManager.create(this.cwd, agentDir);
-    const { session } = await createAgentSession({
-      cwd: runCwd,
-      agentDir,
-      sessionManager: SessionManager.inMemory(),
-      settingsManager: this.settingsManager,
-      customTools,
-      // Per-run modelRegistry wins over the constructor's shared registry, same
-      // precedence as resolveModel() above.
-      ...(options.modelRegistry || this.sharedRegistry
-        ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
-        : {}),
-      ...this.sessionOptions,
-      // Per-call model wins over any sessionOptions.model.
-      ...(resolvedModel ? { model: resolvedModel } : {}),
-    });
-    // createAgentSession loads configured extensions, but session_start hooks only
-    // run after binding. Many extensions register or activate tools there, so bind
-    // headlessly to expose the same generic tool set to workflow subagents.
-    await session.bindExtensions({});
+    // With options.sessionFile the subagent starts from a FORK of that session
+    // (inheriting its context); otherwise a fresh in-memory session.
+    const forked = options.sessionFile ? forkSessionForSubagent(options.sessionFile, runCwd) : undefined;
+    const session = await (async () => {
+      try {
+        const created = await createAgentSession({
+          cwd: runCwd,
+          agentDir,
+          sessionManager: forked?.sessionManager ?? SessionManager.inMemory(),
+          settingsManager: this.settingsManager,
+          customTools,
+          // Per-run modelRegistry wins over the constructor's shared registry, same
+          // precedence as resolveModel() above.
+          ...(options.modelRegistry || this.sharedRegistry
+            ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
+            : {}),
+          ...this.sessionOptions,
+          // Per-call model wins over any sessionOptions.model.
+          ...(resolvedModel ? { model: resolvedModel } : {}),
+        });
+        // createAgentSession loads configured extensions, but session_start hooks
+        // only run after binding. Many extensions register or activate tools there,
+        // so bind headlessly to expose the same tool set to workflow subagents.
+        await created.session.bindExtensions({});
+        return created.session;
+      } catch (error) {
+        forked?.cleanup();
+        throw error;
+      }
+    })();
 
     let removeAbortListener: (() => void) | undefined;
     let removeHistoryListener: (() => void) | undefined;
@@ -504,6 +552,7 @@ export class WorkflowAgent {
         }
       }
       session.dispose();
+      forked?.cleanup();
     }
   }
 
