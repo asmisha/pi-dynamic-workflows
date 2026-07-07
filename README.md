@@ -153,6 +153,14 @@ npm install
 npm test     # biome + tsc + unit tests
 ```
 
+After local code changes, rebuild and reinstall the extension from this checkout:
+
+```bash
+npm run build && pi install .
+```
+
+Then restart/reload Pi so the next session loads the rebuilt extension. `pi list` should show this repo path for the installed package.
+
 Every feature is also verified end-to-end against a real Pi subagent session before release.
 
 ## Credits
