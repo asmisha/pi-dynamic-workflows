@@ -613,7 +613,9 @@ export async function runWorkflow<T = unknown>(
     throwIfAborted();
     if (!Array.isArray(thunks)) throw new TypeError("parallel() expects an array of functions");
     if (thunks.some((thunk) => typeof thunk !== "function")) {
-      throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)");
+      throw new TypeError(
+        "parallel() expects an array of zero-arg functions, not promises. Correct: parallel(items.map(item => () => agent(...))). Wrong: parallel(items.map(item => agent(...))) or parallel(items.map(async item => agent(...))).",
+      );
     }
     return Promise.all(
       thunks.map(async (thunk, index) => {
