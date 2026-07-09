@@ -150,6 +150,48 @@ test("a real subagent session binds extensions so session_start-registered tools
     );
   }));
 
+test("a real subagent waits for deferred extension continuation before returning and disposing", () =>
+  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+    let continuationScheduled = false;
+    let agentEndCount = 0;
+    const continuationErrors: string[] = [];
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          pi.on("agent_end", () => {
+            agentEndCount++;
+            if (continuationScheduled) return;
+            continuationScheduled = true;
+            setTimeout(() => {
+              try {
+                pi.sendUserMessage("continue");
+              } catch (error) {
+                continuationErrors.push(error instanceof Error ? error.message : String(error));
+              }
+            }, 0);
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([
+      fauxAssistantMessage("first response", { stopReason: "stop" }),
+      fauxAssistantMessage("continued response", { stopReason: "stop" }),
+    ]);
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never, resourceLoader } });
+    const text = await agent.run("do the task", { label: "deferred-continuation" });
+
+    assert.equal(text, "continued response");
+    assert.equal(continuationScheduled, true, "agent_end extension should schedule a deferred continuation");
+    assert.equal(agentEndCount, 2, "deferred continuation should run as a second turn before return");
+    assert.deepEqual(continuationErrors, []);
+  }));
+
 test("through the manager: a usage limit pauses the run (not fails) and resume replays the journal", () =>
   withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
     const managerAgent = new WorkflowAgent({ cwd, session: { model: model as never } });
@@ -181,9 +223,13 @@ return { a, b }`;
     // Budget refills: agent 2 now succeeds. Resume replays agent 1 from the journal.
     setResponses([fauxAssistantMessage("second-result-text", { stopReason: "stop" })]);
     assert.equal(await manager.resume(runId), true, "the paused run is resumable");
-    await new Promise((r) => setTimeout(r, 100));
+    const deadline = Date.now() + 1000;
+    let done = manager.getRun(runId);
+    while (done?.status !== "completed" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+      done = manager.getRun(runId);
+    }
 
-    const done = manager.getRun(runId);
     assert.equal(done?.status, "completed", "resumed run completes once the limit clears");
     assert.equal((done?.result?.result as { a?: string })?.a, "first-result-text", "agent 1 replayed from journal");
     assert.equal((done?.result?.result as { b?: string })?.b, "second-result-text", "agent 2 ran live after refill");

@@ -79,6 +79,20 @@ describe("resolveStructuredOutput", () => {
     assert.equal(prompts(), 1, "one repair prompt recovered it");
   });
 
+  it("runs the post-prompt hook after every repair re-prompt", async () => {
+    const { session, capture, prompts } = makeSession();
+    let settled = 0;
+    await assert.rejects(
+      () =>
+        resolveStructuredOutput(session, capture, Schema, opts, noText, async () => {
+          settled++;
+        }),
+      /structured_output/i,
+    );
+    assert.equal(prompts(), 2);
+    assert.equal(settled, 2);
+  });
+
   it("falls back to strict prose extraction when repair fails", async () => {
     const { session, capture } = makeSession();
     const r = await resolveStructuredOutput(session, capture, Schema, opts, () => '{"word":"fromProse"}');

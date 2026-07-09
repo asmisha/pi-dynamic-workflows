@@ -106,6 +106,55 @@ export interface StructuredSession {
   messages: unknown[];
 }
 
+interface IdleTrackedSession {
+  readonly isStreaming: boolean;
+  readonly isCompacting: boolean;
+  readonly pendingMessageCount: number;
+}
+
+const SUBAGENT_IDLE_POLL_MS = 25;
+const SUBAGENT_IDLE_STABLE_MS = 100;
+
+function abortError(): Error {
+  return new Error("Subagent was aborted");
+}
+
+function waitForTimer(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    const onAbort = () => done(abortError());
+    function done(error?: Error): void {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (error) reject(error);
+      else resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function waitForSubagentIdle(session: IdleTrackedSession, signal?: AbortSignal): Promise<void> {
+  // agent_end extension handlers may schedule compaction/autocontinue from a
+  // timer. Yield once so that deferred work can become visible before we test
+  // idle state or read the final assistant output.
+  await waitForTimer(0, signal);
+
+  let idleSince: number | undefined;
+  while (true) {
+    if (signal?.aborted) throw abortError();
+    const idle = !session.isStreaming && !session.isCompacting && session.pendingMessageCount === 0;
+    const now = Date.now();
+    if (idle) {
+      idleSince ??= now;
+      if (now - idleSince >= SUBAGENT_IDLE_STABLE_MS) return;
+    } else {
+      idleSince = undefined;
+    }
+    await waitForTimer(SUBAGENT_IDLE_POLL_MS, signal);
+  }
+}
+
 /**
  * Resolve a schema agent's result. If the tool was called, return the captured
  * value. Otherwise re-prompt up to maxSchemaRetries (tools restricted to
@@ -119,6 +168,7 @@ export async function resolveStructuredOutput<T>(
   schema: TSchema,
   options: { maxSchemaRetries?: number; signal?: AbortSignal; label?: string },
   lastText: (messages: unknown[]) => string,
+  afterPrompt?: () => Promise<void>,
 ): Promise<T> {
   if (capture.called) return capture.value as T;
 
@@ -131,10 +181,11 @@ export async function resolveStructuredOutput<T>(
     // ignore — the re-prompt alone still drives most models to comply
   }
   for (let attempt = 0; attempt < maxRetries && !capture.called; attempt++) {
-    if (options.signal?.aborted) throw new Error("Subagent was aborted");
+    if (options.signal?.aborted) throw abortError();
     await session.prompt(
       "You did not call the structured_output tool. Call structured_output now as your only action, with the required fields filled in. Do not write a prose answer.",
     );
+    await afterPrompt?.();
   }
   if (capture.called) return capture.value as T;
 
@@ -570,7 +621,7 @@ export class WorkflowAgent {
       emitHistory();
     };
     try {
-      if (options.signal?.aborted) throw new Error("Subagent was aborted");
+      if (options.signal?.aborted) throw abortError();
       if (options.signal) {
         const onAbort = () => {
           session.abortBash();
@@ -584,8 +635,9 @@ export class WorkflowAgent {
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+      await waitForSubagentIdle(session, options.signal);
 
-      if (options.signal?.aborted) throw new Error("Subagent was aborted");
+      if (options.signal?.aborted) throw abortError();
 
       // The SDK buries a provider usage/quota limit in the assistant message rather
       // than throwing; detect it here (before the schema/empty-text branches) so it
@@ -594,8 +646,13 @@ export class WorkflowAgent {
       throwIfProviderLimit(session.messages, options.label);
 
       if (options.schema) {
-        return (await resolveStructuredOutput(session, capture, options.schema, options, (m) =>
-          this.lastAssistantText(m),
+        return (await resolveStructuredOutput(
+          session,
+          capture,
+          options.schema,
+          options,
+          (m) => this.lastAssistantText(m),
+          () => waitForSubagentIdle(session, options.signal),
         )) as AgentRunResult<TSchemaDef>;
       }
 
