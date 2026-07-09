@@ -254,6 +254,27 @@ test("buildPrompt includes both instructions when both base and per-call are set
   );
 });
 
+test("buildPrompt preserves a leading slash template for native Pi prompt expansion", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp", instructions: "Base workflow context." });
+  const built: string = (agent as unknown as WorkflowAgentPrivates).buildPrompt(
+    "  /correctness-reviewer review cwd and changed files",
+    { label: "correctness", instructions: "Per-call workflow context." },
+    true,
+  );
+
+  assert.ok(built.startsWith("/correctness-reviewer review cwd and changed files"), "slash template stays first");
+  assert.ok(
+    built.indexOf("/correctness-reviewer") < built.indexOf("Base workflow context."),
+    "native template appears before workflow context",
+  );
+  assert.ok(
+    built.indexOf("Base workflow context.") < built.indexOf("Per-call workflow context."),
+    "base context before per-call context",
+  );
+  assert.ok(built.includes("Task label: correctness"), "label is preserved");
+  assert.ok(built.includes("calling structured_output exactly once"), "structured output contract is preserved");
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // lastAssistantText — verifies text extraction from session messages
 // ═══════════════════════════════════════════════════════════════════════════

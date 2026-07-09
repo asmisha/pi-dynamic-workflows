@@ -637,12 +637,13 @@ export class WorkflowAgent {
   }
 
   private buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string {
-    const parts = [
+    const task = prompt.trimStart();
+    const metadata = [
       this.instructions,
       options.instructions,
       options.label ? `Task label: ${options.label}` : undefined,
-      prompt,
     ].filter(Boolean);
+    const parts = task.startsWith("/") ? [task, ...metadata] : [...metadata, prompt];
 
     if (structured) {
       parts.push(
