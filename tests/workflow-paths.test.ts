@@ -9,7 +9,6 @@ import {
   workflowHomeDir,
   workflowProjectKey,
   workflowProjectPaths,
-  workflowUserSavedDir,
 } from "../src/workflow-paths.js";
 import { withFakeHome } from "./helpers/fake-home.js";
 
@@ -28,7 +27,6 @@ describe("workflow paths", () => {
   it("resolves workflow home under the user home", () => {
     withIsolatedHome((home) => {
       assert.equal(workflowHomeDir(), join(home, WORKFLOW_HOME_RELATIVE_DIR));
-      assert.equal(workflowUserSavedDir(), join(home, WORKFLOW_HOME_RELATIVE_DIR, "saved"));
     });
   });
 
@@ -46,10 +44,8 @@ describe("workflow paths", () => {
       const paths = workflowProjectPaths(cwd);
       assert.ok(paths.rootDir.startsWith(join(home, WORKFLOW_HOME_RELATIVE_DIR, WORKFLOW_PROJECTS_SUBDIR)));
       assert.equal(paths.runsDir, join(paths.rootDir, "runs"));
-      assert.equal(paths.savedDir, join(paths.rootDir, "saved"));
       assert.equal(paths.settingsPath, join(paths.rootDir, "settings.json"));
       assert.equal(paths.legacyRunsDir, normalize(join(cwd, ".pi/workflows/runs")));
-      assert.equal(paths.legacySavedDir, normalize(join(cwd, ".pi/workflows/saved")));
     });
   });
 });

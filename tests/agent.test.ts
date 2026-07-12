@@ -482,7 +482,7 @@ test("agent() in workflow returns runner result", async () => {
   assert.deepEqual(result.result, { findings: ["issue1"] });
 });
 
-test("agent() in workflow returns null for recoverable errors", async () => {
+test("agent() in workflow throws classified recoverable errors after retries", async () => {
   const failer = {
     async run() {
       throw new Error("recoverable agent error");
@@ -496,13 +496,20 @@ test("agent() in workflow returns null for recoverable errors", async () => {
         recoverable?: boolean;
       }
     | undefined;
-  const result = await runWorkflow<unknown>(
-    `export const meta = { name: 'test', description: 't' }
-     const r = await agent('failing task', { label: 'f' })
-     return r`,
-    { agent: failer, persistLogs: false, onAgentEnd: (e) => (end = e) },
+  await assert.rejects(
+    () =>
+      runWorkflow<unknown>(
+        `export const meta = { name: 'test', description: 't' }
+         const r = await agent('failing task', { label: 'f' })
+         return r`,
+        { agent: failer, persistLogs: false, onAgentEnd: (e) => (end = e) },
+      ),
+    (error: unknown) =>
+      error instanceof WorkflowError &&
+      error.code === WorkflowErrorCode.AGENT_EXECUTION_ERROR &&
+      error.recoverable &&
+      error.agentLabel === "f",
   );
-  assert.equal(result.result, null);
   assert.equal(end?.result, null);
   assert.equal(end?.error, "recoverable agent error");
   assert.equal(end?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
@@ -520,14 +527,17 @@ test("agent() in workflow treats empty text output as a recoverable failure", as
         recoverable?: boolean;
       }
     | undefined;
-  const result = await runWorkflow<unknown>(
-    `export const meta = { name: 'test', description: 't' }
-     const r = await agent('empty task', { label: 'empty' })
-     return r`,
-    { agent: rec, persistLogs: false, onAgentEnd: (e) => (end = e) },
+  await assert.rejects(
+    () =>
+      runWorkflow<unknown>(
+        `export const meta = { name: 'test', description: 't' }
+         const r = await agent('empty task', { label: 'empty' })
+         return r`,
+        { agent: rec, persistLogs: false, onAgentEnd: (e) => (end = e) },
+      ),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_EMPTY_OUTPUT,
   );
 
-  assert.equal(result.result, null);
   assert.equal(end?.result, null);
   assert.equal(end?.error, "Subagent produced no assistant output");
   assert.equal(end?.errorCode, WorkflowErrorCode.AGENT_EMPTY_OUTPUT);
@@ -617,7 +627,7 @@ test("agent() accumulates usage across multiple agents", async () => {
   assert.deepEqual(usageEvents, [{ total: 30 }, { total: 60 }], "usage updates after each agent");
 });
 
-test("agent() with timeout should handle gracefully (timeout returns null)", async () => {
+test("agent() with timeout exposes its recoverable error to a local catch", async () => {
   const slow = {
     async run() {
       await new Promise((r) => setTimeout(r, 50));
@@ -639,8 +649,7 @@ test("agent() with timeout should handle gracefully (timeout returns null)", asy
     },
   );
   const r = result.result as { val: unknown };
-  // agent() catches timeout internally (recoverable) and returns null
-  assert.equal(r.val, null, "timeout agent should return null (recoverable)");
+  assert.match(String(r.val), /error:Agent "s" timed out after 5ms/);
   assert.match(errorMessage, /timed out after 5ms/);
   assert.match(errorMessage, /raise or omit timeoutMs\/agentTimeoutMs/);
 });

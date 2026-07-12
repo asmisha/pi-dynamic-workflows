@@ -3,7 +3,6 @@
 [![npm](https://img.shields.io/npm/v/@quintinshaw/pi-dynamic-workflows?color=cb3837&logo=npm)](https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![for Pi](https://img.shields.io/badge/for-Pi-7c3aed)](https://pi.dev)
-[![tests](https://img.shields.io/badge/tests-679%20passing-success)](#development)
 
 > **Claude Code–style dynamic workflows for [Pi](https://pi.dev).**
 > Turn one prompt into a fleet of subagents that fan out in parallel, cross-check each other, and hand back a single synthesized answer.
@@ -65,12 +64,10 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 
 - **Fan-out orchestration** — `agent()`, `parallel()`, `pipeline()`, `phase()` in a sandboxed script. Up to 16 concurrent / 1000 total subagents; intermediate results stay in variables, not the chat.
 - **Real model routing** — `small` / `medium` / `big` tiers (or an exact `model`) per agent. It actually switches the subagent's model — cheap work on a light one, hard synthesis on a big one.
-- **Journaled resume** — an interrupted run replays finished agents from a journal (no re-run, no tokens) and runs only what's left or what you changed.
+- **Journaled resume** — a paused or interrupted run replays its finished prefix from a journal (no re-run, no tokens) and runs only what's left or what you changed. Failed runs are terminal rather than risking an unsafe sparse replay.
 - **Real token & cost accounting** — read from each subagent's session, not estimated. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` let you add explicit gates when you want them.
 - **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes. The panel is compact by default; `/workflows-progress detailed` expands it inline to per-phase/per-agent rows with tokens, cost, and a live tok/s rate (so a stalled agent shows as 0 tok/s) — no need to open `/workflows`.
-- **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, and save runs from the keyboard.
-- **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery.
-- **Saved & nested workflows** — turn any run into a `/<name>` command, and compose saved workflows from inside other scripts.
+- **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, or remove runs from the keyboard.
 
 ## How it maps to Claude Code dynamic workflows
 
@@ -84,14 +81,13 @@ The same model — on Pi, plus the production pieces a real run needs:
 | Background runs | Non-blocking by default, a live task panel, and auto-continue delivery |
 | Resume | **Journaled + replayable** — survives restarts and replays the unchanged prefix |
 | Model selection | **Per-agent / per-phase routing** across any provider Pi is authenticated for |
-| — | **Real cost accounting** and a **quality-pattern stdlib** |
+| — | **Real cost accounting** and persisted diagnostics |
 
 ## Commands
 
 ```text
 /workflows                  open the interactive navigator (plain list in print mode)
 /workflows status <id>      watch a run live; print its result when it finishes
-/workflows save <name>      save the latest run's script as a reusable /<name> command
 /workflows pause|resume|stop|rm <id>
 /workflows run <prompt>     force a dynamic workflow from <prompt> on demand;
                             the run shows in the panel + /workflows.
@@ -102,26 +98,24 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows-models           map the small / medium / big tiers to real models
 ```
 
-In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `d` remove · `r` restart · `s` save · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
+In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `d` remove · `r` restart · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
 ## Storage
 
-Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; project-scoped run history, resume journals, locks, and saved workflow overrides live under `~/.pi/workflows/projects/<project>/`. Older project-local `.pi/workflows/runs` and `.pi/workflows/saved` data is still read as a fallback, but new writes go to the user-level workflow store.
+Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; project-scoped run history, resume journals, and locks live under `~/.pi/workflows/projects/<project>/`. Older project-local `.pi/workflows/runs` data is still read as a fallback. Saved-workflow JSON is intentionally neither read nor mutated.
 
 ## Reference
 
-The full guide — every global, agent option, `agentType` definitions, structured output, and determinism — lives on the **[website](https://quintinshaw.github.io/pi-dynamic-workflows/)**. The essentials:
+The essentials:
 
 | Global | What it does |
 | --- | --- |
-| `agent(prompt, opts)` | Spawn an isolated subagent. Returns its final text, or a validated object with `opts.schema`; recoverable failures return `null` with diagnostics in `/workflows`. |
-| `parallel(thunks)` | Run `() => agent(...)` thunks concurrently; results in input order. |
-| `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`. |
+| `agent(prompt, opts)` | Spawn an isolated subagent. Returns its final text, or a validated object with `opts.schema`; exhausted recoverable failures throw a classified `WorkflowError` with diagnostics in `/workflows`. |
+| `parallel(thunks)` | Run `() => agent(...)` thunks concurrently; results keep input order on success and ordinary branch errors reject the fan-out. For best effort, catch inside each branch, not on `parallel(...)`, because sibling branches can still be running when the aggregate rejects. |
+| `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`; branch errors reject the pipeline unless caught inside that branch/stage. Do not catch only the aggregate while continuing with more workflow work. |
 | `bash(cmd, { cwd?, timeoutMs? })` | Run a shell command; returns `{ pid, exitCode, stdoutFile, stderrFile }`. Full stdout/stderr are written to those files and journaled like `agent()`, so resume replays paths without re-running. Pass file paths to `agent()` for analysis. |
 | `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
-| `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. |
-| `workflow(name, args)` | Run a saved workflow inline (shares the global caps). |
-| `checkpoint(question)` | Always pauses the run and transfers a durable question to the parent conversation. Continue the same run with `workflow({ resumeRunId, reply })`; completed steps replay from the journal. |
+| `checkpoint(question)` | Always pauses the run and transfers a durable question to the parent conversation. Continue the same run with the host `workflow({ resumeRunId, reply })` tool call; completed steps replay from the journal. |
 | `budget` | `{ total, spent(), remaining() }` real-token tracker. |
 
 | Agent option | Description |
@@ -136,7 +130,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
 
-A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. `workflow({ resumeRunId: "...", reply: ... })` validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. A workflow run may call `checkpoint()` at most once.
+A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. The host `workflow({ resumeRunId: "...", reply: ... })` tool call validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. A workflow run may call `checkpoint()` at most once. `/workflows resume` is for paused/interrupted runs; failed runs are intentionally terminal because parallel completion can leave a sparse journal that cannot be replayed safely.
 
 Subagent sessions are temporary by default. Use `sessionPath` only when a reviewer/worker should keep context across runs; use `forkFrom` when it should start from an existing Pi conversation. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle applies normally.
 

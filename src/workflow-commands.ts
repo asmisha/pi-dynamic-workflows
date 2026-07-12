@@ -6,9 +6,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { recomputeWorkflowSnapshot, renderWorkflowText, type WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
-import { registerSavedWorkflow } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
-import type { WorkflowStorage } from "./workflow-saved.js";
 import { openWorkflowNavigator } from "./workflow-ui.js";
 
 const STATUS_ICON: Record<string, string> = {
@@ -21,7 +19,7 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id>";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -116,20 +114,9 @@ function renderPersistedStatus(run: PersistedRunState): string {
   return lines.join("\n");
 }
 
-export interface WorkflowCommandOptions {
-  /** Saved-workflow storage, enabling `/workflows save`. */
-  storage?: WorkflowStorage;
-  /** Working directory for saved workflows registered via `save`. */
-  cwd?: string;
-}
-
 /** Register the `/workflows` command against the shared manager. Idempotent. */
 
-export function registerWorkflowCommands(
-  pi: ExtensionAPI,
-  manager: WorkflowManager,
-  opts: WorkflowCommandOptions = {},
-): void {
+export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowManager): void {
   try {
     const taken = (pi.getCommands?.() ?? []).some((c: { name: string }) => c.name === "workflows");
     if (taken) return;
@@ -139,7 +126,7 @@ export function registerWorkflowCommands(
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | rm <id> | save <name> [runId]",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | rm <id>",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
@@ -183,11 +170,11 @@ export function registerWorkflowCommands(
           // Interactive navigator when a UI is available; plain text otherwise
           // (print/RPC mode) or when the user explicitly asks for `list`.
           if (sub !== "list" && ctx.hasUI) {
-            await openWorkflowNavigator(pi, manager, ctx.ui, { storage: opts.storage, cwd: opts.cwd });
+            await openWorkflowNavigator(pi, manager, ctx.ui);
             return;
           }
           if (parts.length === 0 && ctx.hasUI) {
-            await openWorkflowNavigator(pi, manager, ctx.ui, { storage: opts.storage, cwd: opts.cwd });
+            await openWorkflowNavigator(pi, manager, ctx.ui);
             return;
           }
           const runs = manager.listRuns();
@@ -237,43 +224,15 @@ export function registerWorkflowCommands(
         case "resume": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
           const ok = await manager.resume(id);
-          ctx.ui.notify(ok ? `Resumed ${id}` : `Resume not available for ${id} yet`, ok ? "info" : "warning");
+          ctx.ui.notify(
+            ok ? `Resumed ${id}` : `Resume is available only for paused or interrupted runs; failed runs are terminal.`,
+            ok ? "info" : "warning",
+          );
           return;
         }
         case "rm": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
           ctx.ui.notify(manager.deleteRun(id) ? `Removed ${id}` : `No run ${id}`, "info");
-          return;
-        }
-        case "save": {
-          const name = id;
-          if (!name) return ctx.ui.notify("Usage: /workflows save <name> [runId]", "warning");
-          if (!opts.storage) return ctx.ui.notify("Saving is not available (no storage configured)", "error");
-          const storage = opts.storage;
-          const runs = manager.listRuns();
-          const runIdArg = parts[2];
-          // Pick the named run, else the most recent run that still has its script.
-          const run = runIdArg ? runs.find((r) => r.runId === runIdArg) : runs.find((r) => r.script);
-          if (!run?.script) {
-            ctx.ui.notify(runIdArg ? `No run ${runIdArg} with a script` : "No saved run to save", "error");
-            return;
-          }
-          let saved: ReturnType<WorkflowStorage["save"]>;
-          try {
-            saved = storage.save({
-              name,
-              description: run.workflowName,
-              script: run.script,
-              location: "project",
-            });
-          } catch (error) {
-            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-            return;
-          }
-          registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
-            storage.list().some((w) => w.name === saved.name),
-          );
-          ctx.ui.notify(`Saved /${name} (from ${run.runId})`, "info");
           return;
         }
         default:

@@ -16,7 +16,6 @@ import {
 import { formatWorkflowFailure, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
-import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
 
 /**
@@ -148,8 +147,6 @@ export interface WorkflowToolOptions {
   concurrency?: number;
   /** Shared manager so background runs are reachable from the `/workflows` command. */
   manager?: WorkflowManager;
-  /** Shared saved-workflow storage. */
-  storage?: WorkflowStorage;
   /** Default per-agent timeout for runs created by this tool. null means no hard timeout. */
   defaultAgentTimeoutMs?: number | null;
   /** Default max concurrent agents when no tool-level concurrency is passed. */
@@ -159,7 +156,6 @@ export interface WorkflowToolOptions {
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
-  const storage = options.storage ?? createWorkflowStorage(options.cwd ?? process.cwd());
   const cwd = options.cwd ?? process.cwd();
   const defaults = resolveWorkflowToolDefaults(options, cwd);
   const manager =
@@ -167,7 +163,6 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     new WorkflowManager({
       cwd: options.cwd,
       concurrency: defaults.concurrency,
-      loadSavedWorkflow: (name: string) => storage.load(name)?.script,
       defaultAgentTimeoutMs: defaults.agentTimeoutMs,
       defaultAgentRetries: defaults.agentRetries,
     });
@@ -196,9 +191,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           "const results = await parallel(items.map(item => () => agent('task + context + paths', { label: 'unique 2-4 words', tier: 'small' })))",
           "return { ok: true, verdict: '...', results }",
         ].join("\n"),
-        "Globals: agent(prompt, opts), parallel(thunks: Array<() => Promise<unknown>>), pipeline(items, ...stages), phase(title), bash(cmd, {cwd?, timeoutMs?}), log(msg), args, cwd, budget, workflow('saved-name', args) (nests one level; global caps hold). Helpers built on agent(): verify(item,{reviewers,lens}), judgePanel(attempts,{judges,rubric}), loopUntilDry({round,key}), completenessCheck(args,results), retry(thunk,{attempts,until}), gate(thunk,validator,{attempts}), checkpoint(question). checkpoint always pauses and transfers its question to the parent conversation; continue the same run with workflow({resumeRunId,reply}).",
+        "Globals: agent(prompt, opts), parallel(thunks: Array<() => Promise<unknown>>), pipeline(items, ...stages), phase(title), bash(cmd, {cwd?, timeoutMs?}), log(msg), args, cwd, budget, checkpoint(question). checkpoint always pauses and transfers its question to the parent conversation; continue the same run with the host workflow({resumeRunId, reply}) tool call.",
+        "parallel() and pipeline() reject on branch failure. For best effort, catch inside each branch or pipeline stage (for example, () => agent(...).catch(() => fallback)); never attach .catch to parallel(...) or pipeline(...), because the aggregate can reject while sibling branches are still running. Results keep input order on success.",
         "bash(cmd) runs a shell command and returns {pid, exitCode, stdoutFile, stderrFile}. Full stdout/stderr go to those files; do not paste output directly through the workflow result. Use it for mechanical steps (grep/build/test), check exitCode, then pass the file paths to agent() so subagents can read/grep the files. Results are journaled so resume replays them without re-running.",
-        "parallel() takes an array of zero-arg functions (thunks), not promises. Correct: await parallel(items.map(item => () => agent(...))). Wrong: await parallel(items.map(item => agent(...))) and wrong: await parallel(items.map(async item => agent(...))). Before calling workflow, self-check every parallel(...) argument: each array element must be a function you have not called yet. Results keep input order; failed branches return null and log: check for nulls before synthesizing. pipeline() runs stages sequentially per item, items concurrently; each stage gets (prev, original, index).",
         "Subagents have NO parent context unless you give it to them: each prompt must carry the task, relevant paths, and expected output. For machine-readable output pass a plain JSON Schema via opts.schema (not TypeScript/TypeBox). opts.cwd runs an agent in another directory. Session args: opts.forkFrom forks an existing Pi session file as read-only starting context; opts.sessionPath persists/continues this subagent's working session (relative paths resolve under ~/.pi/workflows/sessions/); using both forks into a new persistent session and is invalid if the target already exists. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle still applies. With multiple phases, call phase('Exact Title') before each phase's work so agents group correctly. End with a synthesis agent when combining results; return a compact JSON-serializable value.",
         modelRoutingGuideline(() => manager.getModelRegistry()),
         agentTypeGuideline(),

@@ -105,32 +105,44 @@ return a`,
   assert.equal(journal.length, 1, "only the final success is journaled");
 });
 
-test("runWorkflow returns null when recoverable retries are exhausted", async () => {
+test("runWorkflow throws the classified recoverable error when retries are exhausted", async () => {
   let calls = 0;
   const logs: string[] = [];
   const journal: JournalEntry[] = [];
-  const result = await runWorkflow(
-    `export const meta = { name: 'retry_exhausted', description: 'retry exhausted' }
+  let ended: { label: string; errorCode?: WorkflowErrorCode; recoverable?: boolean } | undefined;
+
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'retry_exhausted', description: 'retry exhausted' }
 const a = await agent('work', { label: 'a' })
 return a`,
-    {
-      agent: {
-        async run() {
-          calls++;
-          return "";
+        {
+          agent: {
+            async run() {
+              calls++;
+              return "";
+            },
+          },
+          agentRetries: 1,
+          persistLogs: false,
+          onLog: (message) => logs.push(message),
+          onAgentEnd: (event) => (ended = event),
+          onAgentJournal: (entry) => journal.push(entry),
         },
-      },
-      agentRetries: 1,
-      persistLogs: false,
-      onLog: (message) => logs.push(message),
-      onAgentJournal: (entry) => journal.push(entry),
-    },
+      ),
+    (error: unknown) =>
+      error instanceof WorkflowError &&
+      error.code === WorkflowErrorCode.AGENT_EMPTY_OUTPUT &&
+      error.recoverable &&
+      error.agentLabel === "a",
   );
 
-  assert.equal(result.result, null);
-  assert.equal(calls, 2);
-  assert.equal(result.agentCount, 1);
-  assert.equal(journal.length, 0, "failed/null recoverable results are not journaled");
+  assert.equal(calls, 2, "one initial attempt plus the one configured retry");
+  assert.equal(journal.length, 0, "failed calls are never journaled as successes");
+  assert.equal(ended?.label, "a");
+  assert.equal(ended?.errorCode, WorkflowErrorCode.AGENT_EMPTY_OUTPUT);
+  assert.equal(ended?.recoverable, true);
   assert.ok(
     logs.some((message) => /retrying/i.test(message)),
     "logs should mention retrying",
@@ -456,45 +468,16 @@ test("callSeq is deterministic under parallel()", async () => {
   );
 });
 
-test("workflow() runs a nested saved workflow and shares the global agent counter", async () => {
-  const child = `export const meta = { name: 'child', description: 'c' }
-const r = await agent('child task', { label: 'c' })
-return { child: r }`;
-  const parent = `export const meta = { name: 'parent', description: 'p' }
-const a = await agent('parent task', { label: 'p' })
-const nested = await workflow('child', { foo: 1 })
-return { a, nested }`;
+test("removed nested and quality globals are unavailable in the workflow VM", async () => {
+  const script = `export const meta = { name: 'removed_globals', description: 'removed globals' }
+return [typeof workflow, typeof verify, typeof judgePanel, typeof loopUntilDry, typeof completenessCheck, typeof retry, typeof gate]`;
 
-  const result = await runWorkflow<{ a: string; nested: { child: string } }>(parent, {
-    agent: countingAgent().runner,
-    persistLogs: false,
-    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
-  });
+  const result = await runWorkflow<string[]>(script, { agent: countingAgent().runner, persistLogs: false });
 
-  assert.equal(result.agentCount, 2);
-  assert.equal(result.result.nested.child, "ran:child task");
-});
-
-test("workflow() nesting is one level deep (second level throws)", async () => {
-  const map: Record<string, string> = {
-    gc: `export const meta = { name: 'gc', description: 'g' }
-await agent('gc', { label: 'g' })
-return 1`,
-    child: `export const meta = { name: 'child', description: 'c' }
-await workflow('gc')
-return 2`,
-  };
-  const parent = `export const meta = { name: 'parent', description: 'p' }
-let err = null
-try { await workflow('child') } catch (e) { err = String(e && e.message || e) }
-return { err }`;
-
-  const result = await runWorkflow<{ err: string }>(parent, {
-    agent: countingAgent().runner,
-    persistLogs: false,
-    loadSavedWorkflow: (name) => map[name],
-  });
-  assert.match(result.result.err, /one level deep/);
+  assert.deepEqual(
+    [...result.result],
+    ["undefined", "undefined", "undefined", "undefined", "undefined", "undefined", "undefined"],
+  );
 });
 
 test("runWorkflow budget gates on accumulated tokens", async () => {
@@ -533,31 +516,129 @@ return xs`;
   );
 });
 
-test("explicit non-recoverable VM errors propagate out of parallel()", async () => {
-  const script = `export const meta = { name: 'fatal_parallel', description: 'fatal lane failure' }
-const run = async () => {
-  const result = await agent('lane', { label: 'lane' })
-  if (result === null) {
-    const error = new Error('lane exhausted')
-    error.code = 'AGENT_EXECUTION_ERROR'
-    error.recoverable = false
-    error.agentLabel = 'lane'
-    throw error
-  }
-  return result
-}
-return await parallel([() => run()])`;
-  let thrown: unknown;
-  try {
-    await runWorkflow(script, { agent: { run: async () => "" }, persistLogs: false });
-  } catch (error) {
-    thrown = error;
-  }
+test("parallel propagates exhausted recoverable errors and supports per-branch best effort", async () => {
+  const failScript = `export const meta = { name: 'recoverable_parallel', description: 'recoverable lane failure' }
+return await parallel([() => agent('lane', { label: 'lane' })])`;
+  await assert.rejects(
+    () => runWorkflow(failScript, { agent: { run: async () => "" }, persistLogs: false }),
+    (error: unknown) =>
+      error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_EMPTY_OUTPUT && error.recoverable,
+  );
 
-  assert.ok(thrown instanceof WorkflowError);
-  assert.equal(thrown.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
-  assert.equal(thrown.recoverable, false);
-  assert.equal(thrown.agentLabel, "lane");
+  const bestEffortScript = `export const meta = { name: 'best_effort_parallel', description: 'local catch fallback' }
+const results = await parallel([
+  () => agent('bad', { label: 'bad' }).catch(() => 'fallback'),
+  () => agent('good', { label: 'good' }),
+])
+const after = await agent('after', { label: 'after' })
+return { results, after }`;
+  const result = await runWorkflow(bestEffortScript, {
+    agent: { run: async (prompt: string) => (prompt === "bad" ? "" : prompt) },
+    persistLogs: false,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), { results: ["fallback", "good"], after: "after" });
+});
+
+test("detached parallel and pipeline failures keep their exact returned promises observed", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    for (const body of [
+      `parallel([() => { throw new Error('detached parallel') }])`,
+      `pipeline(['x'], () => { throw new Error('detached pipeline') })`,
+    ]) {
+      const script = `export const meta = { name: 'detached_combinator', description: 'observe rejection' }
+${body}
+await Promise.resolve()
+return 'done'`;
+      await runWorkflow(script, { persistLogs: false }).catch(() => undefined);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("parallel schedules every thunk when an earlier thunk throws synchronously", async () => {
+  const started: string[] = [];
+  const script = `export const meta = { name: 'sync_parallel_throw', description: 'schedule every branch' }
+return await parallel([
+  () => { throw new Error('sync branch failure') },
+  () => agent('later', { label: 'later' }),
+])`;
+  const run = runWorkflow(script, {
+    agent: {
+      async run(prompt: string) {
+        started.push(prompt);
+        return prompt;
+      },
+    },
+    persistLogs: false,
+  });
+
+  await assert.rejects(run, /sync branch failure/);
+  for (let i = 0; i < 10 && !started.includes("later"); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.deepEqual(started, ["later"]);
+});
+
+test("pipeline keeps its runtime-owned branch live while a later stage yields", async () => {
+  const gate = createDeferred<void>();
+  const stageEntered = createDeferred<void>();
+  const live = new Set<Promise<unknown>>();
+  const script = `export const meta = { name: 'pipeline_branch_lifetime', description: 'track yielded branch' }
+try {
+  await pipeline(['bad', 'slow'],
+    (item) => agent(item + '-one', { label: item + '-one' }),
+    async (value) => {
+      if (value === 'slow-one') {
+        args.stageEntered()
+        await args.gate
+        return agent('slow-two', { label: 'slow-two' })
+      }
+      return value
+    },
+  )
+} catch {}
+return 'continued after aggregate catch'`;
+  const run = runWorkflow(script, {
+    args: { gate: gate.promise, stageEntered: () => stageEntered.resolve() },
+    agent: { run: async (prompt: string) => (prompt === "bad-one" ? "" : prompt) },
+    persistLogs: false,
+    onRuntimeOwnedWorkStart(work) {
+      live.add(work);
+      void work.then(
+        () => live.delete(work),
+        () => live.delete(work),
+      );
+    },
+  });
+
+  await stageEntered.promise;
+  await assert.rejects(
+    run,
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+  );
+  assert.ok(live.size > 0, "the yielded pipeline branch remains runtime-owned after aggregate rejection");
+
+  gate.resolve();
+  for (let i = 0; i < 10 && live.size > 0; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(live.size, 0);
+});
+
+test("pipeline propagates recoverable failures rather than converting them to null", async () => {
+  const script = `export const meta = { name: 'recoverable_pipeline', description: 'recoverable pipeline failure' }
+return await pipeline([0], () => agent('lane', { label: 'lane' }))`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: { run: async () => "" }, persistLogs: false }),
+    (error: unknown) =>
+      error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_EMPTY_OUTPUT && error.recoverable,
+  );
 });
 
 test("non-recoverable agent-limit propagates out of pipeline() too", async () => {
@@ -938,4 +1019,38 @@ return r`;
     });
     assert.equal(rerun.state.calls, 1, `changed ${label} must re-run live`);
   }
+});
+
+test("parallel rejection does not cancel started or queued agent siblings", async () => {
+  const release = createDeferred<void>();
+  const started: string[] = [];
+  const completed: string[] = [];
+  const signals: AbortSignal[] = [];
+  const script = `export const meta = { name: 'parallel_siblings', description: 'branch failures do not cancel siblings' }
+return await parallel(['bad', 'slow-a', 'slow-b'].map((prompt) => () => agent(prompt, { label: prompt })))`;
+  const run = runWorkflow(script, {
+    concurrency: 1,
+    persistLogs: false,
+    agent: {
+      async run(prompt: string, options: { signal: AbortSignal }) {
+        started.push(prompt);
+        signals.push(options.signal);
+        if (prompt === "bad") return "";
+        await release.promise;
+        completed.push(prompt);
+        return prompt;
+      },
+    },
+  });
+
+  await assert.rejects(run, (error: unknown) => error instanceof WorkflowError && error.recoverable);
+  while (!started.includes("slow-a")) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(started, ["bad", "slow-a"], "the queued sibling starts after the first branch rejects");
+  release.resolve();
+  while (!completed.includes("slow-b")) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(completed, ["slow-a", "slow-b"]);
+  assert.ok(
+    signals.every((signal) => !signal.aborted),
+    "branch failure does not abort sibling attempt signals",
+  );
 });

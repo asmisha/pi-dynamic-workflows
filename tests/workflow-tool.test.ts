@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -107,7 +108,7 @@ test("createWorkflowTool promptGuidelines mention retry and concurrency controls
 
   assert.match(all, /low concurrency/i);
   assert.match(all, /agentRetries/i);
-  assert.match(all, /null/i);
+  assert.match(all, /catch/i);
 });
 
 // ─── modelRoutingGuideline ──────────────────────────────────────────────────────
@@ -165,6 +166,48 @@ test("createWorkflowTool invalid args throws descriptive error", () => {
 test("createWorkflowTool with custom cwd creates tool", () => {
   const tool = createWorkflowTool({ cwd: "/tmp" });
   assert.equal(tool.name, "workflow");
+});
+
+test("workflow tool leaves legacy, user, and project saved-workflow JSON untouched", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-tool-saved-sentinel-"));
+  const home = mkdtempSync(join(tmpdir(), "workflow-tool-saved-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const paths = workflowProjectPaths(cwd);
+      const sentinels = [
+        join(cwd, ".pi", "workflows", "saved", "legacy.json"),
+        join(home, ".pi", "workflows", "saved", "user.json"),
+        join(paths.rootDir, "saved", "project.json"),
+      ];
+      for (const path of sentinels) {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, '{"name":"sentinel","script":"return 1"}\n');
+      }
+      const before = sentinels.map((path) => readFileSync(path));
+      const manager = new WorkflowManager({ cwd, agent: { run: async () => "unused" } as any });
+      const tool = createWorkflowTool({ cwd, manager });
+      const execute = tool.execute as (...args: any[]) => Promise<any>;
+      const result = await execute(
+        "call-sentinel",
+        {
+          script: "export const meta = { name: 'inline', description: 'inline only' }\nawait agent('ok')\nreturn 'ok'",
+          background: false,
+        },
+        new AbortController().signal,
+        () => {},
+        { hasUI: false },
+      );
+
+      assert.equal(result.details.result, "ok");
+      assert.deepEqual(
+        sentinels.map((path) => readFileSync(path)),
+        before,
+      );
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("foreground execution reports the original top-level workflow error", async () => {

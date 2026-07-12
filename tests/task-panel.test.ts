@@ -238,6 +238,35 @@ describe("installResultDelivery", () => {
     assert.equal(calls.length, 0);
   });
 
+  it("does not deliver terminal results or errors outside the current session", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    manager.isRunInCurrentSession = () => false;
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+    manager.emit("error", { runId: "test-run-1", error: { message: "private failure" } });
+
+    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    assert.equal(calls.length, 0);
+  });
+
+  it("rechecks session ownership before retrying delivery", async () => {
+    const first = createMockPi();
+    first.sendMessage = () => Promise.reject(new Error("stale session"));
+    const second = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    mod.installResultDelivery(first as unknown as ExtensionAPI, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    manager.isRunInCurrentSession = () => false;
+    mod.installResultDelivery(second as unknown as ExtensionAPI, manager);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.equal(second._calls.length, 0, "a retry must not cross into the newly active session");
+  });
+
   // ── Paused (usage-limit checkpoint) event ──
 
   it("delivers a resumable checkpoint message on a usage-limit paused event", () => {

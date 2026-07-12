@@ -129,39 +129,6 @@ return 'unreachable'`;
   );
 });
 
-test("checkpoint(): rejects placement inside nested workflow", async () => {
-  const parent = `export const meta = { name: 'parent', description: 'parent' }
-return await workflow('child')`;
-  const child = `export const meta = { name: 'child', description: 'child' }
-return await checkpoint('unsafe nested')`;
-  await assert.rejects(
-    () =>
-      runWorkflow(parent, {
-        agent: noopAgent,
-        persistLogs: false,
-        loadSavedWorkflow: () => child,
-      }),
-    /before any nested workflow/i,
-  );
-});
-
-test("checkpoint(): rejects placement after nested workflow work", async () => {
-  const parent = `export const meta = { name: 'parent', description: 'parent' }
-await workflow('child')
-return await checkpoint('unsafe after nested')`;
-  const child = `export const meta = { name: 'child', description: 'child' }
-return await agent('child work')`;
-  await assert.rejects(
-    () =>
-      runWorkflow(parent, {
-        agent: noopAgent,
-        persistLogs: false,
-        loadSavedWorkflow: () => child,
-      }),
-    /before any nested workflow/i,
-  );
-});
-
 test("checkpoint(): allows at most one parent decision per run", async () => {
   const script = `export const meta = { name: 'c', description: 'checkpoint' }
 const first = await checkpoint('first')

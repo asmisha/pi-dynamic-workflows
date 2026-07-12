@@ -74,7 +74,9 @@ export interface ManagedRun {
   pauseReason?: "manual" | "usage_limit" | "human_input";
   /** True after the user removes the run; suppresses final persistence from the unwinding execution. */
   deleted?: boolean;
-  /** True once the run's execution fully unwound (final state persisted, lease released). */
+  /** True while surviving runtime-owned siblings drain after the first terminal failure. */
+  draining?: boolean;
+  /** True once all runtime-owned work unwound, final state persisted, and the lease released. */
   finalized?: boolean;
   /**
    * True when the run was started in the background (or resumed) and the caller is
@@ -112,8 +114,6 @@ export interface ExecOptions {
 export interface WorkflowManagerOptions {
   cwd?: string;
   concurrency?: number;
-  /** Resolve a saved-workflow name to its script, enabling nested `workflow('name')`. */
-  loadSavedWorkflow?: (name: string) => string | undefined;
   /** Inject a custom agent runner (tests); defaults to a real subagent session. */
   agent?: Pick<WorkflowAgent, "run">;
   /** The session's main model (provider/id), for auto-tiering explore agents. */
@@ -137,7 +137,6 @@ export class WorkflowManager extends EventEmitter {
   private persistence: RunPersistence;
   private cwd: string;
   private concurrency: number;
-  private loadSavedWorkflow?: (name: string) => string | undefined;
   private agent?: Pick<WorkflowAgent, "run">;
   /** The session's main model (provider/id), for auto-tiering explore agents. */
   private mainModel?: string;
@@ -157,7 +156,6 @@ export class WorkflowManager extends EventEmitter {
     super();
     this.cwd = options.cwd ?? process.cwd();
     this.concurrency = options.concurrency ?? 8;
-    this.loadSavedWorkflow = options.loadSavedWorkflow;
     this.agent = options.agent;
     this.mainModel = options.mainModel;
     this.modelRegistry = options.modelRegistry;
@@ -393,6 +391,30 @@ export class WorkflowManager extends EventEmitter {
       agentRetries: resolvedAgentRetries,
     };
     const progress = () => onProgress?.(managed.snapshot);
+    const runtimeOwnedWork = new Set<Promise<unknown>>();
+    const observeRuntimeOwnedWork = (work: Promise<unknown>) => {
+      runtimeOwnedWork.add(work);
+      void work.then(
+        () => runtimeOwnedWork.delete(work),
+        () => runtimeOwnedWork.delete(work),
+      );
+    };
+    const waitForRuntimeOwnedWork = async () => {
+      while (runtimeOwnedWork.size > 0 && !managed.controller.signal.aborted) {
+        const pending = [...runtimeOwnedWork];
+        await new Promise<void>((resolve) => {
+          let finished = false;
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            managed.controller.signal.removeEventListener("abort", finish);
+            resolve();
+          };
+          managed.controller.signal.addEventListener("abort", finish, { once: true });
+          void Promise.allSettled(pending).then(finish);
+        });
+      }
+    };
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
       if (externalSignal.aborted) managed.controller.abort();
@@ -413,7 +435,7 @@ export class WorkflowManager extends EventEmitter {
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget,
         initialTokenUsage,
-        loadSavedWorkflow: this.loadSavedWorkflow,
+        onRuntimeOwnedWorkStart: observeRuntimeOwnedWork,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
         onAgentJournal: (entry) => {
@@ -509,6 +531,14 @@ export class WorkflowManager extends EventEmitter {
           : wrappedError;
 
       const checkpoint = checkpointFromError(workflowError);
+      const usageLimitPaused =
+        !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
+      // Paused runs remain resumable, so their journal must be quiescent before
+      // releasing the lease. Ordinary failures are terminal and persist promptly;
+      // their surviving combinator branches drain passively after finalization.
+      if (!managed.controller.signal.aborted && (checkpoint || usageLimitPaused)) {
+        await waitForRuntimeOwnedWork();
+      }
       if (!managed.controller.signal.aborted && checkpoint) {
         managed.status = "paused";
         managed.pendingCheckpoint = checkpoint;
@@ -538,8 +568,6 @@ export class WorkflowManager extends EventEmitter {
         });
       }
 
-      const usageLimitPaused =
-        !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
       let abortedByHost = false;
       if (managed.controller.signal.aborted) {
         // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
@@ -581,12 +609,30 @@ export class WorkflowManager extends EventEmitter {
         this.emit("error", { runId: managed.runId, error: workflowError });
       }
 
-      // Persist final state. The lease is held until here — pause()/stop() do not
-      // release it early, so another process cannot resume this run and have its
-      // state clobbered by this late persist.
-      this.persistRun(managed);
-      managed.finalized = true;
-      this.releaseRunLease(managed);
+      // Persist the first terminal error promptly. Failed fan-outs retain their
+      // lease while surviving runtime-owned siblings drain, preventing another
+      // process from racing late journal/snapshot updates. The workflow promise
+      // still rejects now; stop/delete/external abort can interrupt the drain.
+      const terminalPersisted = this.persistRun(managed);
+      if (managed.status === "failed") {
+        managed.draining = true;
+        void (async () => {
+          await waitForRuntimeOwnedWork();
+          if (managed.deleted || managed.finalized) return;
+          managed.draining = false;
+          // Keep the lease when persistence fails: an in-process resume must not
+          // replay a sparse journal. A later stop/delete can retry or remove it.
+          if (!this.persistRun(managed)) return;
+          managed.finalized = true;
+          this.releaseRunLease(managed);
+        })().catch(() => {
+          // waitForRuntimeOwnedWork uses allSettled; this is a final guard against
+          // an unhandled finalizer rejection if that implementation changes.
+        });
+      } else if (terminalPersisted) {
+        managed.finalized = true;
+        this.releaseRunLease(managed);
+      }
 
       throw workflowError;
     }
@@ -712,8 +758,10 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * Resume an interrupted run: replay journaled results for the unchanged prefix
-   * and run the rest live. A human-input pause must use resumeWithReply().
+   * Resume a paused or interrupted run: replay journaled results for the unchanged
+   * prefix and run the rest live. Failed runs are terminal because a sparse journal
+   * cannot safely preserve longest-prefix replay. A human-input pause must use
+   * resumeWithReply().
    */
   async resume(runId: string): Promise<boolean> {
     const active = this.runs.get(runId);
@@ -723,6 +771,7 @@ export class WorkflowManager extends EventEmitter {
     if (
       !persisted?.script ||
       persisted.status === "completed" ||
+      persisted.status === "failed" ||
       persisted.status === "aborted" ||
       persisted.pendingCheckpoint
     ) {
@@ -824,21 +873,28 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * Stop a running or paused workflow.
+   * Stop a running/paused workflow or surviving siblings draining after failure.
    */
   stop(runId: string): boolean {
     const managed = this.runs.get(runId);
     if (managed) {
-      if (managed.status !== "running" && managed.status !== "paused") return false;
+      const canStop =
+        managed.status === "running" ||
+        managed.status === "paused" ||
+        (managed.status === "failed" && !managed.finalized);
+      if (!canStop) return false;
 
       managed.controller.abort();
+      managed.draining = false;
       managed.status = "aborted";
       this.emit("stopped", { runId });
-      // Same contract as pause(): persist the final state, mark finalized so the
-      // unwinding execution's late persist is suppressed, release the lease.
-      this.persistRun(managed);
-      managed.finalized = true;
-      this.releaseRunLease(managed);
+      // Same contract as pause(): suppress late writes only after the terminal
+      // state is durable. If persistence fails, retain the lease so a sparse run
+      // cannot be resumed by this or another live manager.
+      if (this.persistRun(managed)) {
+        managed.finalized = true;
+        this.releaseRunLease(managed);
+      }
       return true;
     }
 

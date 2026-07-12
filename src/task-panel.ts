@@ -17,7 +17,6 @@ import {
 } from "./display.js";
 import { formatWorkflowFailure } from "./errors.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
-import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
 import { shortModel } from "./workflow-ui.js";
 
@@ -40,8 +39,6 @@ const RUN_EVENTS = [
 const RUN_END_EVENTS = ["complete", "error", "stopped"] as const;
 
 export interface TaskPanelOptions {
-  storage?: WorkflowStorage;
-  cwd?: string;
   /**
    * Live settings loader. When provided, the panel reads it fresh (with a short
    * TTL cache) on each render so `/workflows-progress` takes effect without a
@@ -115,10 +112,13 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
   m.__deliveryInstalled = true;
   m.__holder = { pi };
 
-  const deliver = (content: string, attempt = 0) => {
+  const deliver = (runId: string, content: string, attempt = 0) => {
+    // A retry may fire after session_start swapped the mutable Pi holder. Recheck
+    // ownership on every attempt so diagnostics never cross session boundaries.
+    if (!manager.isRunInCurrentSession(runId)) return;
     const retry = () => {
       if (attempt >= 2) return;
-      const timer = setTimeout(() => deliver(content, attempt + 1), 250 * (attempt + 1));
+      const timer = setTimeout(() => deliver(runId, content, attempt + 1), 250 * (attempt + 1));
       (timer as { unref?: () => void }).unref?.();
     };
     try {
@@ -141,7 +141,7 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
   m.__deliverPendingCheckpoints = () => {
     for (const run of manager.listRuns()) {
       if (run.status === "paused" && run.pauseReason === "human_input" && run.pendingCheckpoint) {
-        deliver(checkpointText(run.runId, run.pendingCheckpoint.prompt));
+        deliver(run.runId, checkpointText(run.runId, run.pendingCheckpoint.prompt));
       }
     }
   };
@@ -150,12 +150,13 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     const run = manager.getRun(runId);
     // Only background/resumed runs are delivered: a foreground (sync) run already
     // returns its result inline as the tool result, so re-delivering would dup it.
-    if (run?.background) deliver(deliverText(run));
+    if (run?.background) deliver(runId, deliverText(run));
   });
   manager.on("error", ({ runId, error }: { runId: string; error?: unknown }) => {
     const run = manager.getRun(runId);
-    if (!run?.background) return;
+    if (!run?.background || !manager.isRunInCurrentSession(runId)) return;
     deliver(
+      runId,
       `✗ ${formatWorkflowFailure(error, {
         runId,
         ...resolveWorkflowFailureLocation(run.snapshot, run.error?.agentLabel),
@@ -181,13 +182,14 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     }) => {
       if (!manager.getRun(runId)?.background || !manager.isRunInCurrentSession(runId)) return;
       if (reason === "human_input" && checkpoint) {
-        deliver(checkpointText(runId, checkpoint.prompt));
+        deliver(runId, checkpointText(runId, checkpoint.prompt));
         return;
       }
       if (reason !== "usage_limit") return;
       const when = resetHint ? ` (${resetHint})` : "";
       const cause = error?.message ?? "provider usage limit reached";
       deliver(
+        runId,
         `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
           `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
       );

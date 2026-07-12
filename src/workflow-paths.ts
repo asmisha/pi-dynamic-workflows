@@ -9,7 +9,7 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import { WORKFLOW_RUNS_DIR, WORKFLOW_SAVED_DIR } from "./config.js";
+import { WORKFLOW_RUNS_DIR } from "./config.js";
 
 export const WORKFLOW_HOME_RELATIVE_DIR = ".pi/workflows";
 export const WORKFLOW_PROJECTS_SUBDIR = "projects";
@@ -18,18 +18,12 @@ export interface WorkflowProjectPaths {
   key: string;
   rootDir: string;
   runsDir: string;
-  savedDir: string;
   settingsPath: string;
   legacyRunsDir: string;
-  legacySavedDir: string;
 }
 
 export function workflowHomeDir(): string {
   return join(homedir(), WORKFLOW_HOME_RELATIVE_DIR);
-}
-
-export function workflowUserSavedDir(): string {
-  return join(workflowHomeDir(), "saved");
 }
 
 /** Dedicated home for persisted subagent sessions (~/.pi/workflows/sessions). */
@@ -70,10 +64,8 @@ export function workflowProjectPaths(cwd: string): WorkflowProjectPaths {
     key,
     rootDir,
     runsDir: join(rootDir, "runs"),
-    savedDir: join(rootDir, "saved"),
     settingsPath: join(rootDir, "settings.json"),
     legacyRunsDir: resolve(cwd, WORKFLOW_RUNS_DIR),
-    legacySavedDir: resolve(cwd, WORKFLOW_SAVED_DIR),
   };
 }
 

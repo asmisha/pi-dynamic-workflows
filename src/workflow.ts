@@ -46,20 +46,13 @@ export interface JournalEntry {
   result: unknown;
 }
 
-/**
- * Global resources shared across a run and any workflow() nested inside it, so
- * the 16-concurrent / 1000-total caps and the token budget hold across nesting
- * instead of each level getting its own limiter and counters.
- */
+/** Global resources shared by the runtime's agent and bash primitives. */
 export interface SharedRuntime {
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
   agentCount: number;
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
-  depth: number;
-  /** Whether nested workflow() work has run before a possible checkpoint. */
-  nestedUsed: boolean;
-  /** Live or queued agent/bash calls; checkpoints require this to be zero. */
+  /** Live/queued agent/bash calls and combinator branches; checkpoints require this to be zero. */
   activeCalls: number;
 }
 
@@ -95,10 +88,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   initialTokenUsage?: Partial<SharedRuntime["tokenUsage"]>;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
-  /** Internal: shared runtime inherited by a nested workflow() call. */
-  sharedRuntime?: SharedRuntime;
-  /** Resolve a saved-workflow name to its script, enabling `workflow('name', args)`. */
-  loadSavedWorkflow?: (name: string) => string | undefined;
+  /** Internal: observes runtime-owned agent()/bash() promises and combinator branches. */
+  onRuntimeOwnedWorkStart?: (work: Promise<unknown>) => void;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
@@ -309,9 +300,8 @@ export async function runWorkflow<T = unknown>(
   const concurrency = normalizeConcurrency(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
-  // Global caps + budget are shared with any nested workflow() so they hold across nesting.
   const initialUsage = options.initialTokenUsage;
-  const shared: SharedRuntime = options.sharedRuntime ?? {
+  const shared: SharedRuntime = {
     limiter: createLimiter(concurrency),
     agentCount: 0,
     spent: initialUsage?.total ?? 0,
@@ -323,12 +313,27 @@ export async function runWorkflow<T = unknown>(
       cacheRead: initialUsage?.cacheRead ?? 0,
       cacheWrite: initialUsage?.cacheWrite ?? 0,
     },
-    depth: 0,
-    nestedUsed: false,
     activeCalls: 0,
   };
   const limiter = shared.limiter;
   const executionContext = new AsyncLocalStorage<{ concurrent: boolean }>();
+  const observeRuntimeOwnedWork = <T>(work: Promise<T>): Promise<T> => {
+    // Keep the exact promise returned to workflow code observed even when a
+    // malformed script discards it. The handler does not change rejection
+    // semantics for callers that await/return the promise.
+    void work.catch(() => {});
+    options.onRuntimeOwnedWorkStart?.(work);
+    return work;
+  };
+  const trackCombinatorBranch = <T>(branch: Promise<T>): Promise<T> => {
+    shared.activeCalls++;
+    const work = observeRuntimeOwnedWork(branch);
+    void work.then(
+      () => shared.activeCalls--,
+      () => shared.activeCalls--,
+    );
+    return work;
+  };
 
   const log = (message: string) => {
     const text = String(message);
@@ -360,7 +365,7 @@ export async function runWorkflow<T = unknown>(
     }
   };
 
-  const agent = async (prompt: string, agentOptions: AgentOptions = {}) => {
+  const agentImpl = async (prompt: string, agentOptions: AgentOptions = {}) => {
     throwIfAborted();
 
     // Check agent limit
@@ -447,7 +452,7 @@ export async function runWorkflow<T = unknown>(
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
     shared.activeCalls++;
-    return limiter(async () => {
+    const work = limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
@@ -565,24 +570,29 @@ export async function runWorkflow<T = unknown>(
             log(
               `agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`,
             );
-            return null;
           }
           throw workflowError;
         } finally {
           options.signal?.removeEventListener("abort", onRunAbort);
         }
       }
-      return null;
+      throw new WorkflowError("agent retry loop exited unexpectedly", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+        recoverable: false,
+        agentLabel: label,
+      });
     }).finally(() => {
       shared.activeCalls--;
     });
+    return work;
   };
+  const agent = (prompt: string, agentOptions: AgentOptions = {}): Promise<unknown> =>
+    observeRuntimeOwnedWork(agentImpl(prompt, agentOptions));
 
   // Journaled shell step: run a command, write full stdout/stderr to files, and
   // cache the result by call index exactly like agent(). Bash output is
   // nondeterministic, so the journal is what keeps resume's longest-unchanged-
   // prefix contract intact without re-running side effects.
-  const bash = async (
+  const bashImpl = async (
     command: string,
     bashOptions: { cwd?: string; timeoutMs?: number | null } = {},
   ): Promise<WorkflowBashResult> => {
@@ -599,272 +609,80 @@ export async function runWorkflow<T = unknown>(
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
     shared.activeCalls++;
-    try {
-      const output = bashOutputFiles(baseCwd, runId, callIndex, options.persistLogs ?? true);
-      const result = await runBashCommand(command, {
-        cwd: bashOptions.cwd ?? baseCwd,
-        timeoutMs: bashOptions.timeoutMs ?? null,
-        signal: options.signal,
-        stdoutFile: output.stdoutFile,
-        stderrFile: output.stderrFile,
-      });
-      throwIfAborted();
-      const shortCmd = command.length > 80 ? `${command.slice(0, 80)}…` : command;
-      log(
-        `$ ${shortCmd} (pid ${result.pid ?? "?"}, exit ${result.exitCode ?? "signal"}; stdout ${result.stdoutFile}; stderr ${result.stderrFile})`,
-      );
-      options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
-      return result;
-    } finally {
-      shared.activeCalls--;
-    }
+    const work = (async () => {
+      try {
+        const output = bashOutputFiles(baseCwd, runId, callIndex, options.persistLogs ?? true);
+        const result = await runBashCommand(command, {
+          cwd: bashOptions.cwd ?? baseCwd,
+          timeoutMs: bashOptions.timeoutMs ?? null,
+          signal: options.signal,
+          stdoutFile: output.stdoutFile,
+          stderrFile: output.stderrFile,
+        });
+        throwIfAborted();
+        const shortCmd = command.length > 80 ? `${command.slice(0, 80)}…` : command;
+        log(
+          `$ ${shortCmd} (pid ${result.pid ?? "?"}, exit ${result.exitCode ?? "signal"}; stdout ${result.stdoutFile}; stderr ${result.stderrFile})`,
+        );
+        options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
+        return result;
+      } finally {
+        shared.activeCalls--;
+      }
+    })();
+    return work;
   };
+  const bash = (
+    command: string,
+    bashOptions: { cwd?: string; timeoutMs?: number | null } = {},
+  ): Promise<WorkflowBashResult> => observeRuntimeOwnedWork(bashImpl(command, bashOptions));
 
-  const parallel = async (thunks: Array<() => Promise<unknown>>) => {
-    throwIfAborted();
-    if (!Array.isArray(thunks)) throw new TypeError("parallel() expects an array of functions");
-    if (thunks.some((thunk) => typeof thunk !== "function")) {
-      throw new TypeError(
-        "parallel() expects an array of zero-arg functions, not promises. Correct: parallel(items.map(item => () => agent(...))). Wrong: parallel(items.map(item => agent(...))) or parallel(items.map(async item => agent(...))).",
-      );
-    }
-    return Promise.all(
-      thunks.map(async (thunk, index) => {
-        try {
-          return await executionContext.run({ concurrent: true }, thunk);
-        } catch (error) {
-          if (options.signal?.aborted) throw error;
-          const workflowError = wrapError(error);
-          // Non-recoverable failures (token budget / agent limit exhausted) must
-          // halt the whole run, exactly like a directly-awaited agent() — not be
-          // swallowed into a null in the result array.
-          if (!workflowError.recoverable) throw workflowError;
-          log(`parallel[${index}] failed: ${workflowError.message}`);
-          return null;
+  const parallel = (thunks: Array<() => Promise<unknown>>): Promise<unknown[]> =>
+    observeRuntimeOwnedWork(
+      (async () => {
+        throwIfAborted();
+        if (!Array.isArray(thunks)) throw new TypeError("parallel() expects an array of functions");
+        if (thunks.some((thunk) => typeof thunk !== "function")) {
+          throw new TypeError(
+            "parallel() expects an array of zero-arg functions, not promises. Correct: parallel(items.map(item => () => agent(...))). Wrong: parallel(items.map(item => agent(...))) or parallel(items.map(async item => agent(...))).",
+          );
         }
-      }),
+        const branches = thunks.map((thunk) =>
+          trackCombinatorBranch(Promise.resolve().then(() => executionContext.run({ concurrent: true }, thunk))),
+        );
+        return Promise.all(branches);
+      })(),
     );
-  };
 
-  const pipeline = async (
+  const pipeline = (
     items: unknown[],
     ...stages: Array<(prev: unknown, original: unknown, index: number) => unknown>
-  ) => {
-    throwIfAborted();
-    if (!Array.isArray(items)) throw new TypeError("pipeline() expects an array as the first argument");
-    if (stages.some((stage) => typeof stage !== "function")) {
-      throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
-    }
-    return Promise.all(
-      items.map((item, index) =>
-        executionContext.run({ concurrent: true }, async () => {
-          let value: unknown = item;
-          for (const stage of stages) {
-            try {
-              throwIfAborted();
-              value = await stage(value, item, index);
-              throwIfAborted();
-            } catch (error) {
-              if (options.signal?.aborted) throw error;
-              const workflowError = wrapError(error);
-              // Non-recoverable failures halt the whole run (see parallel()).
-              if (!workflowError.recoverable) throw workflowError;
-              log(`pipeline[${index}] failed: ${workflowError.message}`);
-              return null;
-            }
-          }
-          return value;
-        }),
-      ),
-    );
-  };
-
-  // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
-  // run's limiter/counters/budget so the global caps hold. One level deep only.
-  const workflowFn = async (nameOrScript: string, childArgs?: unknown) => {
-    throwIfAborted();
-    if (shared.depth >= 1) {
-      throw new WorkflowError("workflow() can nest only one level deep", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
-        recoverable: false,
-      });
-    }
-    const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
-    const childScript = resolved ?? String(nameOrScript);
-    shared.nestedUsed = true;
-    shared.depth++;
-    try {
-      const child = await runWorkflow(childScript, {
-        ...options,
-        args: childArgs,
-        sharedRuntime: shared,
-        // A nested run is its own script; never reuse the parent's resume journal.
-        resumeJournal: undefined,
-        resumeFromRunId: undefined,
-        runId: `${runId}-nested${shared.depth}`,
-        persistLogs: false,
-      });
-      return child.result;
-    } finally {
-      shared.depth--;
-    }
-  };
-
-  // ── Quality-pattern stdlib: reusable, deterministic helpers built purely on
-  // agent()/parallel() (so callSeq ordering stays stable and resume keeps working).
-  // Injected as globals so workflow scripts compose them directly. ──
-
-  const VERIFY_SCHEMA = {
-    type: "object",
-    properties: { real: { type: "boolean" }, reason: { type: "string" } },
-    required: ["real"],
-  };
-  const verify = async (
-    item: unknown,
-    opts: { reviewers?: number; threshold?: number; lens?: string | string[] } = {},
-  ) => {
-    const reviewers = Math.max(1, opts.reviewers ?? 2);
-    const threshold = opts.threshold ?? 0.5;
-    const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
-    const claim = typeof item === "string" ? item : JSON.stringify(item);
-    const votes = (
-      await parallel(
-        Array.from(
-          { length: reviewers },
-          (_v, i) => () =>
-            agent(
-              `Try to refute this claim using the available tools; real=false if unsure.${lenses.length ? ` Lens: ${lenses[i % lenses.length]}.` : ""}\n\n${claim}`,
-              { label: `verify ${i + 1}`, schema: VERIFY_SCHEMA },
+  ): Promise<unknown[]> =>
+    observeRuntimeOwnedWork(
+      (async () => {
+        throwIfAborted();
+        if (!Array.isArray(items)) throw new TypeError("pipeline() expects an array as the first argument");
+        if (stages.some((stage) => typeof stage !== "function")) {
+          throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
+        }
+        const branches = items.map((item, index) =>
+          trackCombinatorBranch(
+            Promise.resolve().then(() =>
+              executionContext.run({ concurrent: true }, async () => {
+                let value: unknown = item;
+                for (const stage of stages) {
+                  throwIfAborted();
+                  value = await stage(value, item, index);
+                  throwIfAborted();
+                }
+                return value;
+              }),
             ),
-        ),
-      )
-    ).filter(Boolean) as Array<{ real?: boolean; reason?: string }>;
-    const realCount = votes.filter((v) => v?.real).length;
-    return { real: votes.length > 0 && realCount / votes.length >= threshold, realCount, total: votes.length, votes };
-  };
-
-  const JUDGE_SCHEMA = {
-    type: "object",
-    properties: { score: { type: "number" }, reason: { type: "string" } },
-    required: ["score"],
-  };
-  const judgePanel = async (attempts: unknown[], opts: { judges?: number; rubric?: string } = {}) => {
-    const judges = Math.max(1, opts.judges ?? 3);
-    const rubric = opts.rubric ?? "overall quality and correctness";
-    const scored = (
-      await parallel(
-        (Array.isArray(attempts) ? attempts : []).map((att, idx) => async () => {
-          const text = typeof att === "string" ? att : JSON.stringify(att);
-          const js = (
-            await parallel(
-              Array.from(
-                { length: judges },
-                (_v, j) => () =>
-                  agent(
-                    `Score 0-1 on: ${rubric}. 0=unusable, 0.5=acceptable, 1=flawless; use the full range.\n\nCandidate:\n${text}`,
-                    {
-                      label: `judge ${idx + 1}.${j + 1}`,
-                      schema: JUDGE_SCHEMA,
-                    },
-                  ),
-              ),
-            )
-          ).filter(Boolean) as Array<{ score?: number }>;
-          const score = js.length ? js.reduce((s, v) => s + (Number(v?.score) || 0), 0) / js.length : 0;
-          return { index: idx, attempt: att, score, judgments: js };
-        }),
-      )
-    ).filter(Boolean) as Array<{ index: number; attempt: unknown; score: number; judgments: unknown[] }>;
-    // Highest mean score; stable tie-break by input index.
-    let best = scored[0];
-    for (const s of scored) if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
-    return best;
-  };
-
-  const loopUntilDry = async (opts: {
-    round: (roundIndex: number) => Promise<unknown[]> | unknown[];
-    key?: (item: unknown) => string;
-    consecutiveEmpty?: number;
-    maxRounds?: number;
-  }) => {
-    if (!opts || typeof opts.round !== "function")
-      throw new TypeError("loopUntilDry requires { round: (i) => items[] }");
-    const key = opts.key ?? ((x: unknown) => JSON.stringify(x));
-    const consecutiveEmpty = Math.max(1, opts.consecutiveEmpty ?? 2);
-    const maxRounds = opts.maxRounds ?? 50;
-    const seen = new Set<string>();
-    const all: unknown[] = [];
-    let dry = 0;
-    for (let r = 0; r < maxRounds && dry < consecutiveEmpty; r++) {
-      let items: unknown[];
-      try {
-        items = (await opts.round(r)) ?? [];
-      } catch (error) {
-        // Budget / agent-limit exhaustion: return the partial result, don't abort.
-        const code = (error as { code?: string })?.code;
-        if (code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED || code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) break;
-        throw error;
-      }
-      const fresh = (Array.isArray(items) ? items : []).filter((x) => x != null && !seen.has(key(x)));
-      if (!fresh.length) {
-        dry++;
-        continue;
-      }
-      dry = 0;
-      for (const x of fresh) {
-        seen.add(key(x));
-        all.push(x);
-      }
-    }
-    return all;
-  };
-
-  const COMPLETENESS_SCHEMA = {
-    type: "object",
-    properties: { complete: { type: "boolean" }, missing: { type: "array", items: { type: "string" } } },
-    required: ["complete"],
-  };
-  const completenessCheck = (taskArgs: unknown, results: unknown) => {
-    const json = JSON.stringify(results);
-    const clipped = json.length > 4000 ? `${json.slice(0, 4000)}…(truncated)` : json;
-    return agent(
-      `List what is still MISSING for the task (uncovered aspects, unverified claims, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${clipped}`,
-      { label: "completeness critic", schema: COMPLETENESS_SCHEMA },
+          ),
+        );
+        return Promise.all(branches);
+      })(),
     );
-  };
-
-  // Thin bounded-retry / validation-gate combinators. Sugar over the for-loop +
-  // agent() pattern, but each attempt is a real agent() call so it auto-journals
-  // under a stable callSeq (resume-safe). No backoff: there is no timer in the vm
-  // and a delay has no resume value. NOTE: attempt N+1's call hash depends on N's
-  // live result, so a retry/gate chain cache-miss-cascades on resume (correct).
-  const retry = async (
-    thunk: (attempt: number) => Promise<unknown> | unknown,
-    opts: { attempts?: number; until?: (r: unknown) => boolean } = {},
-  ) => {
-    const attempts = Math.max(1, opts.attempts ?? 3);
-    let last: unknown;
-    for (let i = 0; i < attempts; i++) {
-      last = await thunk(i);
-      if (!opts.until || opts.until(last)) return last;
-    }
-    return last; // attempts exhausted — return the last result (caller inspects it)
-  };
-  const gate = async (
-    thunk: (feedback: string | undefined, attempt: number) => Promise<unknown> | unknown,
-    validator: (r: unknown) => Promise<{ ok: boolean; feedback?: string }> | { ok: boolean; feedback?: string },
-    opts: { attempts?: number } = {},
-  ) => {
-    const attempts = Math.max(1, opts.attempts ?? 3);
-    let feedback: string | undefined;
-    let last: unknown;
-    for (let i = 0; i < attempts; i++) {
-      last = await thunk(feedback, i);
-      const verdict = await validator(last);
-      if (verdict?.ok) return { ok: true, value: last, attempts: i + 1 };
-      feedback = verdict?.feedback; // fed into the next attempt
-    }
-    return { ok: false, value: last, attempts };
-  };
 
   // Deterministic durable checkpoint. A live call always unwinds to the workflow
   // manager so the parent conversation can ask the human without holding a worker
@@ -877,13 +695,6 @@ export async function runWorkflow<T = unknown>(
     }
     if (checkpointOptions !== undefined) {
       throw new TypeError("checkpoint() accepts only a question string");
-    }
-    if (shared.depth > 0 || shared.nestedUsed) {
-      throw new WorkflowError(
-        "checkpoint() is only supported before any nested workflow() work",
-        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-        { recoverable: false },
-      );
     }
     if (executionContext.getStore()?.concurrent) {
       throw new WorkflowError(
@@ -901,7 +712,7 @@ export async function runWorkflow<T = unknown>(
     }
     if (shared.activeCalls > 0) {
       throw new WorkflowError(
-        "checkpoint() requires all prior agent() and bash() calls to be awaited",
+        "checkpoint() requires all prior runtime work to be awaited",
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
         { recoverable: false },
       );
@@ -943,13 +754,6 @@ export async function runWorkflow<T = unknown>(
     bash,
     parallel,
     pipeline,
-    workflow: workflowFn,
-    verify,
-    judgePanel,
-    loopUntilDry,
-    completenessCheck,
-    retry,
-    gate,
     checkpoint,
     log,
     phase,
@@ -976,7 +780,7 @@ export async function runWorkflow<T = unknown>(
   const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
   if (shared.activeCalls > 0) {
     throw new WorkflowError(
-      "workflow returned while agent() or bash() calls were still active; await all work before returning",
+      "workflow returned while runtime work was still active; await all work before returning",
       WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
       { recoverable: false },
     );

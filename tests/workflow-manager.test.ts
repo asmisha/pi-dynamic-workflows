@@ -45,6 +45,14 @@ function deferredAgent() {
   };
 }
 
+function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
 function delayedAgent(delayMs: number, result: unknown = "slow") {
   return {
     async run(_prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
@@ -142,10 +150,13 @@ test(
   "manager defaultAgentTimeoutMs applies when run options omit agentTimeoutMs",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: delayedAgent(25), defaultAgentTimeoutMs: 5 });
+    manager.on("error", () => {});
 
-    const result = await manager.runSync(oneAgentScript);
+    await assert.rejects(
+      manager.runSync(oneAgentScript),
+      (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_TIMEOUT,
+    );
 
-    assert.equal((result.result as { a: unknown }).a, null);
     const agent = manager.listRuns()[0]?.agents[0];
     assert.equal(agent?.status, "error");
     assert.match(agent?.error ?? "", /timed out after 5ms/);
@@ -279,8 +290,13 @@ test(
         },
       },
     });
+    manager.on("error", () => {});
 
-    await manager.runSync(oneAgentScript);
+    await assert.rejects(
+      manager.runSync(oneAgentScript),
+      (error: unknown) =>
+        error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_EXECUTION_ERROR && error.recoverable,
+    );
 
     const run = manager.listRuns().find((r) => r.workflowName === "tracked_demo");
     const agent = run?.agents[0];
@@ -288,6 +304,221 @@ test(
     assert.equal(agent?.error, "agent exploded");
     assert.equal(agent?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
     assert.equal(agent?.recoverable, true);
+  }),
+);
+
+test(
+  "manager persists the first parallel error before a passive sibling drain completes",
+  withTempCwd(async (cwd) => {
+    const slow = deferredAgent();
+    const badFinished = createDeferred<void>();
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options?: { signal?: AbortSignal }) {
+          if (prompt === "bad") {
+            badFinished.resolve();
+            return "";
+          }
+          assert.equal(options?.signal?.aborted, false);
+          return slow.runner.run(prompt);
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'persist_siblings', description: 'passive sibling drain' }
+return await parallel([() => agent('bad', { label: 'bad' }), () => agent('slow', { label: 'slow' })])`;
+    const promise = manager.runSync(script, undefined, { concurrency: 2 });
+    let failure: unknown;
+    void promise.catch((error) => {
+      failure = error;
+    });
+
+    try {
+      await badFinished.promise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(failure instanceof WorkflowError, "first branch error rejects without waiting for a hung sibling");
+      assert.equal(failure.code, WorkflowErrorCode.AGENT_EMPTY_OUTPUT);
+
+      const persisted = manager.listRuns().find((run) => run.workflowName === "persist_siblings");
+      assert.equal(persisted?.status, "failed");
+      assert.equal(persisted?.error?.code, WorkflowErrorCode.AGENT_EMPTY_OUTPUT, "the first error is retained");
+      assert.equal(
+        manager.getPersistence().getRunLock(persisted?.runId ?? "")?.alive ?? false,
+        true,
+        "the failed run retains its lease while siblings drain",
+      );
+
+      slow.resolve("slow done");
+      for (let i = 0; i < 20; i++) {
+        const current = manager.getPersistence().load(persisted?.runId ?? "");
+        if (current?.agents.some((agent) => agent.label === "slow" && agent.status === "done")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const drained = manager.getPersistence().load(persisted?.runId ?? "");
+      assert.ok(drained?.agents.some((agent) => agent.label === "slow" && agent.status === "done"));
+      assert.equal(manager.getPersistence().getRunLock(persisted?.runId ?? "")?.alive ?? false, false);
+    } finally {
+      slow.resolve("slow done");
+      await promise.catch(() => {});
+    }
+  }),
+);
+
+test(
+  "terminal persistence failure retains the lease and cannot become resumable",
+  withTempCwd(async (cwd) => {
+    const slow = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: slow.runner });
+    manager.on("error", () => {});
+    const started = new Promise<void>((resolve) => manager.once("agentStart", () => resolve()));
+    const promise = manager.runSync(oneAgentScript);
+    await started;
+
+    const run = manager.listRuns().find((entry) => entry.workflowName === "tracked_demo");
+    assert.ok(run);
+    const persistence = manager.getPersistence();
+    const originalSave = persistence.save;
+    persistence.save = () => {
+      throw new Error("disk full");
+    };
+    slow.resolve("");
+    await assert.rejects(promise, (error: unknown) => error instanceof WorkflowError);
+
+    assert.equal(manager.getRun(run.runId)?.status, "failed");
+    assert.equal(persistence.getRunLock(run.runId)?.alive ?? false, true);
+    assert.equal(await manager.resume(run.runId), false, "the retained lease blocks sparse replay");
+
+    persistence.save = originalSave;
+    assert.equal(manager.stop(run.runId), true);
+    assert.equal(persistence.load(run.runId)?.status, "aborted");
+    assert.equal(persistence.getRunLock(run.runId)?.alive ?? false, false);
+  }),
+);
+
+test(
+  "a host abort interrupts a passive sibling drain after terminal failure",
+  withTempCwd(async (cwd) => {
+    const slowStarted = createDeferred<void>();
+    const slowAborted = createDeferred<void>();
+    const external = new AbortController();
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options?: { signal?: AbortSignal }) {
+          if (prompt === "bad") return "";
+          slowStarted.resolve();
+          return new Promise((_, reject) => {
+            options?.signal?.addEventListener(
+              "abort",
+              () => {
+                slowAborted.resolve();
+                reject(new Error("host aborted sibling"));
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'abort_passive_drain', description: 'host abort still wins' }
+return await parallel([() => agent('bad'), () => agent('slow')])`;
+    const promise = manager.runSync(script, undefined, { concurrency: 2, externalSignal: external.signal });
+    let failure: unknown;
+    void promise.catch((error) => {
+      failure = error;
+    });
+
+    try {
+      await slowStarted.promise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(failure instanceof WorkflowError, "terminal failure is not blocked by the sibling drain");
+
+      external.abort();
+      await slowAborted.promise;
+    } finally {
+      external.abort();
+      await promise.catch(() => {});
+    }
+  }),
+);
+
+test(
+  "stop aborts surviving siblings after a fail-fast terminal error",
+  withTempCwd(async (cwd) => {
+    const slowStarted = createDeferred<void>();
+    const slowAborted = createDeferred<void>();
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options?: { signal?: AbortSignal }) {
+          if (prompt === "bad") return "";
+          slowStarted.resolve();
+          return new Promise((_, reject) => {
+            options?.signal?.addEventListener(
+              "abort",
+              () => {
+                slowAborted.resolve();
+                reject(new Error("stopped sibling"));
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'stop_failed_drain', description: 'stop surviving sibling' }
+return await parallel([() => agent('bad'), () => agent('slow')])`;
+    const promise = manager.runSync(script, undefined, { concurrency: 2 });
+    await slowStarted.promise;
+    await assert.rejects(promise, (error: unknown) => error instanceof WorkflowError);
+
+    const run = manager.listRuns().find((entry) => entry.workflowName === "stop_failed_drain");
+    assert.ok(run);
+    assert.equal(manager.stop(run.runId), true);
+    await slowAborted.promise;
+    assert.equal(manager.getRun(run.runId)?.status, "aborted");
+    assert.equal(manager.getPersistence().getRunLock(run.runId)?.alive ?? false, false);
+  }),
+);
+
+test(
+  "manager observes detached direct agent and bash failures without unhandled rejections",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new Error("detached agent failed");
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      await assert.rejects(
+        manager.runSync(`export const meta = { name: 'detached_agent', description: 'direct failure' }
+agent('fail')
+return 'done'`),
+      );
+      await assert.rejects(
+        manager.runSync(
+          `export const meta = { name: 'detached_bash', description: 'direct failure' }
+bash('echo no', { cwd: args.missing })
+return 'done'`,
+          { missing: join(cwd, "missing") },
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   }),
 );
 
@@ -330,7 +561,7 @@ test(
     manager.on("error", () => {});
     const script = `export const meta = { name: 'later_failure', description: 'fails after handled agent error' }
 phase('Attempt')
-await agent('recoverable', { label: 'old-agent' })
+try { await agent('recoverable', { label: 'old-agent' }) } catch {}
 phase('Controller')
 throw new Error('controller exploded')`;
 
@@ -1309,7 +1540,7 @@ test(
 );
 
 test(
-  "cold-start resume releases the lease after failure so another manager can retry",
+  "failed runs are terminal even after their lease is released",
   withTempCwd(async (cwd) => {
     const failing = new WorkflowManager({
       cwd,
@@ -1336,11 +1567,53 @@ test(
     assert.equal(await failing.resume(runId), true, "first resume starts");
     await new Promise((r) => setTimeout(r, 100));
     assert.equal(failing.getRun(runId)?.status, "failed", "first resume failed");
+    assert.equal(failing.getPersistence().getRunLock(runId)?.alive ?? false, false, "failure releases its lease");
 
-    const retry = new WorkflowManager({ cwd, agent: fakeAgent() });
-    assert.equal(await retry.resume(runId), true, "failed run can be resumed after lease release");
-    await new Promise((r) => setTimeout(r, 100));
-    assert.equal(retry.getRun(runId)?.status, "completed", "retry manager completed the run");
+    let reruns = 0;
+    const retry = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          reruns++;
+          return "must not run";
+        },
+      },
+    });
+    assert.equal(await retry.resume(runId), false, "failed runs cannot be resumed after lease release");
+    assert.equal(reruns, 0);
+  }),
+);
+
+test(
+  "resume refuses a failed sparse journal without replaying later side effects",
+  withTempCwd(async (cwd) => {
+    let calls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          calls++;
+          return "must not run";
+        },
+      },
+    });
+    const runId = "failed-sparse-journal";
+    manager.getPersistence().save({
+      runId,
+      workflowName: "sparse_parallel",
+      script: `export const meta = { name: 'sparse_parallel', description: 'failed first branch' }
+return await parallel([() => agent('first'), () => agent('second')])`,
+      status: "failed",
+      journal: [{ index: 1, hash: "completed-later-branch", result: "side effect already happened" }],
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    assert.equal(await manager.resume(runId), false);
+    assert.equal(calls, 0, "the later successful branch is never replayed after a failed first branch");
   }),
 );
 
@@ -1832,9 +2105,8 @@ test(
     assert.equal(manager.getRun(runId)?.status, "paused");
 
     // Mock the agent runner to throw a non-recoverable WorkflowError on resume.
-    // Regular Error/agent rejections get wrapped as recoverable (agent returns
-    // null, workflow continues). A non-recoverable WorkflowError propagates up
-    // to executeRun's catch block and sets status to "failed".
+    // Both recoverable and non-recoverable terminal agent errors propagate to
+    // executeRun's catch block and set status to "failed".
     test.mock.method(da.runner, "run", async (_prompt: string) => {
       throw new WorkflowError("fatal agent error", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
     });
@@ -1977,7 +2249,7 @@ test(
 );
 
 test(
-  "resume restarts a failed run",
+  "resume refuses a failed run",
   withTempCwd(async (cwd) => {
     const da = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
@@ -2011,16 +2283,9 @@ test(
       await origPromise.catch(() => {});
     }
 
-    // Resume the failed run — resume() allows failed status
     const resumed = await manager.resume(runId);
-    assert.equal(resumed, true, "resume should return true for a failed run");
-    assert.equal(manager.getRun(runId)?.status, "running", "resumed failed run should transition to running");
-
-    // Wait for the resumed run to complete successfully
-    await new Promise((r) => setTimeout(r, 100));
-
-    const finalRun = manager.getRun(runId);
-    assert.equal(finalRun?.status, "completed", "resumed failed run should complete successfully after restore");
+    assert.equal(resumed, false, "failed runs cannot be resumed");
+    assert.equal(manager.getRun(runId)?.status, "failed", "failed state remains terminal");
   }),
 );
 
