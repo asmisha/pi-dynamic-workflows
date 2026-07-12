@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
@@ -161,6 +164,31 @@ test("createWorkflowTool invalid args throws descriptive error", () => {
 test("createWorkflowTool with custom cwd creates tool", () => {
   const tool = createWorkflowTool({ cwd: "/tmp" });
   assert.equal(tool.name, "workflow");
+});
+
+test("foreground execution reports the original top-level workflow error", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-tool-error-"));
+  try {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: { run: async () => "unused" } as any,
+    });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const execute = tool.execute as (...args: any[]) => Promise<unknown>;
+    const script = `export const meta = { name: 'tool_failure', description: 'reports bootstrap failure' }
+if (args.fail) throw new Error('bootstrap exploded')
+return await agent('unreachable')`;
+
+    await assert.rejects(
+      execute("call-1", { script, args: { fail: true }, background: false }, new AbortController().signal, () => {}, {
+        hasUI: false,
+      }),
+      /AGENT_EXECUTION_ERROR: bootstrap exploded/,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("modelRoutingGuideline advertises models from an injected registry", () => {

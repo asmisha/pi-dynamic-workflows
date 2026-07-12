@@ -27,6 +27,14 @@ export interface PersistedAgentState {
   model?: string;
 }
 
+export interface PersistedRunError {
+  message: string;
+  code: WorkflowErrorCode;
+  recoverable: boolean;
+  agentLabel?: string;
+  stack?: string;
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -45,6 +53,8 @@ export interface PersistedRunState {
   agents: PersistedAgentState[];
   logs: string[];
   result?: unknown;
+  /** Terminal top-level failure, preserved even when no agent started. */
+  error?: PersistedRunError;
   startedAt: string;
   updatedAt: string;
   completedAt?: string;

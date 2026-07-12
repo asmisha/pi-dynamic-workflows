@@ -246,6 +246,36 @@ test(
 );
 
 test(
+  "runSync preserves and persists a top-level execution error before the first agent",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'bootstrap_failure', description: 'fails before its agent' }
+if (args.fail) throw new Error('bootstrap exploded')
+return await agent('unreachable')`;
+
+    let thrown: unknown;
+    try {
+      await manager.runSync(script, { fail: true });
+    } catch (error) {
+      thrown = error;
+    }
+
+    assert.ok(thrown instanceof WorkflowError);
+    assert.equal(thrown.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.equal(thrown.message, "bootstrap exploded");
+
+    const persisted = manager.listRuns().find((run) => run.workflowName === "bootstrap_failure");
+    assert.equal(persisted?.status, "failed");
+    assert.equal(persisted?.agents.length, 0);
+    assert.equal(persisted?.error?.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.equal(persisted?.error?.message, "bootstrap exploded");
+    assert.equal(persisted?.error?.recoverable, true);
+    assert.match(persisted?.error?.stack ?? "", /bootstrap exploded/);
+  }),
+);
+
+test(
   "runSync stores compact subagent history for /workflows detail",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({
@@ -613,6 +643,10 @@ test(
     }
 
     assert.equal(stoppedEmitted, true, "manager should emit 'stopped' event on host abort");
+    const persisted = manager.listRuns().find((run) => run.workflowName === "tracked_demo");
+    assert.equal(persisted?.status, "aborted");
+    assert.equal(persisted?.error?.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.match(persisted?.error?.message ?? "", /abort/i);
   }),
 );
 

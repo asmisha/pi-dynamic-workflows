@@ -249,7 +249,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           }
           snapshot = recomputeWorkflowSnapshot(snapshot);
           display.complete(snapshot);
-          throw new Error("Workflow was aborted");
+          const message = error instanceof WorkflowError ? error.message : "Workflow was aborted";
+          throw new Error(`${WorkflowErrorCode.WORKFLOW_ABORTED}: ${message}`, { cause: error });
+        }
+        if (error instanceof WorkflowError) {
+          throw new Error(`${error.code}: ${error.message}`, { cause: error });
         }
         throw error;
       }

@@ -6,7 +6,7 @@ import { EventEmitter } from "node:events";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowSnapshot } from "./display.js";
-import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { errorStack, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import {
   createRunPersistence,
   generateRunId,
@@ -431,14 +431,14 @@ export class WorkflowManager extends EventEmitter {
 
       return result;
     } catch (error) {
+      const wrappedError = wrapError(error);
       const workflowError =
-        error instanceof WorkflowError
-          ? error
-          : new WorkflowError(
-              error instanceof Error ? error.message : String(error),
-              WorkflowErrorCode.WORKFLOW_ABORTED,
-              { recoverable: true },
-            );
+        managed.controller.signal.aborted && wrappedError.code !== WorkflowErrorCode.WORKFLOW_ABORTED
+          ? new WorkflowError(wrappedError.message, WorkflowErrorCode.WORKFLOW_ABORTED, {
+              recoverable: true,
+              details: error,
+            })
+          : wrappedError;
 
       const usageLimitPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
@@ -557,6 +557,15 @@ export class WorkflowManager extends EventEmitter {
           })),
           logs: managed.snapshot.logs,
           result: managed.result?.result,
+          error: managed.error
+            ? {
+                message: managed.error.message,
+                code: managed.error.code,
+                recoverable: managed.error.recoverable,
+                agentLabel: managed.error.agentLabel,
+                stack: errorStack(managed.error.details) ?? managed.error.stack,
+              }
+            : undefined,
           tokenUsage: managed.snapshot.tokenUsage
             ? {
                 input: managed.snapshot.tokenUsage.input,
