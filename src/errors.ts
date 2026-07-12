@@ -119,8 +119,44 @@ export function isTimeoutError(error: unknown): boolean {
 /**
  * Wrap an unknown error into a WorkflowError with appropriate classification.
  */
+export interface WorkflowFailureContext {
+  runId?: string;
+  phase?: string;
+  agentLabel?: string;
+}
+
+export function formatWorkflowFailure(error: unknown, context: WorkflowFailureContext = {}): string {
+  const workflowError = wrapError(error, { agentLabel: context.agentLabel });
+  const run = context.runId ? ` ${context.runId}` : "";
+  const stage = [context.phase, context.agentLabel].filter(Boolean).join(" / ");
+  return `Workflow${run} failed${stage ? ` at ${stage}` : ""}: ${workflowError.code}: ${workflowError.message}`;
+}
+
 export function wrapError(error: unknown, context?: { agentLabel?: string }): WorkflowError {
-  if (isWorkflowError(error)) return error;
+  if (isWorkflowError(error)) {
+    if (!context?.agentLabel || error.agentLabel) return error;
+    return new WorkflowError(error.message, error.code, {
+      recoverable: error.recoverable,
+      agentLabel: context.agentLabel,
+      details: error.details ?? error,
+      resetHint: error.resetHint,
+    });
+  }
+
+  if (error && typeof error === "object" && "recoverable" in error && error.recoverable === false) {
+    const rawCode = "code" in error ? error.code : undefined;
+    const code =
+      typeof rawCode === "string" && Object.values(WorkflowErrorCode).includes(rawCode as WorkflowErrorCode)
+        ? (rawCode as WorkflowErrorCode)
+        : WorkflowErrorCode.AGENT_EXECUTION_ERROR;
+    const agentLabel =
+      "agentLabel" in error && typeof error.agentLabel === "string" ? error.agentLabel : context?.agentLabel;
+    return new WorkflowError(errorMessage(error), code, {
+      recoverable: false,
+      agentLabel,
+      details: error,
+    });
+  }
 
   if (isAbortError(error)) {
     return new WorkflowError(errorMessage(error) || "Workflow was aborted", WorkflowErrorCode.WORKFLOW_ABORTED, {

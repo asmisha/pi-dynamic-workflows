@@ -65,11 +65,49 @@ describe("errors", () => {
     assert.equal(isTimeoutError(undefined), false);
   });
 
+  it("formatWorkflowFailure includes run and stage context", async () => {
+    const { formatWorkflowFailure } = await loadErrors();
+    const result = formatWorkflowFailure(new Error("boom"), {
+      runId: "run-1",
+      phase: "Plan",
+      agentLabel: "planner",
+    });
+
+    assert.equal(result, "Workflow run-1 failed at Plan / planner: AGENT_EXECUTION_ERROR: boom");
+  });
+
   it("wrapError wraps non-WorkflowError", async () => {
     const { wrapError, WorkflowErrorCode, isWorkflowError } = await loadErrors();
     const result = wrapError(new Error("raw"));
     assert.equal(isWorkflowError(result), true);
     assert.equal(result.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  });
+
+  it("wrapError preserves explicit non-recoverable VM error metadata", async () => {
+    const { wrapError, WorkflowErrorCode } = await loadErrors();
+    const vmLikeError = {
+      message: "review lane exhausted",
+      code: WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      recoverable: false,
+      agentLabel: "security review",
+      stack: "Error: review lane exhausted",
+    };
+
+    const result = wrapError(vmLikeError);
+
+    assert.equal(result.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.equal(result.recoverable, false);
+    assert.equal(result.agentLabel, "security review");
+  });
+
+  it("wrapError adds missing agent context to an existing WorkflowError", async () => {
+    const { wrapError, WorkflowError, WorkflowErrorCode } = await loadErrors();
+    const original = new WorkflowError("schema", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE);
+    const result = wrapError(original, { agentLabel: "planner" });
+
+    assert.notEqual(result, original);
+    assert.equal(result.code, WorkflowErrorCode.SCHEMA_NONCOMPLIANCE);
+    assert.equal(result.agentLabel, "planner");
   });
 
   it("wrapError passes through WorkflowError unchanged", async () => {

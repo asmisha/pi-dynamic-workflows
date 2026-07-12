@@ -31,6 +31,7 @@ export interface PersistedRunError {
   message: string;
   code: WorkflowErrorCode;
   recoverable: boolean;
+  phase?: string;
   agentLabel?: string;
   stack?: string;
 }
@@ -40,6 +41,8 @@ export interface PersistedRunState {
   workflowName: string;
   script: string;
   args?: unknown;
+  /** Effective cwd used by this run; absent only on legacy persisted runs. */
+  cwd?: string;
   /** The pi session this run belongs to. Runs persist on disk across sessions but
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;

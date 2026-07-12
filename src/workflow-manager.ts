@@ -5,7 +5,7 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
-import { preview, type WorkflowSnapshot } from "./display.js";
+import { preview, resolveWorkflowFailureLocation, type WorkflowSnapshot } from "./display.js";
 import { errorStack, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import {
   createRunPersistence,
@@ -28,6 +28,8 @@ export interface ManagedRun {
   /** The real script, kept so the run can be resumed. */
   script: string;
   args?: unknown;
+  /** Effective cwd for this run, independent of the host session cwd. */
+  cwd: string;
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
   /** Cross-process execution lease for this run, when it is actively executing. */
@@ -47,6 +49,8 @@ export interface ManagedRun {
 
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
+  /** Effective cwd for the workflow and its default subagent/bash execution. */
+  cwd?: string;
   /** Replay these journaled agent results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
   /** Cap on total agents for this run. */
@@ -222,6 +226,7 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script,
       args,
+      cwd: exec.cwd ?? this.cwd,
       journal: [],
       background: true,
       lease,
@@ -236,6 +241,7 @@ export class WorkflowManager extends EventEmitter {
         workflowName: parsed.meta.name,
         script,
         args,
+        cwd: managed.cwd,
         sessionId: this.sessionId,
         status: "running",
         phases: managed.snapshot.phases,
@@ -268,7 +274,7 @@ export class WorkflowManager extends EventEmitter {
    * a caller (e.g. the workflow tool) drive its own inline display.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args);
+    const managed = this.createManaged(script, args, exec.cwd);
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
@@ -280,7 +286,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /** Build a fresh managed run with an empty snapshot. */
-  private createManaged(script: string, args?: unknown): ManagedRun {
+  private createManaged(script: string, args?: unknown, runCwd?: string): ManagedRun {
     const parsed = parseWorkflowScript(script);
     return {
       runId: generateRunId(),
@@ -300,6 +306,7 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script,
       args,
+      cwd: runCwd ?? this.cwd,
       journal: [],
       background: false,
     };
@@ -333,7 +340,7 @@ export class WorkflowManager extends EventEmitter {
     }
     try {
       const result = await runWorkflow(script, {
-        cwd: this.cwd,
+        cwd: managed.cwd,
         args,
         agent: this.agent,
         mainModel: this.mainModel,
@@ -526,6 +533,7 @@ export class WorkflowManager extends EventEmitter {
   private persistRun(managed: ManagedRun) {
     if (managed.deleted) return;
     this.cancelScheduledPersist(managed.runId);
+    const failureLocation = resolveWorkflowFailureLocation(managed.snapshot, managed.error?.agentLabel);
     try {
       this.persistence.save(
         {
@@ -535,6 +543,7 @@ export class WorkflowManager extends EventEmitter {
           // in workflow run storage — protect via directory permissions, not blanking.
           script: managed.script,
           args: managed.args,
+          cwd: managed.cwd,
           sessionId: this.sessionId,
           journal: managed.journal,
           status: managed.status,
@@ -562,7 +571,8 @@ export class WorkflowManager extends EventEmitter {
                 message: managed.error.message,
                 code: managed.error.code,
                 recoverable: managed.error.recoverable,
-                agentLabel: managed.error.agentLabel,
+                phase: failureLocation.phase,
+                agentLabel: failureLocation.agentLabel,
                 stack: errorStack(managed.error.details) ?? managed.error.stack,
               }
             : undefined,
@@ -645,6 +655,7 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script: persisted.script,
       args: persisted.args,
+      cwd: persisted.cwd ?? this.cwd,
       journal: persisted.journal ?? [],
       background: true,
       lease,

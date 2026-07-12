@@ -109,6 +109,36 @@ test(
 );
 
 test(
+  "runSync uses and persists a per-run cwd",
+  withTempCwd(async (hostCwd) => {
+    const runCwd = mkdtempSync(join(tmpdir(), "pi-dw-run-cwd-"));
+    try {
+      let agentCwd: string | undefined;
+      const manager = new WorkflowManager({
+        cwd: hostCwd,
+        agent: {
+          async run(_prompt: string, options?: { cwd?: string }) {
+            agentCwd = options?.cwd;
+            return "ok";
+          },
+        },
+      });
+      const script = `export const meta = { name: 'run_cwd', description: 'per-run cwd' }
+await agent('ok')
+return cwd`;
+
+      const result = await manager.runSync(script, undefined, { cwd: runCwd });
+
+      assert.equal(result.result, runCwd);
+      assert.equal(agentCwd, runCwd);
+      assert.equal(manager.listRuns()[0]?.cwd, runCwd);
+    } finally {
+      rmSync(runCwd, { recursive: true, force: true });
+    }
+  }),
+);
+
+test(
   "manager defaultAgentTimeoutMs applies when run options omit agentTimeoutMs",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: delayedAgent(25), defaultAgentTimeoutMs: 5 });
@@ -251,6 +281,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
     manager.on("error", () => {});
     const script = `export const meta = { name: 'bootstrap_failure', description: 'fails before its agent' }
+phase('Bootstrap')
 if (args.fail) throw new Error('bootstrap exploded')
 return await agent('unreachable')`;
 
@@ -271,7 +302,51 @@ return await agent('unreachable')`;
     assert.equal(persisted?.error?.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
     assert.equal(persisted?.error?.message, "bootstrap exploded");
     assert.equal(persisted?.error?.recoverable, true);
+    assert.equal(persisted?.error?.phase, "Bootstrap");
     assert.match(persisted?.error?.stack ?? "", /bootstrap exploded/);
+  }),
+);
+
+test(
+  "top-level failure after a handled agent error is not attributed to that agent",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: { run: async () => "" } });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'later_failure', description: 'fails after handled agent error' }
+phase('Attempt')
+await agent('recoverable', { label: 'old-agent' })
+phase('Controller')
+throw new Error('controller exploded')`;
+
+    await assert.rejects(manager.runSync(script), /controller exploded/);
+
+    const persisted = manager.listRuns().find((run) => run.workflowName === "later_failure");
+    assert.equal(persisted?.error?.phase, "Controller");
+    assert.equal(persisted?.error?.agentLabel, undefined);
+  }),
+);
+
+test(
+  "agent failure diagnostics use the agent's explicit phase",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError("schema exploded", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, { recoverable: false });
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'agent_phase_failure', description: 'explicit phase failure' }
+phase('Controller')
+await agent('fail', { label: 'schema-agent', phase: 'Special phase' })`;
+
+    await assert.rejects(manager.runSync(script), /schema exploded/);
+
+    const persisted = manager.listRuns().find((run) => run.workflowName === "agent_phase_failure");
+    assert.equal(persisted?.error?.phase, "Special phase");
+    assert.equal(persisted?.error?.agentLabel, "schema-agent");
   }),
 );
 

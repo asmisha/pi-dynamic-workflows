@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -269,6 +269,86 @@ test("createWorkflowTool prepareArguments strips javascript fences", () => {
       script: "```\nexport const meta = { name: 't', description: 't' }\n```",
     });
     assert.equal(result.script, "export const meta = { name: 't', description: 't' }");
+  }
+});
+
+test("createWorkflowTool prepareArguments accepts one absolute scriptPath", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-tool-source-"));
+  try {
+    const scriptPath = join(cwd, "workflow.mjs");
+    writeFileSync(
+      scriptPath,
+      "export const meta = { name: 'file', description: 'file source' }\nreturn await agent('ok')\n",
+    );
+    const tool = createWorkflowTool({ cwd });
+    const prepare = tool.prepareArguments as (args: unknown) => { scriptPath: string; cwd: string };
+
+    const result = prepare({ scriptPath, cwd });
+
+    assert.equal(result.scriptPath, scriptPath);
+    assert.equal(result.cwd, cwd);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("createWorkflowTool prepareArguments requires exactly one script source", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as (args: unknown) => unknown;
+
+  assert.throws(() => prepare({}), /exactly one of `script` or `scriptPath`/);
+  assert.throws(
+    () => prepare({ script: "export const meta = {}", scriptPath: "/tmp/workflow.mjs" }),
+    /exactly one of `script` or `scriptPath`/,
+  );
+  assert.throws(() => prepare({ scriptPath: "relative/workflow.mjs" }), /absolute/);
+});
+
+test("scriptPath rejects files above the workflow source size limit", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-tool-large-source-"));
+  try {
+    const scriptPath = join(cwd, "workflow.mjs");
+    writeFileSync(scriptPath, Buffer.alloc(1024 * 1024 + 1, "x"));
+    const tool = createWorkflowTool({ cwd });
+    const execute = tool.execute as (...args: any[]) => Promise<unknown>;
+
+    await assert.rejects(
+      execute("call-large", { scriptPath, background: false }, new AbortController().signal, () => {}, {
+        hasUI: false,
+      }),
+      /exceeds 1048576 byte limit/,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("foreground execution loads scriptPath once and runs in the requested cwd", async () => {
+  const hostCwd = mkdtempSync(join(tmpdir(), "workflow-tool-host-"));
+  const runCwd = mkdtempSync(join(tmpdir(), "workflow-tool-run-"));
+  try {
+    const scriptPath = join(hostCwd, "workflow.mjs");
+    writeFileSync(
+      scriptPath,
+      "export const meta = { name: 'file_run', description: 'file source run' }\nawait agent('ok')\nreturn cwd\n",
+    );
+    const manager = new WorkflowManager({ cwd: hostCwd, agent: { run: async () => "ok" } as any });
+    const tool = createWorkflowTool({ cwd: hostCwd, manager });
+    const execute = tool.execute as (...args: any[]) => Promise<any>;
+
+    const result = await execute(
+      "call-file",
+      { scriptPath, cwd: runCwd, background: false },
+      new AbortController().signal,
+      () => {},
+      { hasUI: false },
+    );
+
+    assert.equal(result.details.result, runCwd);
+    assert.equal(manager.listRuns()[0]?.cwd, runCwd);
+  } finally {
+    rmSync(hostCwd, { recursive: true, force: true });
+    rmSync(runCwd, { recursive: true, force: true });
   }
 });
 

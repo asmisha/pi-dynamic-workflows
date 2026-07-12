@@ -533,6 +533,33 @@ return xs`;
   );
 });
 
+test("explicit non-recoverable VM errors propagate out of parallel()", async () => {
+  const script = `export const meta = { name: 'fatal_parallel', description: 'fatal lane failure' }
+const run = async () => {
+  const result = await agent('lane', { label: 'lane' })
+  if (result === null) {
+    const error = new Error('lane exhausted')
+    error.code = 'AGENT_EXECUTION_ERROR'
+    error.recoverable = false
+    error.agentLabel = 'lane'
+    throw error
+  }
+  return result
+}
+return await parallel([() => run()])`;
+  let thrown: unknown;
+  try {
+    await runWorkflow(script, { agent: { run: async () => "" }, persistLogs: false });
+  } catch (error) {
+    thrown = error;
+  }
+
+  assert.ok(thrown instanceof WorkflowError);
+  assert.equal(thrown.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  assert.equal(thrown.recoverable, false);
+  assert.equal(thrown.agentLabel, "lane");
+});
+
 test("non-recoverable agent-limit propagates out of pipeline() too", async () => {
   const script = `export const meta = { name: 'mp', description: 'agent limit pipeline' }
 const xs = await pipeline([0, 1, 2, 3], (n) => agent('x' + n, { label: 'p' + n }))
@@ -869,9 +896,9 @@ test("agent opts.cwd, opts.forkFrom, and opts.sessionPath are forwarded to the r
 await agent('a', { label: 'plain' })
 await agent('b', { label: 'placed', cwd: '/tmp/elsewhere', forkFrom: '/tmp/parent-session.jsonl', sessionPath: 'child-session' })
 return 'done'`;
-  await runWorkflow(script, { agent: runner, persistLogs: false });
+  await runWorkflow(script, { agent: runner, cwd: "/tmp/base", persistLogs: false });
   assert.deepEqual(seen, [
-    { cwd: undefined, forkFrom: undefined, sessionPath: undefined },
+    { cwd: "/tmp/base", forkFrom: undefined, sessionPath: undefined },
     { cwd: "/tmp/elsewhere", forkFrom: "/tmp/parent-session.jsonl", sessionPath: "child-session" },
   ]);
 });

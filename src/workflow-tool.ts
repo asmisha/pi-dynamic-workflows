@@ -1,3 +1,5 @@
+import { readFileSync, statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { defineTool, type ModelRegistry, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -8,9 +10,10 @@ import {
   createWorkflowSnapshot,
   recomputeWorkflowSnapshot,
   renderWorkflowText,
+  resolveWorkflowFailureLocation,
   type WorkflowSnapshot,
 } from "./display.js";
-import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { formatWorkflowFailure, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
@@ -57,11 +60,26 @@ export function agentTypeGuideline(cwd: string = process.cwd()): string | undefi
   return `opts.agentType routes an agent to a named definition binding tools, model, and role prompt. Available: ${list}. An explicit opts.model overrides the definition's model.`;
 }
 
+const MAX_WORKFLOW_SCRIPT_BYTES = 1024 * 1024;
+
 const workflowToolSchema = Type.Object({
-  script: Type.String({
-    description:
-      "Raw JavaScript workflow script (no Markdown fences). Must start with the meta export and call agent() at least once — see the workflow guidelines.",
-  }),
+  script: Type.Optional(
+    Type.String({
+      description: "Raw JavaScript workflow script (no Markdown fences). Pass exactly one of script or scriptPath.",
+    }),
+  ),
+  scriptPath: Type.Optional(
+    Type.String({
+      description:
+        "Absolute path to a workflow JavaScript file. Pass exactly one of script or scriptPath; the file is read once at launch and its contents are persisted for resume.",
+    }),
+  ),
+  cwd: Type.Optional(
+    Type.String({
+      description:
+        "Absolute existing directory used as the workflow cwd and default cwd for its subagents and bash steps. Defaults to the host Pi cwd.",
+    }),
+  ),
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
   ),
@@ -103,7 +121,9 @@ const workflowToolSchema = Type.Object({
 });
 
 export type WorkflowToolInput = {
-  script: string;
+  script?: string;
+  scriptPath?: string;
+  cwd?: string;
   args?: unknown;
   background?: boolean;
   maxAgents?: number;
@@ -147,10 +167,10 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     label: "Workflow",
     description: [
       "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), pipeline(), and shell steps via bash().",
-      "script is required raw JavaScript. It must start with export const meta = { name, description, phases? } and must call agent() at least once.",
+      "Pass exactly one source: inline script or an absolute scriptPath. Both must contain a meta export and call agent() at least once.",
     ].join(" "),
     promptSnippet:
-      "Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
+      "Run a deterministic workflow from one source: inline script or absolute scriptPath. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
     // Lazy accessor: the SDK re-reads definition.promptGuidelines on every
     // tool-registry refresh, so each read sees the manager's registry as it
     // stands then (setModelRegistry runs on session_start, after tool creation).
@@ -160,7 +180,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return [
         "Use workflow only when the user explicitly asks for a workflow, fan-out, or multi-agent orchestration — for decomposable work (repo inspection, independent checks, multi-perspective review, fan-out/fan-in synthesis), not a single quick read/edit.",
         [
-          "script is one raw JavaScript string — no fences, no prose, no TypeScript/imports/require/fs/Date.now()/Math.random()/new Date(). Skeleton:",
+          "Use exactly one source: script for generated JavaScript, or scriptPath for a trusted reusable local workflow file. Scripts use no fences, prose, TypeScript/imports/require/fs/Date.now()/Math.random()/new Date(). Skeleton:",
           "export const meta = { name: 'short_snake_case', description: 'non-empty', phases: [{ title: 'Phase' }] }",
           "phase('Phase')",
           "const results = await parallel(items.map(item => () => agent('task + context + paths', { label: 'unique 2-4 words', tier: 'small' })))",
@@ -180,7 +200,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return normalizeWorkflowToolArgs(args);
     },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const script = normalizeWorkflowScript(params.script);
+      const script = resolveWorkflowScript(params);
+      const runCwd = resolveWorkflowCwd(params.cwd);
       const parsed = parseWorkflowScript(script);
 
       // checkpoint() reaches the human only on a UI-bearing foreground run; a
@@ -205,6 +226,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
+          cwd: runCwd,
         });
         return {
           content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
@@ -232,6 +254,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
+          cwd: runCwd,
           confirm,
           externalSignal: signal,
           onProgress(live) {
@@ -240,7 +263,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           },
         });
       } catch (error) {
-        if (signal?.aborted || (error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED)) {
+        const aborted =
+          signal?.aborted || (error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED);
+        if (aborted) {
           for (const agent of snapshot.agents) {
             if (agent.status === "running") {
               agent.status = "skipped";
@@ -249,13 +274,12 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           }
           snapshot = recomputeWorkflowSnapshot(snapshot);
           display.complete(snapshot);
-          const message = error instanceof WorkflowError ? error.message : "Workflow was aborted";
-          throw new Error(`${WorkflowErrorCode.WORKFLOW_ABORTED}: ${message}`, { cause: error });
         }
-        if (error instanceof WorkflowError) {
-          throw new Error(`${error.code}: ${error.message}`, { cause: error });
-        }
-        throw error;
+        const failureLocation = resolveWorkflowFailureLocation(
+          snapshot,
+          error instanceof WorkflowError ? error.agentLabel : undefined,
+        );
+        throw new Error(formatWorkflowFailure(error, failureLocation), { cause: error });
       }
 
       if (result.agentCount === 0) {
@@ -357,10 +381,61 @@ export function backgroundStartedText(name: string, runId: string): string {
 }
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
-  if (!args || typeof args !== "object") throw new Error("workflow requires an object argument with a script string");
+  if (!args || typeof args !== "object") {
+    throw new Error("workflow requires an object argument with exactly one script source");
+  }
   const value = args as Record<string, unknown>;
-  if (typeof value.script !== "string") throw new Error("workflow requires `script` to be a string");
-  return { ...value, script: normalizeWorkflowScript(value.script) } as WorkflowToolInput;
+  const hasScript = value.script !== undefined;
+  const hasScriptPath = value.scriptPath !== undefined;
+  if (hasScript === hasScriptPath) {
+    throw new Error("workflow requires exactly one of `script` or `scriptPath`");
+  }
+  if (hasScript && typeof value.script !== "string") {
+    throw new Error("workflow requires `script` to be a string");
+  }
+  if (hasScriptPath) validateAbsolutePath(value.scriptPath, "scriptPath");
+  if (value.cwd !== undefined) validateAbsolutePath(value.cwd, "cwd");
+  return {
+    ...value,
+    ...(typeof value.script === "string" ? { script: normalizeWorkflowScript(value.script) } : {}),
+  } as WorkflowToolInput;
+}
+
+function validateAbsolutePath(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || !isAbsolute(value)) {
+    throw new Error(`workflow \`${field}\` must be an absolute path`);
+  }
+}
+
+function resolveWorkflowScript(input: WorkflowToolInput): string {
+  if (input.script !== undefined) return normalizeWorkflowScript(input.script);
+  if (!input.scriptPath) throw new Error("workflow requires exactly one of `script` or `scriptPath`");
+  try {
+    const stat = statSync(input.scriptPath);
+    if (!stat.isFile()) throw new Error("path is not a file");
+    if (stat.size > MAX_WORKFLOW_SCRIPT_BYTES) {
+      throw new Error(`file exceeds ${MAX_WORKFLOW_SCRIPT_BYTES} byte limit`);
+    }
+    const source = readFileSync(input.scriptPath);
+    if (source.byteLength > MAX_WORKFLOW_SCRIPT_BYTES) {
+      throw new Error(`file exceeds ${MAX_WORKFLOW_SCRIPT_BYTES} byte limit`);
+    }
+    return normalizeWorkflowScript(source.toString("utf-8"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not read workflow scriptPath ${input.scriptPath}: ${message}`, { cause: error });
+  }
+}
+
+function resolveWorkflowCwd(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  try {
+    if (!statSync(value).isDirectory()) throw new Error("path is not a directory");
+    return value;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not use workflow cwd ${value}: ${message}`, { cause: error });
+  }
 }
 
 function normalizeWorkflowScript(script: string): string {

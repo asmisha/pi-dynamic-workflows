@@ -492,7 +492,7 @@ export async function runWorkflow<T = unknown>(
               modelRegistry: options.modelRegistry,
               toolNames: agentDef?.tools,
               disallowedToolNames: agentDef?.disallowedTools,
-              cwd: agentOptions.cwd,
+              cwd: agentOptions.cwd ?? baseCwd,
               forkFrom: agentOptions.forkFrom,
               sessionPath: agentOptions.sessionPath,
               onModelResolved: (id: string) => {

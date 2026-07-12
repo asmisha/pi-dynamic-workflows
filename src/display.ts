@@ -22,6 +22,26 @@ export interface WorkflowAgentSnapshot {
   model?: string;
 }
 
+export interface WorkflowFailureLocation {
+  phase?: string;
+  agentLabel?: string;
+}
+
+export function resolveWorkflowFailureLocation(
+  snapshot: WorkflowSnapshot,
+  explicitAgentLabel?: string,
+): WorkflowFailureLocation {
+  const agent = explicitAgentLabel
+    ? [...snapshot.agents].reverse().find((candidate) => candidate.label === explicitAgentLabel)
+    : [...snapshot.agents]
+        .reverse()
+        .find((candidate) => candidate.status === "running" || candidate.status === "skipped");
+  return {
+    phase: agent?.phase ?? snapshot.currentPhase,
+    agentLabel: explicitAgentLabel ?? agent?.label,
+  };
+}
+
 export interface WorkflowSnapshot {
   name: string;
   description?: string;

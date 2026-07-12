@@ -8,7 +8,14 @@
 
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { shorten, statusIcon, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import {
+  resolveWorkflowFailureLocation,
+  shorten,
+  statusIcon,
+  type WorkflowAgentSnapshot,
+  type WorkflowSnapshot,
+} from "./display.js";
+import { formatWorkflowFailure } from "./errors.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
@@ -125,9 +132,15 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     // returns its result inline as the tool result, so re-delivering would dup it.
     if (run?.background) deliver(deliverText(run));
   });
-  manager.on("error", ({ runId, error }: { runId: string; error?: { message?: string } }) => {
-    if (!manager.getRun(runId)?.background) return;
-    deliver(`✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`);
+  manager.on("error", ({ runId, error }: { runId: string; error?: unknown }) => {
+    const run = manager.getRun(runId);
+    if (!run?.background) return;
+    deliver(
+      `✗ ${formatWorkflowFailure(error, {
+        runId,
+        ...resolveWorkflowFailureLocation(run.snapshot, run.error?.agentLabel),
+      })}`,
+    );
   });
   // A provider usage/quota limit checkpoints the run as paused (not failed): tell the
   // user it is resumable once their budget refills, rather than letting it look dead.
