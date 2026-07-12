@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Minimal fake ModelRegistry, matching the shape the PR's existing tests use. */
 function fakeRegistry(models: Array<{ provider: string; id: string }>) {
@@ -304,6 +305,31 @@ test("createWorkflowTool prepareArguments requires exactly one script source", (
   assert.throws(() => prepare({ scriptPath: "relative/workflow.mjs" }), /absolute/);
 });
 
+test("createWorkflowTool prepareArguments accepts only run ID and reply for continuation", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as (args: unknown) => unknown;
+
+  assert.deepEqual(prepare({ resumeRunId: "run-1", reply: "accept" }), {
+    resumeRunId: "run-1",
+    reply: "accept",
+  });
+  assert.throws(() => prepare({ resumeRunId: "run-1" }), /requires a non-empty string `reply`/);
+  assert.throws(() => prepare({ resumeRunId: "run-1", reply: "   " }), /non-empty string `reply`/);
+  assert.throws(
+    () => prepare({ resumeRunId: "run-1", reply: "accept", cwd: "/tmp" }),
+    /accepts only `resumeRunId` and `reply`/,
+  );
+  assert.throws(
+    () => prepare({ resumeRunId: "run-1", reply: "accept", script: "return 1" }),
+    /cannot include `script`/,
+  );
+  assert.throws(() => prepare({ resumeRunId: "../run-1", reply: "accept" }), /valid run ID/);
+  assert.throws(
+    () => prepare({ resumeRunId: "run-1", reply: "accept", unexpected: true }),
+    /accepts only `resumeRunId` and `reply`/,
+  );
+});
+
 test("scriptPath rejects files above the workflow source size limit", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "workflow-tool-large-source-"));
   try {
@@ -349,6 +375,64 @@ test("foreground execution loads scriptPath once and runs in the requested cwd",
   } finally {
     rmSync(hostCwd, { recursive: true, force: true });
     rmSync(runCwd, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool returns a checkpoint to the parent and continues the same run with reply", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workflow-tool-checkpoint-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      let calls = 0;
+      const manager = new WorkflowManager({
+        cwd: process.cwd(),
+        agent: {
+          run: async (prompt: string) => {
+            calls++;
+            return prompt;
+          },
+        } as any,
+      });
+      const tool = createWorkflowTool({ cwd: process.cwd(), manager });
+      const execute = tool.execute as (...args: any[]) => Promise<any>;
+      const script = `export const meta = { name: 'tool_checkpoint', description: 'tool checkpoint' }
+const before = await agent('before')
+const reply = await checkpoint('Accept?')
+const after = await agent('after:' + reply)
+return { before, reply, after }`;
+
+      const paused = await execute(
+        "call-start",
+        { script, background: false },
+        new AbortController().signal,
+        () => {},
+        {
+          hasUI: false,
+        },
+      );
+      assert.equal(paused.details.paused, true);
+      assert.match(paused.content[0].text, /Accept\?/);
+      const runId = paused.details.runId;
+      assert.ok(runId);
+
+      const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
+      const continued = await execute(
+        "call-continue",
+        { resumeRunId: runId, reply: "yes" },
+        new AbortController().signal,
+        () => {},
+        { hasUI: false },
+      );
+      assert.equal(continued.details.runId, runId);
+      assert.equal(continued.details.resumed, true);
+      await completed;
+      const result = manager.getRun(runId)?.result?.result as { before?: string; reply?: string; after?: string };
+      assert.equal(result.before, "before");
+      assert.equal(result.reply, "yes");
+      assert.equal(result.after, "after:yes");
+      assert.equal(calls, 2);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { JournalEntry } from "../src/workflow.js";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import type { JournalEntry, PendingCheckpoint } from "../src/workflow.js";
 import { runWorkflow } from "../src/workflow.js";
 
 const noopAgent = {
@@ -9,77 +10,189 @@ const noopAgent = {
   },
 };
 
-test("checkpoint(): headless takes the declared default and journals it", async () => {
-  const journal: JournalEntry[] = [];
+test("checkpoint(): always transfers control with durable metadata", async () => {
   const script = `export const meta = { name: 'c', description: 'checkpoint' }
-const ok = await checkpoint('Approve plan?', { default: true })
-const name = await checkpoint('Pick a name', { default: 'fallback' })
-return { ok, name }`;
-  const res = await runWorkflow<{ ok: boolean; name: string }>(script, {
-    agent: noopAgent,
-    persistLogs: false,
-    onAgentJournal: (e) => journal.push(e),
-  });
-  assert.equal(res.result.ok, true);
-  assert.equal(res.result.name, "fallback");
-  assert.equal(journal.length, 2, "both checkpoints journaled");
+return await checkpoint('Approve plan?')`;
+  let thrown: unknown;
+  try {
+    await runWorkflow(script, { agent: noopAgent, persistLogs: false });
+  } catch (error) {
+    thrown = error;
+  }
+
+  assert.ok(thrown instanceof WorkflowError);
+  assert.equal(thrown.code, WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED);
+  assert.equal(thrown.recoverable, false);
+  const checkpoint = thrown.details as PendingCheckpoint;
+  assert.equal(checkpoint.callIndex, 0);
+  assert.equal(typeof checkpoint.hash, "string");
+  assert.equal(checkpoint.prompt, "Approve plan?");
+  assert.deepEqual(Object.keys(checkpoint).sort(), ["callIndex", "hash", "prompt"]);
 });
 
-test("checkpoint(): headless 'abort' throws when no UI is threaded in", async () => {
+test("checkpoint(): rejects all options including removed default/headless flags", async () => {
   const script = `export const meta = { name: 'c', description: 'checkpoint' }
-await checkpoint('Approve?', { headless: 'abort' })
-return 1`;
-  await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false }), /human input|headless/i);
+return await checkpoint('Proceed?', { default: true, headless: 'default' })`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: noopAgent, persistLogs: false }),
+    /accepts only a question string/i,
+  );
 });
 
-test("checkpoint(): uses the threaded confirm when present", async () => {
-  let asked = "";
+test("checkpoint(): replays a journaled parent reply and continues", async () => {
   const script = `export const meta = { name: 'c', description: 'checkpoint' }
-return await checkpoint('Proceed?', { kind: 'confirm' })`;
-  const res = await runWorkflow<string>(script, {
-    agent: noopAgent,
-    persistLogs: false,
-    confirm: async (p) => {
-      asked = p;
-      return "yes";
-    },
-  });
-  assert.equal(res.result, "yes");
-  assert.equal(asked, "Proceed?");
-});
+const reply = await checkpoint('Approve?')
+return { reply, continued: true }`;
+  let checkpoint: PendingCheckpoint | undefined;
+  try {
+    await runWorkflow(script, { agent: noopAgent, persistLogs: false });
+  } catch (error) {
+    if (error instanceof WorkflowError) checkpoint = error.details as PendingCheckpoint;
+  }
+  assert.ok(checkpoint);
 
-test("checkpoint(): replays the journaled reply on resume (no re-prompt)", async () => {
-  const script = `export const meta = { name: 'c', description: 'checkpoint' }
-const r = await checkpoint('Approve?', {})
-return { r }`;
-  const journal = new Map<number, JournalEntry>();
-  const first = await runWorkflow<{ r: string }>(script, {
-    agent: noopAgent,
-    persistLogs: false,
-    confirm: async () => "approved",
-    onAgentJournal: (e) => journal.set(e.index, e),
-  });
-  assert.equal(first.result.r, "approved");
-
-  let calledAgain = false;
-  const second = await runWorkflow<{ r: string }>(script, {
+  const journal = new Map<number, JournalEntry>([
+    [checkpoint.callIndex, { index: checkpoint.callIndex, hash: checkpoint.hash, result: "approved" }],
+  ]);
+  const resumed = await runWorkflow<{ reply: string; continued: boolean }>(script, {
     agent: noopAgent,
     persistLogs: false,
     resumeJournal: journal,
-    confirm: async () => {
-      calledAgain = true;
-      return "DIFFERENT";
-    },
   });
-  assert.equal(second.result.r, "approved", "reply replays from the journal");
-  assert.equal(calledAgain, false, "confirm is not called again on resume");
+
+  assert.equal(resumed.result.reply, "approved");
+  assert.equal(resumed.result.continued, true);
 });
 
-test("checkpoint(): counts against maxAgents (no tokens, but bounded)", async () => {
+test("checkpoint(): cached prefix and reply replay even when cumulative token budget is exhausted", async () => {
   const script = `export const meta = { name: 'c', description: 'checkpoint' }
-await checkpoint('a', { default: 1 })
-await checkpoint('b', { default: 1 })
-await checkpoint('c', { default: 1 })
+const before = await agent('before')
+const reply = await checkpoint('Approve?')
+return { before, reply }`;
+  const journal: JournalEntry[] = [];
+  let pending: PendingCheckpoint | undefined;
+  try {
+    await runWorkflow(script, {
+      agent: noopAgent,
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+    });
+  } catch (error) {
+    if (error instanceof WorkflowError) pending = error.details as PendingCheckpoint;
+  }
+  assert.ok(pending);
+  journal.push({ index: pending.callIndex, hash: pending.hash, result: "approved" });
+  const resumed = await runWorkflow<{ before: string; reply: string }>(script, {
+    agent: {
+      run: async () => {
+        throw new Error("cached agent must not rerun");
+      },
+    },
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+    tokenBudget: 100,
+    initialTokenUsage: { total: 100 },
+  });
+  assert.equal(resumed.result.before, "ok");
+  assert.equal(resumed.result.reply, "approved");
+});
+
+test("checkpoint(): rejects concurrent parallel placement", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+return await parallel([() => checkpoint('unsafe')])`;
+  await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false }), /awaited sequentially/i);
+});
+
+test("checkpoint(): disables native Promise scheduling", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+return await Promise.all([agent('work'), checkpoint('unsafe')])`;
+  await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false }), /Promise|undefined/i);
+});
+
+test("checkpoint(): rejects detached async functions at parse time", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' };
+(async () => { await agent('late work') })()
+return await checkpoint('unsafe')`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: noopAgent, persistLogs: false }),
+    /cannot detach async functions/i,
+  );
+});
+
+test("checkpoint(): transfers control even when its returned value is not awaited", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+checkpoint('still pauses')
+return 'unreachable'`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: noopAgent, persistLogs: false }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED,
+  );
+});
+
+test("checkpoint(): rejects placement inside nested workflow", async () => {
+  const parent = `export const meta = { name: 'parent', description: 'parent' }
+return await workflow('child')`;
+  const child = `export const meta = { name: 'child', description: 'child' }
+return await checkpoint('unsafe nested')`;
+  await assert.rejects(
+    () =>
+      runWorkflow(parent, {
+        agent: noopAgent,
+        persistLogs: false,
+        loadSavedWorkflow: () => child,
+      }),
+    /before any nested workflow/i,
+  );
+});
+
+test("checkpoint(): rejects placement after nested workflow work", async () => {
+  const parent = `export const meta = { name: 'parent', description: 'parent' }
+await workflow('child')
+return await checkpoint('unsafe after nested')`;
+  const child = `export const meta = { name: 'child', description: 'child' }
+return await agent('child work')`;
+  await assert.rejects(
+    () =>
+      runWorkflow(parent, {
+        agent: noopAgent,
+        persistLogs: false,
+        loadSavedWorkflow: () => child,
+      }),
+    /before any nested workflow/i,
+  );
+});
+
+test("checkpoint(): allows at most one parent decision per run", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+const first = await checkpoint('first')
+const second = await checkpoint('second')
+return { first, second }`;
+  let first: PendingCheckpoint | undefined;
+  try {
+    await runWorkflow(script, { agent: noopAgent, persistLogs: false });
+  } catch (error) {
+    if (error instanceof WorkflowError) first = error.details as PendingCheckpoint;
+  }
+  assert.ok(first);
+  const journal = new Map<number, JournalEntry>([
+    [first.callIndex, { index: first.callIndex, hash: first.hash, result: "answer" }],
+  ]);
+  await assert.rejects(
+    () => runWorkflow(script, { agent: noopAgent, persistLogs: false, resumeJournal: journal }),
+    /at most once/i,
+  );
+});
+
+test("checkpoint(): rejects workflows with phase token sub-budgets", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint', phases: [{ title: 'P' }] }
+phase('P', { budget: 100 })
+return await checkpoint('unsupported budget combination')`;
+  await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false }), /phase token sub-budgets/i);
+});
+
+test("checkpoint(): counts against maxAgents", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+await checkpoint('a')
 return 1`;
-  await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false, maxAgents: 2 }), /limit/i);
+  await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false, maxAgents: 0 }), /limit/i);
 });

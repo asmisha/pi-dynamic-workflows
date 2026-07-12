@@ -121,7 +121,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
 | `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. |
 | `workflow(name, args)` | Run a saved workflow inline (shares the global caps). |
-| `checkpoint(prompt, opts)` | A journaled, replayable human approval gate. |
+| `checkpoint(question)` | Always pauses the run and transfers a durable question to the parent conversation. Continue the same run with `workflow({ resumeRunId, reply })`; completed steps replay from the journal. |
 | `budget` | `{ total, spent(), remaining() }` real-token tracker. |
 
 | Agent option | Description |
@@ -135,6 +135,8 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `schema` | JSON Schema → the subagent returns a validated object. |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
+
+A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. `workflow({ resumeRunId: "...", reply: ... })` validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. A workflow run may call `checkpoint()` at most once.
 
 Subagent sessions are temporary by default. Use `sessionPath` only when a reviewer/worker should keep context across runs; use `forkFrom` when it should start from an existing Pi conversation. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle applies normally.
 

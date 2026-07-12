@@ -566,7 +566,7 @@ test("agent() in workflow reports non-recoverable errors before throwing", async
   assert.equal(end?.recoverable, false);
 });
 
-test("agent() in workflow fires onTokenUsage after run", async () => {
+test("agent() in workflow fires cumulative onTokenUsage after each agent", async () => {
   const rec = new CallRecordingAgent();
   const usageEvents: Array<{ input: number; output: number; total: number }> = [];
   await runWorkflow(
@@ -579,7 +579,7 @@ test("agent() in workflow fires onTokenUsage after run", async () => {
       onTokenUsage: (u) => usageEvents.push({ input: u.input, output: u.output, total: u.total }),
     },
   );
-  assert.equal(usageEvents.length, 1, "should fire onTokenUsage once");
+  assert.equal(usageEvents.length, 1, "one agent emits one cumulative usage update");
   assert.equal(usageEvents[0].total, 30, "should accumulate from agent usage");
 });
 
@@ -614,8 +614,7 @@ test("agent() accumulates usage across multiple agents", async () => {
       onTokenUsage: (u) => usageEvents.push({ total: u.total }),
     },
   );
-  assert.equal(usageEvents.length, 1, "one final usage event");
-  assert.equal(usageEvents[0].total, 60, "two agents × 30 tokens each");
+  assert.deepEqual(usageEvents, [{ total: 30 }, { total: 60 }], "usage updates after each agent");
 });
 
 test("agent() with timeout should handle gracefully (timeout returns null)", async () => {

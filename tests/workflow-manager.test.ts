@@ -227,11 +227,27 @@ test(
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
     let listedWhileRunning = 0;
+    let persistedOptions: unknown;
     manager.on("agentStart", () => {
-      listedWhileRunning = manager.listRuns().filter((r) => r.status === "running").length;
+      const running = manager.listRuns().filter((r) => r.status === "running");
+      listedWhileRunning = running.length;
+      persistedOptions = running[0]?.executionOptions;
     });
-    await manager.runSync(oneAgentScript);
+    await manager.runSync(oneAgentScript, undefined, {
+      maxAgents: 5,
+      tokenBudget: 1000,
+      concurrency: 2,
+      agentRetries: 1,
+      agentTimeoutMs: 500,
+    });
     assert.equal(listedWhileRunning, 1, "the run shows as running in listRuns mid-flight");
+    assert.deepEqual(persistedOptions, {
+      maxAgents: 5,
+      agentTimeoutMs: 500,
+      tokenBudget: 1000,
+      concurrency: 2,
+      agentRetries: 1,
+    });
   }),
 );
 
@@ -2057,3 +2073,163 @@ return results`;
     assert.equal(result.agentCount, 0, "no agents should run with empty parallel");
   }),
 );
+
+test("cold-start manager resumes a persisted parent checkpoint with the same run ID", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workflow-checkpoint-cold-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      let calls = 0;
+      const agent = {
+        run: async (prompt: string) => {
+          calls++;
+          return prompt;
+        },
+      };
+      const script = `export const meta = { name: 'checkpoint_cold', description: 'cold resume' }
+const before = await agent('before')
+const reply = await checkpoint('Question?')
+const after = await agent('after:' + reply)
+return { before, reply, after }`;
+      const first = new WorkflowManager({ cwd: process.cwd(), agent });
+      first.setSessionId("cold-checkpoint-session");
+      const paused = new Promise<void>((resolve) => first.once("paused", () => resolve()));
+      const { runId } = first.startInBackground(script);
+      await paused;
+
+      const second = new WorkflowManager({ cwd: process.cwd(), agent });
+      second.setSessionId("cold-checkpoint-session");
+      const completed = new Promise<void>((resolve) => second.once("complete", () => resolve()));
+      assert.equal(await second.resumeWithReply(runId, "answer"), true);
+      await completed;
+
+      assert.equal(second.getRun(runId)?.status, "completed");
+      assert.equal(second.getRun(runId)?.result?.runId, runId);
+      assert.equal(calls, 2, "the pre-checkpoint agent replays after manager restart");
+      assert.equal(second.getPersistence().load(runId)?.runId, runId);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint persistence failure fails instead of asking the parent", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workflow-checkpoint-persist-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const deferred = deferredAgent();
+      const manager = new WorkflowManager({ cwd: process.cwd(), agent: deferred.runner });
+      const script = `export const meta = { name: 'checkpoint_persist', description: 'persist failure' }
+await agent('before', { label: 'before' })
+return await checkpoint('must persist')`;
+      let pauseCount = 0;
+      manager.on("paused", () => pauseCount++);
+      const failed = new Promise<WorkflowError>((resolve) => manager.once("error", ({ error }) => resolve(error)));
+      const started = new Promise<void>((resolve) => manager.once("agentStart", () => resolve()));
+      const { runId } = manager.startInBackground(script);
+      await started;
+
+      const persistence = manager.getPersistence();
+      const originalSave = persistence.save;
+      persistence.save = () => {
+        throw new Error("disk full");
+      };
+      deferred.resolve("done");
+      const error = await failed;
+      persistence.save = originalSave;
+
+      assert.equal(error.code, WorkflowErrorCode.PERSISTENCE_ERROR);
+      assert.equal(pauseCount, 0, "the parent must not receive a non-durable checkpoint");
+      assert.equal(manager.getRun(runId)?.status, "failed");
+      assert.equal(persistence.getRunLock(runId)?.alive ?? false, false);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("background checkpoint pauses durably and resumes the same run with a reply", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workflow-checkpoint-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      let calls = 0;
+      const agent = {
+        async run(prompt: string) {
+          calls++;
+          return `ran:${prompt}`;
+        },
+      };
+      const manager = new WorkflowManager({ cwd: process.cwd(), agent });
+      manager.setSessionId("checkpoint-session-a");
+      const script = `export const meta = { name: 'durable_checkpoint', description: 'pause and resume' }
+const before = await agent('before', { label: 'before' })
+const reply = await checkpoint('Accept risk?')
+const after = await agent('after:' + reply, { label: 'after' })
+return { before, reply, after }`;
+
+      const paused = new Promise<void>((resolve) => {
+        manager.once("paused", ({ reason }) => {
+          assert.equal(reason, "human_input");
+          resolve();
+        });
+      });
+      const { runId } = manager.startInBackground(script, undefined, {
+        maxAgents: 5,
+        tokenBudget: 10_000,
+        concurrency: 2,
+        agentRetries: 1,
+        agentTimeoutMs: 1234,
+      });
+      await paused;
+
+      const persisted = manager.getPersistence().load(runId);
+      assert.equal(persisted?.status, "paused");
+      assert.equal(persisted?.pauseReason, "human_input");
+      assert.equal(persisted?.pendingCheckpoint?.prompt, "Accept risk?");
+      assert.deepEqual(persisted?.executionOptions, {
+        maxAgents: 5,
+        agentTimeoutMs: 1234,
+        tokenBudget: 10_000,
+        concurrency: 2,
+        agentRetries: 1,
+      });
+      assert.equal(persisted?.journal?.length, 1, "the completed prefix is journaled before the checkpoint");
+      const usageBeforeReply = persisted?.tokenUsage?.total ?? 0;
+      assert.ok(usageBeforeReply > 0, "usage spent before the checkpoint is persisted");
+      assert.equal(await manager.resume(runId), false, "plain resume cannot bypass pending human input");
+      assert.equal(await manager.resumeWithReply(runId, "   "), false, "blank replies are rejected");
+      manager.setSessionId("checkpoint-session-b");
+      assert.equal(await manager.resumeWithReply(runId, "accept"), false, "another parent session cannot reply");
+      manager.setSessionId("checkpoint-session-a");
+      const originalSave = manager.getPersistence().save;
+      manager.getPersistence().save = () => {
+        throw new Error("reply save failed");
+      };
+      await assert.rejects(() => manager.resumeWithReply(runId, "accept"), /reply save failed/);
+      manager.getPersistence().save = originalSave;
+      assert.equal(
+        manager.getPersistence().getRunLock(runId)?.alive ?? false,
+        false,
+        "failed reply save releases lease",
+      );
+
+      const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
+      assert.equal(await manager.resumeWithReply(runId, "accept"), true);
+      await completed;
+
+      const run = manager.getRun(runId);
+      assert.equal(run?.status, "completed");
+      assert.equal(run?.result?.runId, runId);
+      const result = run?.result?.result as { before?: string; reply?: string; after?: string };
+      assert.equal(result.before, "ran:before");
+      assert.equal(result.reply, "accept");
+      assert.equal(result.after, "ran:after:accept");
+      assert.equal(calls, 2, "the completed pre-checkpoint agent is replayed rather than rerun");
+      const final = manager.getPersistence().load(runId);
+      assert.equal(final?.pendingCheckpoint, undefined);
+      assert.equal(final?.pauseReason, undefined);
+      assert.ok((final?.tokenUsage?.total ?? 0) > usageBeforeReply, "resumed usage includes the pre-checkpoint total");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

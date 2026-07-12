@@ -63,6 +63,14 @@ export function agentTypeGuideline(cwd: string = process.cwd()): string | undefi
 const MAX_WORKFLOW_SCRIPT_BYTES = 1024 * 1024;
 
 const workflowToolSchema = Type.Object({
+  resumeRunId: Type.Optional(
+    Type.String({
+      description: "Paused workflow run to continue with `reply`. Omit script/scriptPath for continuation calls.",
+    }),
+  ),
+  reply: Type.Optional(
+    Type.String({ description: "Non-empty parent-conversation reply for the paused run's checkpoint." }),
+  ),
   script: Type.Optional(
     Type.String({
       description: "Raw JavaScript workflow script (no Markdown fences). Pass exactly one of script or scriptPath.",
@@ -121,6 +129,8 @@ const workflowToolSchema = Type.Object({
 });
 
 export type WorkflowToolInput = {
+  resumeRunId?: string;
+  reply?: string;
   script?: string;
   scriptPath?: string;
   cwd?: string;
@@ -166,8 +176,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     name: "workflow",
     label: "Workflow",
     description: [
-      "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), pipeline(), and shell steps via bash().",
-      "Pass exactly one source: inline script or an absolute scriptPath. Both must contain a meta export and call agent() at least once.",
+      "Execute or continue a deterministic JavaScript workflow that orchestrates subagents and shell steps.",
+      "To start, pass exactly one source: inline script or absolute scriptPath. To answer a paused checkpoint, pass only resumeRunId and reply.",
     ].join(" "),
     promptSnippet:
       "Run a deterministic workflow from one source: inline script or absolute scriptPath. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
@@ -186,7 +196,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           "const results = await parallel(items.map(item => () => agent('task + context + paths', { label: 'unique 2-4 words', tier: 'small' })))",
           "return { ok: true, verdict: '...', results }",
         ].join("\n"),
-        "Globals: agent(prompt, opts), parallel(thunks: Array<() => Promise<unknown>>), pipeline(items, ...stages), phase(title), bash(cmd, {cwd?, timeoutMs?}), log(msg), args, cwd, budget, workflow('saved-name', args) (nests one level; global caps hold). Helpers built on agent(): verify(item,{reviewers,lens}), judgePanel(attempts,{judges,rubric}), loopUntilDry({round,key}), completenessCheck(args,results), retry(thunk,{attempts,until}), gate(thunk,validator,{attempts}), checkpoint(prompt,opts).",
+        "Globals: agent(prompt, opts), parallel(thunks: Array<() => Promise<unknown>>), pipeline(items, ...stages), phase(title), bash(cmd, {cwd?, timeoutMs?}), log(msg), args, cwd, budget, workflow('saved-name', args) (nests one level; global caps hold). Helpers built on agent(): verify(item,{reviewers,lens}), judgePanel(attempts,{judges,rubric}), loopUntilDry({round,key}), completenessCheck(args,results), retry(thunk,{attempts,until}), gate(thunk,validator,{attempts}), checkpoint(question). checkpoint always pauses and transfers its question to the parent conversation; continue the same run with workflow({resumeRunId,reply}).",
         "bash(cmd) runs a shell command and returns {pid, exitCode, stdoutFile, stderrFile}. Full stdout/stderr go to those files; do not paste output directly through the workflow result. Use it for mechanical steps (grep/build/test), check exitCode, then pass the file paths to agent() so subagents can read/grep the files. Results are journaled so resume replays them without re-running.",
         "parallel() takes an array of zero-arg functions (thunks), not promises. Correct: await parallel(items.map(item => () => agent(...))). Wrong: await parallel(items.map(item => agent(...))) and wrong: await parallel(items.map(async item => agent(...))). Before calling workflow, self-check every parallel(...) argument: each array element must be a function you have not called yet. Results keep input order; failed branches return null and log: check for nulls before synthesizing. pipeline() runs stages sequentially per item, items concurrently; each stage gets (prev, original, index).",
         "Subagents have NO parent context unless you give it to them: each prompt must carry the task, relevant paths, and expected output. For machine-readable output pass a plain JSON Schema via opts.schema (not TypeScript/TypeBox). opts.cwd runs an agent in another directory. Session args: opts.forkFrom forks an existing Pi session file as read-only starting context; opts.sessionPath persists/continues this subagent's working session (relative paths resolve under ~/.pi/workflows/sessions/); using both forks into a new persistent session and is invalid if the target already exists. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle still applies. With multiple phases, call phase('Exact Title') before each phase's work so agents group correctly. End with a synthesis agent when combining results; return a compact JSON-serializable value.",
@@ -199,21 +209,28 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     prepareArguments(args) {
       return normalizeWorkflowToolArgs(args);
     },
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+      if (params.resumeRunId) {
+        const resumed = await manager.resumeWithReply(params.resumeRunId, params.reply);
+        if (!resumed) {
+          throw new Error(
+            `Workflow ${params.resumeRunId} is not paused at a checkpoint, is already running, or rejected the reply`,
+          );
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Checkpoint reply accepted. Workflow ${params.resumeRunId} resumed in the background. Its result will return to this conversation.`,
+            },
+          ],
+          details: { runId: params.resumeRunId, background: true, resumed: true },
+        };
+      }
+
       const script = resolveWorkflowScript(params);
       const runCwd = resolveWorkflowCwd(params.cwd);
       const parsed = parseWorkflowScript(script);
-
-      // checkpoint() reaches the human only on a UI-bearing foreground run; a
-      // background run is detached, so checkpoint() falls back to its headless
-      // default. Map a checkpoint to ctx.ui.confirm (a yes/no gate) when available.
-      const uiCtx = ctx as
-        | { hasUI?: boolean; ui?: { confirm?(title: string, message: string): Promise<boolean> } }
-        | undefined;
-      const uiConfirm = uiCtx?.hasUI ? uiCtx.ui?.confirm : undefined;
-      const confirm = uiConfirm
-        ? (promptText: string) => uiConfirm.call(uiCtx?.ui, "Workflow checkpoint", promptText)
-        : undefined;
 
       // Background execution is the default: return immediately so the turn ends
       // and the user isn't blocked. The result is delivered back into the
@@ -255,7 +272,6 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
           cwd: runCwd,
-          confirm,
           externalSignal: signal,
           onProgress(live) {
             snapshot = recomputeWorkflowSnapshot(live);
@@ -263,6 +279,21 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           },
         });
       } catch (error) {
+        if (error instanceof WorkflowError && error.code === WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED) {
+          const checkpoint = error.details as { runId?: string; prompt?: string };
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Workflow ${checkpoint.runId ?? "unknown"} paused for parent-conversation input.\n` +
+                  `${checkpoint.prompt ?? error.message}\n` +
+                  `After the user replies, continue it with workflow({resumeRunId, reply}).`,
+              },
+            ],
+            details: { runId: checkpoint.runId, paused: true, checkpoint },
+          };
+        }
         const aborted =
           signal?.aborted || (error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED);
         if (aborted) {
@@ -382,13 +413,33 @@ export function backgroundStartedText(name: string, runId: string): string {
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
   if (!args || typeof args !== "object") {
-    throw new Error("workflow requires an object argument with exactly one script source");
+    throw new Error("workflow requires an object argument");
   }
   const value = args as Record<string, unknown>;
   const hasScript = value.script !== undefined;
   const hasScriptPath = value.scriptPath !== undefined;
+  const hasResume = value.resumeRunId !== undefined;
+  if (hasResume) {
+    if (hasScript || hasScriptPath) {
+      throw new Error("workflow continuation cannot include `script` or `scriptPath`");
+    }
+    if (typeof value.resumeRunId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value.resumeRunId)) {
+      throw new Error("workflow `resumeRunId` must be a valid run ID");
+    }
+    if (typeof value.reply !== "string" || value.reply.trim().length === 0) {
+      throw new Error("workflow continuation requires a non-empty string `reply`");
+    }
+    const continuationFields = new Set(["resumeRunId", "reply"]);
+    if (Object.keys(value).some((field) => !continuationFields.has(field))) {
+      throw new Error("workflow continuation accepts only `resumeRunId` and `reply`");
+    }
+    return value as WorkflowToolInput;
+  }
   if (hasScript === hasScriptPath) {
-    throw new Error("workflow requires exactly one of `script` or `scriptPath`");
+    throw new Error("workflow start requires exactly one of `script` or `scriptPath`");
+  }
+  if (Object.hasOwn(value, "reply")) {
+    throw new Error("workflow `reply` requires `resumeRunId`");
   }
   if (hasScript && typeof value.script !== "string") {
     throw new Error("workflow requires `script` to be a string");

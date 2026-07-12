@@ -22,10 +22,13 @@ describe("installResultDelivery", () => {
   function createMockManager(run?: unknown) {
     const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
       getRun: (...args: unknown[]) => unknown;
+      isRunInCurrentSession: (...args: unknown[]) => boolean;
       __deliveryInstalled?: boolean;
       listRuns?: () => unknown[];
     };
     manager.getRun = () => run;
+    manager.isRunInCurrentSession = () => true;
+    manager.listRuns = () => [];
     return manager;
   }
 
@@ -255,6 +258,46 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("/workflows resume test-run-1"), "should name the resume command");
     assert.ok(calls[0].content.includes("Resets in ~3h"), "should include the reset hint");
     assert.ok(!calls[0].content.includes("failed"), "should not say failed");
+  });
+
+  it("replays a persisted human checkpoint when delivery installs after reload", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    manager.listRuns = () => [
+      {
+        runId: "persisted-run",
+        status: "paused",
+        pauseReason: "human_input",
+        pendingCheckpoint: { prompt: "Persisted question?" },
+      },
+    ];
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+
+    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].content, /Persisted question\?/);
+    assert.match(calls[0].content, /persisted-run/);
+  });
+
+  it("delivers a human checkpoint to the parent conversation", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("paused", {
+      runId: "test-run-1",
+      reason: "human_input",
+      checkpoint: {
+        prompt: "Accept the bounded rollout risk?",
+      },
+    });
+
+    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].content, /Accept the bounded rollout risk\?/);
+    assert.match(calls[0].content, /resumeRunId/);
+    assert.match(calls[0].content, /Do not start a new run/);
   });
 
   it("ignores a manual pause (no reason) — no delivery", () => {

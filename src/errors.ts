@@ -17,6 +17,8 @@ export enum WorkflowErrorCode {
    * so the run is checkpointed (paused) and replayed by resume() rather than failed.
    */
   PROVIDER_USAGE_LIMIT = "PROVIDER_USAGE_LIMIT",
+  /** A workflow checkpoint is waiting for a reply from the parent conversation. */
+  CHECKPOINT_INPUT_REQUIRED = "CHECKPOINT_INPUT_REQUIRED",
   /** Script validation failed. */
   SCRIPT_VALIDATION_ERROR = "SCRIPT_VALIDATION_ERROR",
   /** A schema agent never produced valid structured_output (after repair + extraction). */

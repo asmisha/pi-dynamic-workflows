@@ -10,12 +10,42 @@ import { errorStack, WorkflowError, WorkflowErrorCode, wrapError } from "./error
 import {
   createRunPersistence,
   generateRunId,
+  type PersistedExecutionOptions,
   type PersistedRunState,
   type RunLease,
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
-import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import {
+  type JournalEntry,
+  type PendingCheckpoint,
+  parseWorkflowScript,
+  runWorkflow,
+  type WorkflowRunResult,
+} from "./workflow.js";
+
+function checkpointFromError(error: WorkflowError): PendingCheckpoint | undefined {
+  if (error.code !== WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED) return undefined;
+  const value = error.details;
+  if (!value || typeof value !== "object") return undefined;
+  const checkpoint = value as Partial<PendingCheckpoint>;
+  if (
+    !Number.isInteger(checkpoint.callIndex) ||
+    typeof checkpoint.hash !== "string" ||
+    typeof checkpoint.prompt !== "string"
+  ) {
+    return undefined;
+  }
+  return checkpoint as PendingCheckpoint;
+}
+
+function isValidRunId(runId: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(runId);
+}
+
+function isValidCheckpointReply(_checkpoint: PendingCheckpoint, reply: unknown): reply is string {
+  return typeof reply === "string" && reply.trim().length > 0;
+}
 
 export interface ManagedRun {
   runId: string;
@@ -28,12 +58,20 @@ export interface ManagedRun {
   /** The real script, kept so the run can be resumed. */
   script: string;
   args?: unknown;
+  /** Parent Pi session that owns delivery and checkpoint replies. */
+  sessionId?: string;
   /** Effective cwd for this run, independent of the host session cwd. */
   cwd: string;
+  /** Effective execution limits preserved across pause/resume. */
+  executionOptions?: PersistedExecutionOptions;
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
   /** Cross-process execution lease for this run, when it is actively executing. */
   lease?: RunLease;
+  /** Durable checkpoint currently awaiting a reply from the parent conversation. */
+  pendingCheckpoint?: PendingCheckpoint;
+  /** Why this run is paused. */
+  pauseReason?: "manual" | "usage_limit" | "human_input";
   /** True after the user removes the run; suppresses final persistence from the unwinding execution. */
   deleted?: boolean;
   /** True once the run's execution fully unwound (final state persisted, lease released). */
@@ -53,6 +91,8 @@ export interface ExecOptions {
   cwd?: string;
   /** Replay these journaled agent results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
+  /** Cumulative usage already spent by the replayed prefix. */
+  initialTokenUsage?: PersistedRunState["tokenUsage"];
   /** Cap on total agents for this run. */
   maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
@@ -67,8 +107,6 @@ export interface ExecOptions {
   concurrency?: number;
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
-  /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
-  confirm?: (promptText: string, options: unknown) => Promise<unknown>;
 }
 
 export interface WorkflowManagerOptions {
@@ -226,7 +264,9 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script,
       args,
+      sessionId: this.sessionId,
       cwd: exec.cwd ?? this.cwd,
+      executionOptions: this.resolveExecutionOptions(exec),
       journal: [],
       background: true,
       lease,
@@ -242,6 +282,7 @@ export class WorkflowManager extends EventEmitter {
         script,
         args,
         cwd: managed.cwd,
+        executionOptions: managed.executionOptions,
         sessionId: this.sessionId,
         status: "running",
         phases: managed.snapshot.phases,
@@ -274,7 +315,7 @@ export class WorkflowManager extends EventEmitter {
    * a caller (e.g. the workflow tool) drive its own inline display.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args, exec.cwd);
+    const managed = this.createManaged(script, args, exec);
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
@@ -286,7 +327,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /** Build a fresh managed run with an empty snapshot. */
-  private createManaged(script: string, args?: unknown, runCwd?: string): ManagedRun {
+  private createManaged(script: string, args?: unknown, exec: ExecOptions = {}): ManagedRun {
     const parsed = parseWorkflowScript(script);
     return {
       runId: generateRunId(),
@@ -306,9 +347,21 @@ export class WorkflowManager extends EventEmitter {
       startedAt: new Date(),
       script,
       args,
-      cwd: runCwd ?? this.cwd,
+      sessionId: this.sessionId,
+      cwd: exec.cwd ?? this.cwd,
+      executionOptions: this.resolveExecutionOptions(exec),
       journal: [],
       background: false,
+    };
+  }
+
+  private resolveExecutionOptions(exec: ExecOptions): PersistedExecutionOptions {
+    return {
+      maxAgents: exec.maxAgents,
+      agentTimeoutMs: exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs,
+      tokenBudget: exec.tokenBudget,
+      concurrency: exec.concurrency ?? this.concurrency,
+      agentRetries: exec.agentRetries ?? this.defaultAgentRetries,
     };
   }
 
@@ -327,11 +380,18 @@ export class WorkflowManager extends EventEmitter {
       tokenBudget,
       concurrency,
       agentRetries,
-      confirm,
+      initialTokenUsage,
     } = exec;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
     const resolvedConcurrency = concurrency ?? this.concurrency;
     const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
+    managed.executionOptions ??= {
+      maxAgents,
+      agentTimeoutMs: resolvedAgentTimeoutMs,
+      tokenBudget,
+      concurrency: resolvedConcurrency,
+      agentRetries: resolvedAgentRetries,
+    };
     const progress = () => onProgress?.(managed.snapshot);
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
@@ -340,6 +400,7 @@ export class WorkflowManager extends EventEmitter {
     }
     try {
       const result = await runWorkflow(script, {
+        runId: managed.runId,
         cwd: managed.cwd,
         args,
         agent: this.agent,
@@ -351,7 +412,7 @@ export class WorkflowManager extends EventEmitter {
         maxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget,
-        confirm,
+        initialTokenUsage,
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
@@ -447,6 +508,36 @@ export class WorkflowManager extends EventEmitter {
             })
           : wrappedError;
 
+      const checkpoint = checkpointFromError(workflowError);
+      if (!managed.controller.signal.aborted && checkpoint) {
+        managed.status = "paused";
+        managed.pendingCheckpoint = checkpoint;
+        managed.pauseReason = "human_input";
+        if (!this.persistRun(managed)) {
+          const persistenceError = new WorkflowError(
+            "Could not persist the workflow checkpoint",
+            WorkflowErrorCode.PERSISTENCE_ERROR,
+            { recoverable: false, details: workflowError },
+          );
+          managed.status = "failed";
+          managed.pendingCheckpoint = undefined;
+          managed.pauseReason = undefined;
+          managed.error = persistenceError;
+          this.emit("error", { runId: managed.runId, error: persistenceError });
+          managed.finalized = true;
+          this.releaseRunLease(managed);
+          throw persistenceError;
+        }
+        this.emit("paused", { runId: managed.runId, reason: "human_input", checkpoint });
+        managed.finalized = true;
+        this.releaseRunLease(managed);
+        this.runs.delete(managed.runId);
+        throw new WorkflowError(workflowError.message, WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED, {
+          recoverable: false,
+          details: { ...checkpoint, runId: managed.runId },
+        });
+      }
+
       const usageLimitPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
       let abortedByHost = false;
@@ -457,6 +548,7 @@ export class WorkflowManager extends EventEmitter {
           abortedByHost = true; // Esc/external abort: no pause()/stop() emitted an event
         }
       } else if (usageLimitPaused) {
+        managed.pauseReason = "usage_limit";
         // Provider quota/usage limit: NOT a failure. Checkpoint the run as paused so
         // the persisted journal (completed agent results) is replayed by resume()
         // once the budget refills — instead of the user starting from scratch.
@@ -530,8 +622,8 @@ export class WorkflowManager extends EventEmitter {
     this.persistTimers.delete(runId);
   }
 
-  private persistRun(managed: ManagedRun) {
-    if (managed.deleted) return;
+  private persistRun(managed: ManagedRun): boolean {
+    if (managed.deleted) return false;
     this.cancelScheduledPersist(managed.runId);
     const failureLocation = resolveWorkflowFailureLocation(managed.snapshot, managed.error?.agentLabel);
     try {
@@ -544,19 +636,14 @@ export class WorkflowManager extends EventEmitter {
           script: managed.script,
           args: managed.args,
           cwd: managed.cwd,
-          sessionId: this.sessionId,
+          executionOptions: managed.executionOptions,
+          sessionId: managed.sessionId,
           journal: managed.journal,
           status: managed.status,
-          // Why a usage-limit pause happened, so the navigator / a future cold start
-          // can show it and (eventually) re-arm resume after the budget refills.
-          pauseReason:
-            managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
-              ? "usage_limit"
-              : undefined,
+          pauseReason: managed.status === "paused" ? managed.pauseReason : undefined,
+          pendingCheckpoint: managed.status === "paused" ? managed.pendingCheckpoint : undefined,
           resetHint:
-            managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
-              ? managed.error.resetHint
-              : undefined,
+            managed.status === "paused" && managed.pauseReason === "usage_limit" ? managed.error?.resetHint : undefined,
           phases: managed.snapshot.phases,
           currentPhase: managed.snapshot.currentPhase,
           agents: managed.snapshot.agents.map((a) => ({
@@ -594,11 +681,13 @@ export class WorkflowManager extends EventEmitter {
         },
         { backup: managed.status !== "running" },
       );
+      return true;
     } catch (err) {
       // Persistence is best-effort: the run is still healthy in memory.
       // Log so an operator debugging state-loss has a lead, but never crash
       // the workflow over a disk-full situation.
       console.warn("[workflow-manager] Persist run failed:", err);
+      return false;
     }
   }
 
@@ -611,6 +700,7 @@ export class WorkflowManager extends EventEmitter {
 
     managed.controller.abort();
     managed.status = "paused";
+    managed.pauseReason = "manual";
     this.emit("paused", { runId });
     // Persist the final paused state and release the lease NOW so the run is
     // immediately resumable; `finalized` suppresses the unwinding execution's
@@ -623,23 +713,78 @@ export class WorkflowManager extends EventEmitter {
 
   /**
    * Resume an interrupted run: replay journaled results for the unchanged prefix
-   * and run the rest live. Returns false if there is nothing resumable.
+   * and run the rest live. A human-input pause must use resumeWithReply().
    */
   async resume(runId: string): Promise<boolean> {
-    // Guard: refuse to resume a run that is already running, or one that was
-    // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
-    if (active?.status === "running") return false;
-    if (active?.status === "aborted") return false;
+    if (active?.status === "running" || active?.status === "aborted") return false;
 
     const persisted = this.persistence.load(runId);
-    if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
+    if (
+      !persisted?.script ||
+      persisted.status === "completed" ||
+      persisted.status === "aborted" ||
+      persisted.pendingCheckpoint
+    ) {
+      return false;
+    }
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
+    this.startResumedRun(persisted, lease, persisted.journal ?? []);
+    return true;
+  }
 
-    const controller = new AbortController();
+  /** Supply the one pending checkpoint reply and continue the same persisted run. */
+  async resumeWithReply(runId: string, reply: unknown): Promise<boolean> {
+    if (!isValidRunId(runId)) return false;
+    const active = this.runs.get(runId);
+    if (active?.status === "running" || active?.status === "aborted") return false;
+
+    const persisted = this.persistence.load(runId);
+    const checkpoint = persisted?.pendingCheckpoint;
+    if (!persisted?.script || persisted.status !== "paused" || !checkpoint) return false;
+    if (!this.ownsCurrentSession(persisted.sessionId)) return false;
+    if (!isValidCheckpointReply(checkpoint, reply)) return false;
+
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) return false;
+    try {
+      const latest = this.persistence.load(runId);
+      const currentCheckpoint = latest?.pendingCheckpoint;
+      if (
+        !latest?.script ||
+        latest.status !== "paused" ||
+        !currentCheckpoint ||
+        !this.ownsCurrentSession(latest.sessionId) ||
+        !isValidCheckpointReply(currentCheckpoint, reply)
+      ) {
+        this.persistence.releaseRunLease(lease);
+        return false;
+      }
+      const journal = [
+        ...(latest.journal ?? []).filter((entry) => entry.index !== currentCheckpoint.callIndex),
+        { index: currentCheckpoint.callIndex, hash: currentCheckpoint.hash, result: reply },
+      ].sort((left, right) => left.index - right.index);
+      const resumedState: PersistedRunState = {
+        ...latest,
+        journal,
+        pendingCheckpoint: undefined,
+        pauseReason: undefined,
+        resetHint: undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      this.persistence.save(resumedState);
+      this.startResumedRun(resumedState, lease, journal);
+      return true;
+    } catch (error) {
+      this.persistence.releaseRunLease(lease);
+      throw error;
+    }
+  }
+
+  private startResumedRun(persisted: PersistedRunState, lease: RunLease, journal: JournalEntry[]): void {
     const managed: ManagedRun = {
-      runId,
+      runId: persisted.runId,
       status: "running",
       snapshot: {
         name: persisted.workflowName,
@@ -651,22 +796,26 @@ export class WorkflowManager extends EventEmitter {
         doneCount: 0,
         errorCount: 0,
       },
-      controller,
+      controller: new AbortController(),
       startedAt: new Date(),
       script: persisted.script,
       args: persisted.args,
+      sessionId: persisted.sessionId,
       cwd: persisted.cwd ?? this.cwd,
-      journal: persisted.journal ?? [],
+      executionOptions: persisted.executionOptions,
+      journal,
       background: true,
       lease,
     };
-    this.runs.set(runId, managed);
+    this.runs.set(persisted.runId, managed);
 
-    const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
-    this.emit("resumed", { runId });
-    // Run in the background; executeRun records status/errors on the managed run.
-    void this.executeRun(managed, persisted.script, persisted.args, { resumeJournal }).catch(() => {});
-    return true;
+    const resumeJournal = new Map(journal.map((entry) => [entry.index, entry] as const));
+    this.emit("resumed", { runId: persisted.runId });
+    void this.executeRun(managed, persisted.script, persisted.args, {
+      ...persisted.executionOptions,
+      resumeJournal,
+      initialTokenUsage: persisted.tokenUsage,
+    }).catch(() => {});
   }
 
   private hasLiveExternalOwner(runId: string): boolean {
@@ -705,7 +854,13 @@ export class WorkflowManager extends EventEmitter {
     try {
       const latest = this.persistence.load(runId) ?? persisted;
       if (latest.status !== "running" && latest.status !== "paused") return false;
-      this.persistence.save({ ...latest, status: "aborted", pauseReason: undefined, resetHint: undefined });
+      this.persistence.save({
+        ...latest,
+        status: "aborted",
+        pauseReason: undefined,
+        pendingCheckpoint: undefined,
+        resetHint: undefined,
+      });
       this.emit("stopped", { runId });
       return true;
     } finally {
@@ -718,6 +873,16 @@ export class WorkflowManager extends EventEmitter {
    */
   getRun(runId: string): ManagedRun | undefined {
     return this.runs.get(runId);
+  }
+
+  private ownsCurrentSession(owner: string | undefined): boolean {
+    return this.sessionId === undefined || owner === undefined || owner === this.sessionId;
+  }
+
+  /** Whether this run belongs to the parent Pi session currently bound to the manager. */
+  isRunInCurrentSession(runId: string): boolean {
+    const owner = this.runs.get(runId)?.sessionId ?? this.persistence.load(runId)?.sessionId;
+    return this.ownsCurrentSession(owner);
   }
 
   /**

@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import { join } from "node:path";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
+import type { PendingCheckpoint } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -36,6 +37,14 @@ export interface PersistedRunError {
   stack?: string;
 }
 
+export interface PersistedExecutionOptions {
+  maxAgents?: number;
+  agentTimeoutMs?: number | null;
+  tokenBudget?: number | null;
+  concurrency?: number;
+  agentRetries?: number;
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -43,12 +52,16 @@ export interface PersistedRunState {
   args?: unknown;
   /** Effective cwd used by this run; absent only on legacy persisted runs. */
   cwd?: string;
+  /** Effective execution limits preserved across pause/resume. */
+  executionOptions?: PersistedExecutionOptions;
   /** The pi session this run belongs to. Runs persist on disk across sessions but
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
   status: RunStatus;
-  /** Why a paused run is paused (e.g. "usage_limit" when a provider quota was hit). */
-  pauseReason?: string;
+  /** Why a paused run is paused. */
+  pauseReason?: "manual" | "usage_limit" | "human_input";
+  /** The durable checkpoint awaiting a parent-conversation reply. */
+  pendingCheckpoint?: PendingCheckpoint;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
   phases: string[];

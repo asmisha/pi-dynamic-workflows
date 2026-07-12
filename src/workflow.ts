@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, mkdirSync, openSync } from "node:fs";
@@ -56,6 +57,10 @@ export interface SharedRuntime {
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   depth: number;
+  /** Whether nested workflow() work has run before a possible checkpoint. */
+  nestedUsed: boolean;
+  /** Live or queued agent/bash calls; checkpoints require this to be zero. */
+  activeCalls: number;
 }
 
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
@@ -86,18 +91,14 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeJournal?: Map<number, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
+  /** Resume: cumulative usage already spent by the journaled prefix. */
+  initialTokenUsage?: Partial<SharedRuntime["tokenUsage"]>;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /** Resolve a saved-workflow name to its script, enabling `workflow('name', args)`. */
   loadSavedWorkflow?: (name: string) => string | undefined;
-  /**
-   * Ask the human a checkpoint() question and resolve to their reply. Threaded from
-   * a UI-bearing tool context. Absent => headless: checkpoint() takes its declared
-   * default (and journals it), so a detached/background run never hangs.
-   */
-  confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
@@ -198,18 +199,11 @@ export interface WorkflowBashResult {
   stderrFile: string;
 }
 
-/** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
-export interface CheckpointOptions {
-  /** Reply used when no UI is available (headless/background) and headless != "abort". */
-  default?: unknown;
-  /** Headless behavior: "default" (take `default`/true) or "abort" (throw). Default "default". */
-  headless?: "default" | "abort";
-  /** Confirm | free-text input | pick-one. Affects the hash and the UI widget. */
-  kind?: "confirm" | "input" | "select";
-  /** For kind "select". */
-  choices?: string[];
-  /** Per-checkpoint timeout in ms for the interactive prompt. */
-  timeoutMs?: number;
+/** Persisted identity of the one checkpoint currently awaiting a parent-chat reply. */
+export interface PendingCheckpoint {
+  callIndex: number;
+  hash: string;
+  prompt: string;
 }
 
 interface RuntimeState {
@@ -226,6 +220,8 @@ interface RuntimeState {
   phases: string[];
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
   callSeq: number;
+  /** At most one durable parent checkpoint is allowed per run. */
+  checkpointSeen: boolean;
   /**
    * Index of the first call that missed the resume journal (changed or new).
    * Longest-unchanged-prefix resume: a cached result is replayed only while
@@ -305,6 +301,7 @@ export async function runWorkflow<T = unknown>(
     currentPhase: meta.phases?.[0]?.title,
     phaseBudgets: new Map(),
     callSeq: 0,
+    checkpointSeen: false,
     firstMiss: Number.POSITIVE_INFINITY,
   };
 
@@ -313,14 +310,25 @@ export async function runWorkflow<T = unknown>(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
   // Global caps + budget are shared with any nested workflow() so they hold across nesting.
+  const initialUsage = options.initialTokenUsage;
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
     agentCount: 0,
-    spent: 0,
-    tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    spent: initialUsage?.total ?? 0,
+    tokenUsage: {
+      input: initialUsage?.input ?? 0,
+      output: initialUsage?.output ?? 0,
+      total: initialUsage?.total ?? 0,
+      cost: initialUsage?.cost ?? 0,
+      cacheRead: initialUsage?.cacheRead ?? 0,
+      cacheWrite: initialUsage?.cacheWrite ?? 0,
+    },
     depth: 0,
+    nestedUsed: false,
+    activeCalls: 0,
   };
   const limiter = shared.limiter;
+  const executionContext = new AsyncLocalStorage<{ concurrent: boolean }>();
 
   const log = (message: string) => {
     const text = String(message);
@@ -364,36 +372,7 @@ export async function runWorkflow<T = unknown>(
       );
     }
 
-    if (budget.total !== null && budget.remaining() <= 0) {
-      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
-        recoverable: false,
-      });
-    }
-
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
-
-    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
-    // without touching the run's overall budget. Soft (spent accrues post-agent),
-    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
-    // work so later phases still proceed.
-    if (assignedPhase) {
-      const pb = state.phaseBudgets.get(assignedPhase);
-      if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
-        if (phaseSpent >= pb.budget) {
-          throw new WorkflowError(
-            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
-            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
-            { recoverable: false },
-          );
-        }
-        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
-          pb.warned = true;
-          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
-        }
-      }
-    }
-
     const requestedLabel = agentOptions.label?.trim();
 
     // Resolve a named agentType to its bound definition (tools/model/prompt).
@@ -440,10 +419,34 @@ export async function runWorkflow<T = unknown>(
       options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
       return cached.result;
     }
+
+    if (budget.total !== null && budget.remaining() <= 0) {
+      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
+        recoverable: false,
+      });
+    }
+    if (assignedPhase) {
+      const pb = state.phaseBudgets.get(assignedPhase);
+      if (pb) {
+        const phaseSpent = shared.spent - pb.startSpent;
+        if (phaseSpent >= pb.budget) {
+          throw new WorkflowError(
+            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
+            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+            { recoverable: false },
+          );
+        }
+        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
+          pb.warned = true;
+          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
+        }
+      }
+    }
     // A genuine miss (no journal entry, or the hash changed) marks where the
     // unchanged prefix ends; this call and every later one then run live.
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
+    shared.activeCalls++;
     return limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
@@ -466,6 +469,7 @@ export async function runWorkflow<T = unknown>(
         }
         shared.tokenUsage.total += tokens;
         shared.spent += tokens;
+        options.onTokenUsage?.(shared.tokenUsage);
         return tokens;
       };
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -569,6 +573,8 @@ export async function runWorkflow<T = unknown>(
         }
       }
       return null;
+    }).finally(() => {
+      shared.activeCalls--;
     });
   };
 
@@ -592,21 +598,26 @@ export async function runWorkflow<T = unknown>(
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
-    const output = bashOutputFiles(baseCwd, runId, callIndex, options.persistLogs ?? true);
-    const result = await runBashCommand(command, {
-      cwd: bashOptions.cwd ?? baseCwd,
-      timeoutMs: bashOptions.timeoutMs ?? null,
-      signal: options.signal,
-      stdoutFile: output.stdoutFile,
-      stderrFile: output.stderrFile,
-    });
-    throwIfAborted();
-    const shortCmd = command.length > 80 ? `${command.slice(0, 80)}…` : command;
-    log(
-      `$ ${shortCmd} (pid ${result.pid ?? "?"}, exit ${result.exitCode ?? "signal"}; stdout ${result.stdoutFile}; stderr ${result.stderrFile})`,
-    );
-    options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
-    return result;
+    shared.activeCalls++;
+    try {
+      const output = bashOutputFiles(baseCwd, runId, callIndex, options.persistLogs ?? true);
+      const result = await runBashCommand(command, {
+        cwd: bashOptions.cwd ?? baseCwd,
+        timeoutMs: bashOptions.timeoutMs ?? null,
+        signal: options.signal,
+        stdoutFile: output.stdoutFile,
+        stderrFile: output.stderrFile,
+      });
+      throwIfAborted();
+      const shortCmd = command.length > 80 ? `${command.slice(0, 80)}…` : command;
+      log(
+        `$ ${shortCmd} (pid ${result.pid ?? "?"}, exit ${result.exitCode ?? "signal"}; stdout ${result.stdoutFile}; stderr ${result.stderrFile})`,
+      );
+      options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
+      return result;
+    } finally {
+      shared.activeCalls--;
+    }
   };
 
   const parallel = async (thunks: Array<() => Promise<unknown>>) => {
@@ -620,7 +631,7 @@ export async function runWorkflow<T = unknown>(
     return Promise.all(
       thunks.map(async (thunk, index) => {
         try {
-          return await thunk();
+          return await executionContext.run({ concurrent: true }, thunk);
         } catch (error) {
           if (options.signal?.aborted) throw error;
           const workflowError = wrapError(error);
@@ -645,24 +656,26 @@ export async function runWorkflow<T = unknown>(
       throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
     }
     return Promise.all(
-      items.map(async (item, index) => {
-        let value: unknown = item;
-        for (const stage of stages) {
-          try {
-            throwIfAborted();
-            value = await stage(value, item, index);
-            throwIfAborted();
-          } catch (error) {
-            if (options.signal?.aborted) throw error;
-            const workflowError = wrapError(error);
-            // Non-recoverable failures halt the whole run (see parallel()).
-            if (!workflowError.recoverable) throw workflowError;
-            log(`pipeline[${index}] failed: ${workflowError.message}`);
-            return null;
+      items.map((item, index) =>
+        executionContext.run({ concurrent: true }, async () => {
+          let value: unknown = item;
+          for (const stage of stages) {
+            try {
+              throwIfAborted();
+              value = await stage(value, item, index);
+              throwIfAborted();
+            } catch (error) {
+              if (options.signal?.aborted) throw error;
+              const workflowError = wrapError(error);
+              // Non-recoverable failures halt the whole run (see parallel()).
+              if (!workflowError.recoverable) throw workflowError;
+              log(`pipeline[${index}] failed: ${workflowError.message}`);
+              return null;
+            }
           }
-        }
-        return value;
-      }),
+          return value;
+        }),
+      ),
     );
   };
 
@@ -677,6 +690,7 @@ export async function runWorkflow<T = unknown>(
     }
     const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
     const childScript = resolved ?? String(nameOrScript);
+    shared.nestedUsed = true;
     shared.depth++;
     try {
       const child = await runWorkflow(childScript, {
@@ -852,14 +866,54 @@ export async function runWorkflow<T = unknown>(
     return { ok: false, value: last, attempts };
   };
 
-  // Deterministic, journaled, replayable human checkpoint. Spends no tokens, so it
-  // is gated on the agent counter + abort (not budget). On resume the human's reply
-  // replays by callIndex exactly like a cached agent() — the genuine edge over CC,
-  // whose steering is in-session only. Headless (no UI threaded in): takes the
-  // declared default and journals THAT, so a detached/background run never hangs.
-  const checkpoint = async (promptText: string, checkpointOptions: CheckpointOptions = {}) => {
+  // Deterministic durable checkpoint. A live call always unwinds to the workflow
+  // manager so the parent conversation can ask the human without holding a worker
+  // or VM stack open. resumeWithReply() journals the answer; the next execution
+  // replays the unchanged prefix and returns that answer here before continuing.
+  const checkpoint = (promptText: string, checkpointOptions?: unknown): unknown => {
     throwIfAborted();
-    if (typeof promptText !== "string") throw new TypeError("checkpoint(promptText, options?) needs a prompt string");
+    if (typeof promptText !== "string" || promptText.trim().length === 0) {
+      throw new TypeError("checkpoint() needs a non-empty question string");
+    }
+    if (checkpointOptions !== undefined) {
+      throw new TypeError("checkpoint() accepts only a question string");
+    }
+    if (shared.depth > 0 || shared.nestedUsed) {
+      throw new WorkflowError(
+        "checkpoint() is only supported before any nested workflow() work",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    if (executionContext.getStore()?.concurrent) {
+      throw new WorkflowError(
+        "checkpoint() must be awaited sequentially, outside parallel() and pipeline()",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    if (state.phaseBudgets.size > 0) {
+      throw new WorkflowError(
+        "checkpoint() is not supported in workflows with phase token sub-budgets",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    if (shared.activeCalls > 0) {
+      throw new WorkflowError(
+        "checkpoint() requires all prior agent() and bash() calls to be awaited",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    if (state.checkpointSeen) {
+      throw new WorkflowError(
+        "checkpoint() may be called at most once per workflow run",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    state.checkpointSeen = true;
     if (shared.agentCount >= maxAgents) {
       throw new WorkflowError(
         `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,
@@ -868,30 +922,20 @@ export async function runWorkflow<T = unknown>(
       );
     }
     const callIndex = state.callSeq++;
-    const callHash = hashCheckpoint(promptText, checkpointOptions);
+    const callHash = hashCheckpoint(promptText);
     const cached = options.resumeJournal?.get(callIndex);
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
-      return cached.result; // replay the journaled human reply
+      return cached.result;
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
     shared.agentCount++;
 
-    let reply: unknown;
-    if (options.confirm) {
-      reply = await options.confirm(promptText, checkpointOptions);
-    } else if (checkpointOptions.headless === "abort") {
-      throw new WorkflowError(
-        `checkpoint "${promptText}" needs human input but none is available (headless run)`,
-        WorkflowErrorCode.WORKFLOW_ABORTED,
-        { recoverable: false },
-      );
-    } else {
-      reply = checkpointOptions.default ?? true;
-    }
-    throwIfAborted();
-    options.onAgentJournal?.({ index: callIndex, hash: callHash, result: reply });
-    return reply;
+    const pending: PendingCheckpoint = { callIndex, hash: callHash, prompt: promptText };
+    throw new WorkflowError(promptText, WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED, {
+      recoverable: false,
+      details: pending,
+    });
   };
 
   const context = vm.createContext({
@@ -912,6 +956,9 @@ export async function runWorkflow<T = unknown>(
     args: options.args,
     cwd: options.cwd ?? process.cwd(),
     process: Object.freeze({ cwd: () => options.cwd ?? process.cwd() }),
+    // Checkpoint workflows must use the provided sequential/parallel primitives;
+    // native Promise scheduling can detach work from the durable journal boundary.
+    Promise: /\bcheckpoint\s*\(/.test(body) ? undefined : Promise,
     budget,
     console: {
       log,
@@ -927,15 +974,19 @@ export async function runWorkflow<T = unknown>(
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+  if (shared.activeCalls > 0) {
+    throw new WorkflowError(
+      "workflow returned while agent() or bash() calls were still active; await all work before returning",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
 
   // Persist logs
   const logFile = logger.persist();
   if (logFile) {
     log(`Logs persisted to ${logFile}`);
   }
-
-  // Emit final token usage
-  options.onTokenUsage?.(shared.tokenUsage);
 
   return {
     meta,
@@ -965,6 +1016,8 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
     allowReturnOutsideFunction: true,
     ranges: false,
   }) as AnyNode;
+
+  validateCheckpointScheduling(ast);
 
   const first = ast.body?.[0] as AnyNode | undefined;
   if (first?.type !== "ExportNamedDeclaration") {
@@ -1009,6 +1062,67 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
     meta,
     body: script.slice(0, first.start) + script.slice(first.end),
   };
+}
+
+function validateCheckpointScheduling(ast: AnyNode): void {
+  let usesCheckpoint = false;
+  const asyncNames = new Set<string>();
+  walkAst(ast, undefined, (node) => {
+    if (node.type === "Identifier" && node.name === "checkpoint") usesCheckpoint = true;
+    if (node.type === "FunctionDeclaration" && node.async && node.id?.type === "Identifier") {
+      asyncNames.add(node.id.name);
+    }
+    if (
+      node.type === "VariableDeclarator" &&
+      node.id?.type === "Identifier" &&
+      (node.init?.type === "ArrowFunctionExpression" || node.init?.type === "FunctionExpression") &&
+      node.init.async
+    ) {
+      asyncNames.add(node.id.name);
+    }
+  });
+  if (!usesCheckpoint) return;
+
+  walkAst(ast, undefined, (node, parent) => {
+    if (node.type !== "CallExpression") return;
+    const callee = node.callee as AnyNode;
+    const callsAsyncFunction =
+      ((callee.type === "ArrowFunctionExpression" || callee.type === "FunctionExpression") && callee.async) ||
+      (callee.type === "Identifier" && asyncNames.has(callee.name));
+    const callsPromiseCallback =
+      callee.type === "MemberExpression" &&
+      !callee.computed &&
+      callee.property?.type === "Identifier" &&
+      ["then", "catch", "finally"].includes(callee.property.name);
+    if (!callsAsyncFunction && !callsPromiseCallback) return;
+    const safelyChained =
+      parent?.type === "AwaitExpression" ||
+      parent?.type === "ReturnStatement" ||
+      (parent?.type === "ArrowFunctionExpression" && parent.body === node);
+    if (!safelyChained) {
+      throw new WorkflowError(
+        "checkpoint workflows cannot detach async functions or Promise callbacks",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+  });
+}
+
+function walkAst(node: AnyNode, parent: AnyNode | undefined, visit: (node: AnyNode, parent?: AnyNode) => void): void {
+  visit(node, parent);
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "start" || key === "end") continue;
+    if (Array.isArray(value)) {
+      for (const child of value) {
+        if (child && typeof child === "object" && typeof child.type === "string") {
+          walkAst(child as AnyNode, node, visit);
+        }
+      }
+    } else if (value && typeof value === "object" && typeof (value as AnyNode).type === "string") {
+      walkAst(value as AnyNode, node, visit);
+    }
+  }
 }
 
 function evaluateLiteral(node: AnyNode, path: string): unknown {
@@ -1096,13 +1210,8 @@ function defaultAgentLabel(phase: string | undefined, index: number): string {
 }
 
 /** Stable identity hash for an agent() call — a cache miss on resume when anything changes. */
-function hashCheckpoint(promptText: string, options: CheckpointOptions): string {
-  const identity = JSON.stringify({
-    promptText,
-    kind: options.kind ?? "confirm",
-    choices: options.choices ?? null,
-  });
-  return createHash("sha256").update(identity).digest("hex");
+function hashCheckpoint(promptText: string): string {
+  return createHash("sha256").update(promptText).digest("hex");
 }
 
 function hashAgentCall(

@@ -102,27 +102,47 @@ export function deliverText(run: ManagedRun): string {
  */
 export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager): void {
   // Mutable holder on manager so shared across re-calls (e.g. session_start after /reload).
-  const m = manager as unknown as { __deliveryInstalled?: boolean; __holder?: { pi: ExtensionAPI } };
+  const m = manager as unknown as {
+    __deliveryInstalled?: boolean;
+    __holder?: { pi: ExtensionAPI };
+    __deliverPendingCheckpoints?: () => void;
+  };
   if (m.__deliveryInstalled) {
-    // Refresh pi reference only — listeners stay registered.
     if (m.__holder) m.__holder.pi = pi;
+    m.__deliverPendingCheckpoints?.();
     return;
   }
   m.__deliveryInstalled = true;
   m.__holder = { pi };
 
-  const deliver = (content: string) => {
+  const deliver = (content: string, attempt = 0) => {
+    const retry = () => {
+      if (attempt >= 2) return;
+      const timer = setTimeout(() => deliver(content, attempt + 1), 250 * (attempt + 1));
+      (timer as { unref?: () => void }).unref?.();
+    };
     try {
       const ret = m.__holder?.pi.sendMessage(
         { customType: "workflow-result", content, display: true },
         { triggerTurn: true, deliverAs: "followUp" },
       );
-      // sendMessage may return a promise; a sync try/catch can't catch its
-      // rejection, so swallow the async path too. A stale ctx after /reload is
-      // the expected failure — the result is still visible via /workflows.
-      void Promise.resolve(ret).catch(() => {});
+      void Promise.resolve(ret).catch(retry);
     } catch {
-      // Synchronous failure (e.g. stale ctx) — result still visible via /workflows.
+      retry();
+    }
+  };
+
+  const checkpointText = (runId: string, prompt: string) =>
+    `⏸ Background workflow ${runId} paused for parent-conversation input.\n\n` +
+    `${prompt}\n\n` +
+    `Ask the user this question. Do not start a new run. After the user replies, continue the same run with ` +
+    `workflow({resumeRunId: "${runId}", reply: <user reply>}).`;
+
+  m.__deliverPendingCheckpoints = () => {
+    for (const run of manager.listRuns()) {
+      if (run.status === "paused" && run.pauseReason === "human_input" && run.pendingCheckpoint) {
+        deliver(checkpointText(run.runId, run.pendingCheckpoint.prompt));
+      }
     }
   };
 
@@ -142,10 +162,8 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
       })}`,
     );
   });
-  // A provider usage/quota limit checkpoints the run as paused (not failed): tell the
-  // user it is resumable once their budget refills, rather than letting it look dead.
-  // Manual pause() also emits "paused" but with no reason — guard so only the
-  // usage-limit case delivers a message.
+  // Durable checkpoints and provider limits both pause without failing. Deliver
+  // the reason to the parent conversation so it can ask the user or explain resume.
   manager.on(
     "paused",
     ({
@@ -153,14 +171,20 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
       reason,
       error,
       resetHint,
+      checkpoint,
     }: {
       runId: string;
       reason?: string;
       error?: { message?: string };
       resetHint?: string;
+      checkpoint?: { prompt: string };
     }) => {
+      if (!manager.getRun(runId)?.background || !manager.isRunInCurrentSession(runId)) return;
+      if (reason === "human_input" && checkpoint) {
+        deliver(checkpointText(runId, checkpoint.prompt));
+        return;
+      }
       if (reason !== "usage_limit") return;
-      if (!manager.getRun(runId)?.background) return;
       const when = resetHint ? ` (${resetHint})` : "";
       const cause = error?.message ?? "provider usage limit reached";
       deliver(
@@ -169,6 +193,8 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
       );
     },
   );
+
+  m.__deliverPendingCheckpoints();
 }
 
 export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {
