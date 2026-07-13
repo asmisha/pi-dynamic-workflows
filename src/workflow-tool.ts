@@ -155,6 +155,60 @@ export interface WorkflowToolOptions {
   defaultAgentRetries?: number;
 }
 
+const workflowControlToolSchema = Type.Object({
+  runId: Type.String({
+    pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+    description: "Workflow run ID returned by the workflow tool.",
+  }),
+});
+
+function createWorkflowControlTool(
+  manager: WorkflowManager,
+  action: "pause" | "stop",
+): ToolDefinition<typeof workflowControlToolSchema, any> {
+  const pastTense = action === "pause" ? "paused" : "stopped";
+  return defineTool({
+    name: `workflow_${action}`,
+    label: action === "pause" ? "Pause Workflow" : "Stop Workflow",
+    description:
+      action === "pause"
+        ? "Temporarily pause a running workflow in the current session. The run can be resumed later."
+        : "Stop a running or paused workflow in the current session. Stopped runs cannot be resumed.",
+    promptSnippet:
+      action === "pause"
+        ? "Pause a running workflow when its work should be suspended but may continue later."
+        : "Stop a workflow when its remaining work should be aborted and must not continue.",
+    promptGuidelines: [
+      `Pass the exact runId returned by the workflow tool. Use workflow_${action} only for runs in the current parent session.`,
+    ],
+    parameters: workflowControlToolSchema,
+    async execute(_toolCallId, params) {
+      if (!manager.isRunInCurrentSession(params.runId)) {
+        throw new Error(`Workflow ${params.runId} is unavailable in this session`);
+      }
+      if (!manager[action](params.runId)) {
+        throw new Error(`Workflow ${params.runId} cannot be ${pastTense} in its current state`);
+      }
+      return {
+        content: [{ type: "text", text: `Workflow ${params.runId} ${pastTense}.` }],
+        details: { runId: params.runId, [pastTense]: true },
+      };
+    },
+  });
+}
+
+export function createWorkflowPauseTool(
+  manager: WorkflowManager,
+): ToolDefinition<typeof workflowControlToolSchema, any> {
+  return createWorkflowControlTool(manager, "pause");
+}
+
+export function createWorkflowStopTool(
+  manager: WorkflowManager,
+): ToolDefinition<typeof workflowControlToolSchema, any> {
+  return createWorkflowControlTool(manager, "stop");
+}
+
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
   const cwd = options.cwd ?? process.cwd();
   const defaults = resolveWorkflowToolDefaults(options, cwd);

@@ -81,7 +81,12 @@ export {
   saveWorkflowSettingsForCwd,
 } from "./workflow-settings.js";
 export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
-export { backgroundStartedText, createWorkflowTool } from "./workflow-tool.js";
+export {
+  backgroundStartedText,
+  createWorkflowPauseTool,
+  createWorkflowStopTool,
+  createWorkflowTool,
+} from "./workflow-tool.js";
 export {
   keyToAction,
   type NavAction,

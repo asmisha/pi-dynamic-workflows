@@ -1,5 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  createWorkflowPauseTool,
+  createWorkflowStopTool,
   createWorkflowTool,
   installResultDelivery,
   installTaskPanel,
@@ -24,7 +26,12 @@ export default function extension(pi: ExtensionAPI) {
   });
 
   const workflowTool = createWorkflowTool({ cwd, manager });
+  const workflowPauseTool = createWorkflowPauseTool(manager);
+  const workflowStopTool = createWorkflowStopTool(manager);
   pi.registerTool(workflowTool);
+  pi.registerTool(workflowPauseTool);
+  pi.registerTool(workflowStopTool);
+  const workflowToolNames = [workflowTool.name, workflowPauseTool.name, workflowStopTool.name];
   registerWorkflowCommands(pi, manager);
   registerWorkflowModelsCommand(pi);
   registerWorkflowProgressCommands(pi, {
@@ -43,9 +50,8 @@ export default function extension(pi: ExtensionAPI) {
     // advertise the shared registry's models.
     manager.setModelRegistry(ctx.modelRegistry);
     const active = pi.getActiveTools();
-    if (!active.includes(workflowTool.name)) {
-      pi.setActiveTools([...active, workflowTool.name]);
-    }
+    const missing = workflowToolNames.filter((name) => !active.includes(name));
+    if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
     // Scope the /workflows history to this session: runs persist on disk across
     // sessions, but the navigator/task panel show only the current session's runs.
     // Switching back to a previous session re-shows that session's runs.

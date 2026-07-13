@@ -5,7 +5,13 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
-import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
+import {
+  backgroundStartedText,
+  createWorkflowPauseTool,
+  createWorkflowStopTool,
+  createWorkflowTool,
+  modelRoutingGuideline,
+} from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Minimal fake ModelRegistry, matching the shape the PR's existing tests use. */
@@ -166,6 +172,72 @@ test("createWorkflowTool invalid args throws descriptive error", () => {
 test("createWorkflowTool with custom cwd creates tool", () => {
   const tool = createWorkflowTool({ cwd: "/tmp" });
   assert.equal(tool.name, "workflow");
+});
+
+test("workflow pause and stop tools expose agent-callable controls", async () => {
+  const calls: Array<{ action: "pause" | "stop"; runId: string }> = [];
+  const manager = {
+    isRunInCurrentSession: () => true,
+    pause: (runId: string) => {
+      calls.push({ action: "pause", runId });
+      return true;
+    },
+    stop: (runId: string) => {
+      calls.push({ action: "stop", runId });
+      return true;
+    },
+  } as unknown as WorkflowManager;
+  const pause = createWorkflowPauseTool(manager);
+  const stop = createWorkflowStopTool(manager);
+
+  assert.equal(pause.name, "workflow_pause");
+  assert.equal(stop.name, "workflow_stop");
+  const pauseResult = await (pause.execute as (...args: any[]) => Promise<any>)(
+    "pause-call",
+    { runId: "run-123" },
+    new AbortController().signal,
+    () => {},
+    { hasUI: false },
+  );
+  const stopResult = await (stop.execute as (...args: any[]) => Promise<any>)(
+    "stop-call",
+    { runId: "run-456" },
+    new AbortController().signal,
+    () => {},
+    { hasUI: false },
+  );
+
+  assert.deepEqual(calls, [
+    { action: "pause", runId: "run-123" },
+    { action: "stop", runId: "run-456" },
+  ]);
+  assert.equal(pauseResult.details.paused, true);
+  assert.equal(stopResult.details.stopped, true);
+});
+
+test("workflow control tools reject runs outside the current session or invalid state", async () => {
+  let pauseCalled = false;
+  const manager = {
+    isRunInCurrentSession: () => false,
+    pause: () => {
+      pauseCalled = true;
+      return true;
+    },
+    stop: () => false,
+  } as unknown as WorkflowManager;
+  const executePause = createWorkflowPauseTool(manager).execute as (...args: any[]) => Promise<any>;
+  await assert.rejects(
+    executePause("pause-call", { runId: "other-run" }, new AbortController().signal, () => {}, { hasUI: false }),
+    /unavailable in this session/i,
+  );
+  assert.equal(pauseCalled, false);
+
+  manager.isRunInCurrentSession = () => true;
+  const executeStop = createWorkflowStopTool(manager).execute as (...args: any[]) => Promise<any>;
+  await assert.rejects(
+    executeStop("stop-call", { runId: "finished-run" }, new AbortController().signal, () => {}, { hasUI: false }),
+    /cannot be stopped/i,
+  );
 });
 
 test("workflow tool leaves legacy, user, and project saved-workflow JSON untouched", async () => {
