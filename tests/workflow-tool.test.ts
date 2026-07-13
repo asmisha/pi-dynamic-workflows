@@ -8,6 +8,7 @@ import { workflowProjectPaths } from "../src/workflow-paths.js";
 import {
   backgroundStartedText,
   createWorkflowPauseTool,
+  createWorkflowStatusTool,
   createWorkflowStopTool,
   createWorkflowTool,
   modelRoutingGuideline,
@@ -174,6 +175,81 @@ test("createWorkflowTool with custom cwd creates tool", () => {
   assert.equal(tool.name, "workflow");
 });
 
+test("workflow status tool returns compact live progress", async () => {
+  const manager = {
+    isRunInCurrentSession: () => true,
+    getRun: () => ({
+      status: "running",
+      snapshot: {
+        name: "full_review",
+        phases: ["Plan", "Implement"],
+        currentPhase: "Implement",
+        logs: [],
+        agents: [
+          { id: 1, label: "planner", prompt: "plan", status: "done" },
+          { id: 2, label: "writer", prompt: "write", status: "running" },
+        ],
+        agentCount: 2,
+        runningCount: 1,
+        doneCount: 1,
+        errorCount: 0,
+        tokenUsage: { input: 100, output: 50, total: 150 },
+      },
+    }),
+    listRuns: () => [],
+  } as unknown as WorkflowManager;
+  const status = createWorkflowStatusTool(manager);
+
+  assert.equal(status.name, "workflow_status");
+  const result = await (status.execute as (...args: any[]) => Promise<any>)(
+    "status-call",
+    { runId: "run-123" },
+    new AbortController().signal,
+    () => {},
+    { hasUI: false },
+  );
+
+  assert.equal(result.details.status, "running");
+  assert.equal(result.details.currentPhase, "Implement");
+  assert.deepEqual(result.details.agents, { total: 2, running: 1, done: 1, error: 0 });
+  assert.match(result.content[0].text, /full_review/);
+  assert.match(result.content[0].text, /running/);
+});
+
+test("workflow status tool reads terminal persisted runs without exposing their script", async () => {
+  const manager = {
+    isRunInCurrentSession: () => true,
+    getRun: () => undefined,
+    listRuns: () => [
+      {
+        runId: "done-123",
+        workflowName: "finished_review",
+        script: "secret source",
+        args: { secret: true },
+        status: "completed",
+        phases: ["Review"],
+        currentPhase: "Review",
+        agents: [{ id: 1, label: "reviewer", prompt: "private prompt", status: "done" }],
+        logs: [],
+        result: "private result",
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tokenUsage: { input: 20, output: 10, total: 30 },
+      },
+    ],
+  } as unknown as WorkflowManager;
+  const execute = createWorkflowStatusTool(manager).execute as (...args: any[]) => Promise<any>;
+  const result = await execute("status-call", { runId: "done-123" }, new AbortController().signal, () => {}, {
+    hasUI: false,
+  });
+
+  assert.equal(result.details.status, "completed");
+  assert.equal(result.details.workflowName, "finished_review");
+  assert.equal("script" in result.details, false);
+  assert.equal("args" in result.details, false);
+  assert.equal("result" in result.details, false);
+});
+
 test("workflow pause and stop tools expose agent-callable controls", async () => {
   const calls: Array<{ action: "pause" | "stop"; runId: string }> = [];
   const manager = {
@@ -225,6 +301,12 @@ test("workflow control tools reject runs outside the current session or invalid 
     },
     stop: () => false,
   } as unknown as WorkflowManager;
+  const executeStatus = createWorkflowStatusTool(manager).execute as (...args: any[]) => Promise<any>;
+  await assert.rejects(
+    executeStatus("status-call", { runId: "other-run" }, new AbortController().signal, () => {}, { hasUI: false }),
+    /unavailable in this session/i,
+  );
+
   const executePause = createWorkflowPauseTool(manager).execute as (...args: any[]) => Promise<any>;
   await assert.rejects(
     executePause("pause-call", { runId: "other-run" }, new AbortController().signal, () => {}, { hasUI: false }),

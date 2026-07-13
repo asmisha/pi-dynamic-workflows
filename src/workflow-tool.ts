@@ -162,6 +162,64 @@ const workflowControlToolSchema = Type.Object({
   }),
 });
 
+export function createWorkflowStatusTool(
+  manager: WorkflowManager,
+): ToolDefinition<typeof workflowControlToolSchema, any> {
+  return defineTool({
+    name: "workflow_status",
+    label: "Workflow Status",
+    description: "Get the current status and compact progress of a workflow run in the current session.",
+    promptSnippet: "Inspect a workflow run's current status, phase, agent counts, token usage, and terminal error.",
+    promptGuidelines: ["Pass the exact runId returned by the workflow tool."],
+    parameters: workflowControlToolSchema,
+    async execute(_toolCallId, params) {
+      if (!manager.isRunInCurrentSession(params.runId)) {
+        throw new Error(`Workflow ${params.runId} is unavailable in this session`);
+      }
+      const live = manager.getRun(params.runId);
+      const persisted = live ? undefined : manager.listRuns().find((run) => run.runId === params.runId);
+      if (!live && !persisted) {
+        throw new Error(`Workflow ${params.runId} is unavailable in this session`);
+      }
+
+      const snapshot = live ? recomputeWorkflowSnapshot(live.snapshot) : undefined;
+      const statuses = snapshot?.agents ?? persisted?.agents ?? [];
+      const agents = {
+        total: statuses.length,
+        running: statuses.filter((agent) => agent.status === "running").length,
+        done: statuses.filter((agent) => agent.status === "done").length,
+        error: statuses.filter((agent) => agent.status === "error").length,
+      };
+      const workflowName = snapshot?.name ?? persisted?.workflowName ?? "workflow";
+      const status = live?.status ?? persisted?.status;
+      const currentPhase = snapshot?.currentPhase ?? persisted?.currentPhase;
+      const tokenUsage = snapshot?.tokenUsage ?? persisted?.tokenUsage;
+      const pauseReason = live?.pauseReason ?? persisted?.pauseReason;
+      const sourceError = live?.error ?? persisted?.error;
+      const error = sourceError ? { code: sourceError.code, message: sourceError.message } : undefined;
+      const details = {
+        runId: params.runId,
+        workflowName,
+        status,
+        currentPhase,
+        agents,
+        tokenUsage,
+        pauseReason,
+        error,
+      };
+      const lines = [
+        `Workflow ${workflowName} (${params.runId}) is ${status}.`,
+        ...(currentPhase ? [`Current phase: ${currentPhase}.`] : []),
+        `Agents: ${agents.done}/${agents.total} done, ${agents.running} running, ${agents.error} error.`,
+        ...(tokenUsage ? [`Tokens: ${tokenUsage.total}.`] : []),
+        ...(pauseReason ? [`Pause reason: ${pauseReason}.`] : []),
+        ...(error ? [`Error: ${error.code}: ${error.message}`] : []),
+      ];
+      return { content: [{ type: "text", text: lines.join("\n") }], details };
+    },
+  });
+}
+
 function createWorkflowControlTool(
   manager: WorkflowManager,
   action: "pause" | "stop",

@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createWorkflowPauseTool,
+  createWorkflowStatusTool,
   createWorkflowStopTool,
   createWorkflowTool,
   installResultDelivery,
@@ -26,12 +27,14 @@ export default function extension(pi: ExtensionAPI) {
   });
 
   const workflowTool = createWorkflowTool({ cwd, manager });
+  const workflowStatusTool = createWorkflowStatusTool(manager);
   const workflowPauseTool = createWorkflowPauseTool(manager);
   const workflowStopTool = createWorkflowStopTool(manager);
   pi.registerTool(workflowTool);
+  pi.registerTool(workflowStatusTool);
   pi.registerTool(workflowPauseTool);
   pi.registerTool(workflowStopTool);
-  const workflowToolNames = [workflowTool.name, workflowPauseTool.name, workflowStopTool.name];
+  const workflowToolNames = [workflowTool.name, workflowStatusTool.name, workflowPauseTool.name, workflowStopTool.name];
   registerWorkflowCommands(pi, manager);
   registerWorkflowModelsCommand(pi);
   registerWorkflowProgressCommands(pi, {

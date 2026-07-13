@@ -32,8 +32,9 @@ test("workflow extension session_start activates the tool and installs the task 
     },
   );
 
-  assert.deepEqual(registeredTools, ["workflow", "workflow_pause", "workflow_stop"]);
+  assert.deepEqual(registeredTools, ["workflow", "workflow_status", "workflow_pause", "workflow_stop"]);
   assert.ok(activeTools.includes("workflow"), "workflow tool is active after session start");
+  assert.ok(activeTools.includes("workflow_status"), "workflow status tool is active after session start");
   assert.ok(activeTools.includes("workflow_pause"), "workflow pause tool is active after session start");
   assert.ok(activeTools.includes("workflow_stop"), "workflow stop tool is active after session start");
   assert.deepEqual(widgets, ["workflow-tasks"]);

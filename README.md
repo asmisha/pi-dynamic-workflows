@@ -98,7 +98,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows-models           map the small / medium / big tiers to real models
 ```
 
-Agents can control current-session runs directly with the `workflow_pause` and `workflow_stop` tools; the slash commands remain available for manual control.
+Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, and `workflow_stop` tools; the slash commands remain available for manual control.
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `d` remove · `r` restart · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
