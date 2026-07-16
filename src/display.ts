@@ -18,6 +18,10 @@ export interface WorkflowAgentSnapshot {
   history?: AgentHistoryEntry[];
   /** Tokens used by this agent. */
   tokens?: number;
+  /** When this agent started, for persisted progress/heartbeat state. */
+  startedAt?: string;
+  /** When this agent ended, for persisted progress/heartbeat state. */
+  endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
 }

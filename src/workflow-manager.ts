@@ -39,6 +39,8 @@ function checkpointFromError(error: WorkflowError): PendingCheckpoint | undefine
   return checkpoint as PendingCheckpoint;
 }
 
+const RUN_HEARTBEAT_MS = 1000;
+
 function isValidRunId(runId: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(runId);
 }
@@ -149,8 +151,10 @@ export class WorkflowManager extends EventEmitter {
   /** Short-TTL cache for listRuns(): the task panel re-renders on every run event,
    * and an uncached list re-reads + re-parses every persisted run file each time. */
   private runsCache?: { at: number; runs: PersistedRunState[] };
-  /** Pending debounced persists, keyed by runId (journal saves are coalesced). */
+  /** Pending debounced persists, keyed by runId (progress/journal saves are coalesced). */
   private persistTimers = new Map<string, NodeJS.Timeout>();
+  /** Periodic updatedAt heartbeat for live runs, keyed by runId. */
+  private heartbeatTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -390,7 +394,10 @@ export class WorkflowManager extends EventEmitter {
       concurrency: resolvedConcurrency,
       agentRetries: resolvedAgentRetries,
     };
-    const progress = () => onProgress?.(managed.snapshot);
+    const progress = () => {
+      onProgress?.(managed.snapshot);
+      this.schedulePersist(managed);
+    };
     const runtimeOwnedWork = new Set<Promise<unknown>>();
     const observeRuntimeOwnedWork = (work: Promise<unknown>) => {
       runtimeOwnedWork.add(work);
@@ -420,6 +427,7 @@ export class WorkflowManager extends EventEmitter {
       if (externalSignal.aborted) managed.controller.abort();
       else externalSignal.addEventListener("abort", () => managed.controller.abort(), { once: true });
     }
+    this.startHeartbeat(managed);
     try {
       const result = await runWorkflow(script, {
         runId: managed.runId,
@@ -467,6 +475,7 @@ export class WorkflowManager extends EventEmitter {
             prompt: event.prompt,
             status: "running",
             model: event.model,
+            startedAt: new Date().toISOString(),
           });
           this.emit("agentStart", { runId: managed.runId, ...event });
           progress();
@@ -482,6 +491,7 @@ export class WorkflowManager extends EventEmitter {
             agent.errorCode = event.errorCode;
             agent.recoverable = event.recoverable;
             agent.tokens = event.tokens;
+            agent.endedAt = new Date().toISOString();
             if (event.model) agent.model = event.model;
           }
           this.emit("agentEnd", { runId: managed.runId, ...event });
@@ -639,15 +649,36 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private releaseRunLease(managed: ManagedRun): void {
+    this.cancelHeartbeat(managed.runId);
     if (!managed.lease) return;
     this.persistence.releaseRunLease(managed.lease);
     managed.lease = undefined;
   }
 
+  private startHeartbeat(managed: ManagedRun): void {
+    if (this.heartbeatTimers.has(managed.runId)) return;
+    const timer = setInterval(() => {
+      if (managed.deleted || managed.finalized || managed.status !== "running") {
+        this.cancelHeartbeat(managed.runId);
+        return;
+      }
+      this.persistRun(managed);
+    }, RUN_HEARTBEAT_MS);
+    (timer as { unref?: () => void }).unref?.();
+    this.heartbeatTimers.set(managed.runId, timer);
+  }
+
+  private cancelHeartbeat(runId: string): void {
+    const timer = this.heartbeatTimers.get(runId);
+    if (!timer) return;
+    clearInterval(timer);
+    this.heartbeatTimers.delete(runId);
+  }
+
   /**
-   * Debounced persist for hot-path saves (journal flushes). Coalesces a burst of
-   * agent completions into one full-file write; status transitions persist
-   * immediately via persistRun() (which cancels any pending flush).
+   * Debounced persist for hot-path saves (progress and journal flushes). Coalesces
+   * a burst of agent/history updates into one full-file write; status transitions
+   * persist immediately via persistRun() (which cancels any pending flush).
    */
   private schedulePersist(managed: ManagedRun): void {
     if (managed.deleted || managed.finalized) return;
@@ -694,8 +725,8 @@ export class WorkflowManager extends EventEmitter {
           currentPhase: managed.snapshot.currentPhase,
           agents: managed.snapshot.agents.map((a) => ({
             ...a,
-            startedAt: managed.startedAt.toISOString(),
-            endedAt: new Date().toISOString(),
+            startedAt: a.startedAt ?? managed.startedAt.toISOString(),
+            endedAt: a.endedAt ?? (a.status === "running" ? undefined : new Date().toISOString()),
           })),
           logs: managed.snapshot.logs,
           result: managed.result?.result,

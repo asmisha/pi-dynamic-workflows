@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
+import type { AgentHistoryEntry } from "../src/agent-history.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -51,6 +52,17 @@ function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T |
     resolve = complete;
   });
   return { promise, resolve };
+}
+
+async function waitFor<T>(probe: () => T | undefined, message: string, timeoutMs = 2000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let value = probe();
+  while (value === undefined && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    value = probe();
+  }
+  assert.notEqual(value, undefined, message);
+  return value as T;
 }
 
 function delayedAgent(delayMs: number, result: unknown = "slow") {
@@ -259,6 +271,71 @@ test(
       concurrency: 2,
       agentRetries: 1,
     });
+  }),
+);
+
+test(
+  "runSync persists phase and running agent progress before completion",
+  withTempCwd(async (cwd) => {
+    const slow = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: slow.runner });
+    const promise = manager.runSync(oneAgentScript);
+
+    try {
+      const persisted = await waitFor(() => {
+        const run = manager.listRuns().find((entry) => entry.workflowName === "tracked_demo");
+        return run?.status === "running" && run.currentPhase === "Work" && run.agents[0]?.status === "running"
+          ? run
+          : undefined;
+      }, "running agent progress should be persisted before the agent completes");
+
+      assert.equal(persisted.agents[0].label, "a");
+      assert.ok(persisted.agents[0].startedAt, "running agent should have a start timestamp");
+      assert.equal(persisted.agents[0].endedAt, undefined, "running agent should not have an end timestamp");
+      assert.ok(Date.parse(persisted.updatedAt) > Date.parse(persisted.startedAt), "updatedAt should advance");
+    } finally {
+      slow.resolve("done");
+      await promise;
+    }
+  }),
+);
+
+test(
+  "runSync persists live agent history and heartbeats while the agent is blocked",
+  withTempCwd(async (cwd) => {
+    const gate = createDeferred<unknown>();
+    const history: AgentHistoryEntry[] = [{ role: "assistant", kind: "text", text: "working", timestamp: 1 }];
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options?: { onHistory?: (entries: AgentHistoryEntry[]) => void }) {
+          options?.onHistory?.(history);
+          return gate.promise;
+        },
+      },
+    });
+    const promise = manager.runSync(oneAgentScript);
+
+    try {
+      const withHistory = await waitFor(() => {
+        const run = manager.listRuns().find((entry) => entry.workflowName === "tracked_demo");
+        return run?.agents[0]?.history?.[0]?.text === "working" ? run : undefined;
+      }, "agent history should be persisted while the agent is still running");
+      const firstUpdatedAt = withHistory.updatedAt;
+
+      const heartbeat = await waitFor(
+        () => {
+          const run = manager.listRuns().find((entry) => entry.workflowName === "tracked_demo");
+          return run && Date.parse(run.updatedAt) > Date.parse(firstUpdatedAt) ? run : undefined;
+        },
+        "running run updatedAt should keep advancing as a heartbeat",
+        2500,
+      );
+      assert.equal(heartbeat.status, "running");
+    } finally {
+      gate.resolve("done");
+      await promise;
+    }
   }),
 );
 
