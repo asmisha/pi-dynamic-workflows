@@ -139,7 +139,9 @@ return a`,
   );
 
   assert.equal(calls, 2, "one initial attempt plus the one configured retry");
-  assert.equal(journal.length, 0, "failed calls are never journaled as successes");
+  assert.equal(journal.length, 1, "failed calls are journaled with failed status, not as successes");
+  assert.equal(journal[0]?.status, "failed");
+  assert.equal(journal[0]?.error?.code, WorkflowErrorCode.AGENT_EMPTY_OUTPUT);
   assert.equal(ended?.label, "a");
   assert.equal(ended?.errorCode, WorkflowErrorCode.AGENT_EMPTY_OUTPUT);
   assert.equal(ended?.recoverable, true);
@@ -422,6 +424,39 @@ test("resume re-runs the changed call AND everything after it (longest-unchanged
     resumeJournal: new Map(journal.map((e) => [e.index, e])),
   });
   assert.equal(second.state.calls, 2, "edited call (1) + its suffix (2) re-run; only the prefix (0) is cached");
+});
+
+test("resume treats a failed journal entry as a prefix miss", async () => {
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(threeCallScript, {
+    agent: first.runner,
+    persistLogs: false,
+    onAgentJournal: (e) => journal.push(e),
+  });
+  const failedJournal = journal.map((entry) =>
+    entry.index === 1
+      ? {
+          ...entry,
+          status: "failed" as const,
+          result: undefined,
+          error: {
+            message: "failed before pause",
+            code: WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+            recoverable: true,
+          },
+        }
+      : entry,
+  );
+
+  const second = countingAgent();
+  await runWorkflow(threeCallScript, {
+    agent: second.runner,
+    persistLogs: false,
+    resumeJournal: new Map(failedJournal.map((e) => [e.index, e])),
+  });
+
+  assert.equal(second.state.calls, 2, "failed call and its suffix re-run; only the prefix is cached");
 });
 
 test("resume in parallel(): editing one thunk re-runs that index and every later one", async () => {

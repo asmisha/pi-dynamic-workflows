@@ -84,6 +84,7 @@ export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js"
 export {
   backgroundStartedText,
   createWorkflowPauseTool,
+  createWorkflowRetryTool,
   createWorkflowStatusTool,
   createWorkflowStopTool,
   createWorkflowTool,

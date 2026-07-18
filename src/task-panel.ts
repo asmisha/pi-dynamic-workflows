@@ -185,6 +185,15 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
         deliver(runId, checkpointText(runId, checkpoint.prompt));
         return;
       }
+      if (reason === "agent_failure") {
+        const cause = error?.message ?? "retryable agent failure";
+        deliver(
+          runId,
+          `⏸ Background workflow ${runId} paused after ${cause}. ` +
+            `Completed sibling work is saved — run /workflows retry ${runId} to rerun only the failed agent call(s).`,
+        );
+        return;
+      }
       if (reason !== "usage_limit") return;
       const when = resetHint ? ` (${resetHint})` : "";
       const cause = error?.message ?? "provider usage limit reached";

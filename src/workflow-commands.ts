@@ -19,7 +19,7 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id>";
+  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | retry <id> | rm <id>";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -126,7 +126,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowMana
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | rm <id>",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/retry <id> | rm <id>",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
@@ -225,7 +225,20 @@ export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowMana
           if (!id) return ctx.ui.notify(USAGE, "warning");
           const ok = await manager.resume(id);
           ctx.ui.notify(
-            ok ? `Resumed ${id}` : `Resume is available only for paused or interrupted runs; failed runs are terminal.`,
+            ok
+              ? `Resumed ${id}`
+              : `Resume is available only for paused/interrupted non-agent-failure runs. Use retry for retryable agent failures.`,
+            ok ? "info" : "warning",
+          );
+          return;
+        }
+        case "retry": {
+          if (!id) return ctx.ui.notify(USAGE, "warning");
+          const ok = await manager.retry(id);
+          ctx.ui.notify(
+            ok
+              ? `Retrying ${id}`
+              : `Retry is available only for paused retryable agent failures with unchanged cwd state.`,
             ok ? "info" : "warning",
           );
           return;

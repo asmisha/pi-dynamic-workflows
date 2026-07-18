@@ -38,12 +38,35 @@ export interface WorkflowMeta {
   model?: string;
 }
 
-/** One cached agent() result, keyed by its deterministic call index. */
+export type JournalCallKind = "agent" | "bash" | "checkpoint";
+export type JournalEntryStatus = "succeeded" | "failed";
+
+export interface JournalEntryError {
+  message: string;
+  code: WorkflowErrorCode;
+  recoverable: boolean;
+  agentLabel?: string;
+  phase?: string;
+}
+
+/** One durable runtime call state. Legacy entries only have index/hash/result. */
 export interface JournalEntry {
+  /** Legacy deterministic call index; still used for prefix resume and old run files. */
   index: number;
+  /** Deterministic structural call ID for same-run retry. */
+  callId?: string;
+  kind?: JournalCallKind;
+  status?: JournalEntryStatus;
   /** sha256 of the call's identity (prompt + model + phase + agentType + schema). */
   hash: string;
-  result: unknown;
+  result?: unknown;
+  error?: JournalEntryError;
+  /** Durable retry attempt count for this call. */
+  attempt?: number;
+  /** Workflow author safety flag. Agent calls default true; side-effecting agents may opt out. */
+  retryable?: boolean;
+  label?: string;
+  phase?: string;
 }
 
 /** Global resources shared by the runtime's agent and bash primitives. */
@@ -80,8 +103,10 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
   runId?: string;
-  /** Resume: cached agent results keyed by deterministic call index. */
+  /** Resume: cached call results keyed by deterministic call index. */
   resumeJournal?: Map<number, JournalEntry>;
+  /** Retry: failed structural call IDs to rerun while replaying successful siblings. */
+  retryFailedCallIds?: Set<string>;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
   /** Resume: cumulative usage already spent by the journaled prefix. */
@@ -90,6 +115,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onAgentJournal?: (entry: JournalEntry) => void;
   /** Internal: observes runtime-owned agent()/bash() promises and combinator branches. */
   onRuntimeOwnedWorkStart?: (work: Promise<unknown>) => void;
+  /** Internal: records failed agent calls that escaped a runtime-owned branch. */
+  onAgentFailureEscaped?: (callId: string) => void;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
@@ -162,6 +189,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
+  /** Whether this agent may be rerun after a durable agent-failure pause. Defaults to true. */
+  retryable?: boolean;
   /** Run this agent in a different working directory (tools + session bind to it). */
   cwd?: string;
   /**
@@ -193,8 +222,16 @@ export interface WorkflowBashResult {
 /** Persisted identity of the one checkpoint currently awaiting a parent-chat reply. */
 export interface PendingCheckpoint {
   callIndex: number;
+  callId?: string;
   hash: string;
   prompt: string;
+}
+
+interface RuntimeExecutionContext {
+  concurrent: boolean;
+  path: string;
+  callSeq: number;
+  branchSeq: number;
 }
 
 interface RuntimeState {
@@ -316,7 +353,25 @@ export async function runWorkflow<T = unknown>(
     activeCalls: 0,
   };
   const limiter = shared.limiter;
-  const executionContext = new AsyncLocalStorage<{ concurrent: boolean }>();
+  const rootExecutionContext: RuntimeExecutionContext = { concurrent: false, path: "root", callSeq: 0, branchSeq: 0 };
+  const executionContext = new AsyncLocalStorage<RuntimeExecutionContext>();
+  const currentExecutionContext = () => executionContext.getStore() ?? rootExecutionContext;
+  const nextCallIdentity = () => {
+    const ctx = currentExecutionContext();
+    const localSeq = ctx.callSeq++;
+    return { index: state.callSeq++, callId: `${ctx.path}/${localSeq}` };
+  };
+  const nextBranchBase = (kind: "parallel" | "pipeline") => {
+    const ctx = currentExecutionContext();
+    const branchSeq = ctx.branchSeq++;
+    return `${ctx.path}/${kind}${branchSeq}`;
+  };
+  const childExecutionContext = (path: string): RuntimeExecutionContext => ({
+    concurrent: true,
+    path,
+    callSeq: 0,
+    branchSeq: 0,
+  });
   const observeRuntimeOwnedWork = <T>(work: Promise<T>): Promise<T> => {
     // Keep the exact promise returned to workflow code observed even when a
     // malformed script discards it. The handler does not change rejection
@@ -328,6 +383,9 @@ export async function runWorkflow<T = unknown>(
   const trackCombinatorBranch = <T>(branch: Promise<T>): Promise<T> => {
     shared.activeCalls++;
     const work = observeRuntimeOwnedWork(branch);
+    void work.catch((error) => {
+      if (error instanceof WorkflowError && error.callId) options.onAgentFailureEscaped?.(error.callId);
+    });
     void work.then(
       () => shared.activeCalls--,
       () => shared.activeCalls--,
@@ -362,6 +420,26 @@ export async function runWorkflow<T = unknown>(
   const throwIfAborted = () => {
     if (options.signal?.aborted) {
       throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+    }
+  };
+
+  const retryFailedCallIds = options.retryFailedCallIds ?? new Set<string>();
+  const retryMode = retryFailedCallIds.size > 0;
+  const resumeJournalByCallId = new Map<string, JournalEntry>();
+  for (const entry of options.resumeJournal?.values() ?? []) {
+    if (entry.callId) resumeJournalByCallId.set(entry.callId, entry);
+  }
+  const cachedForCall = (callId: string, index: number): JournalEntry | undefined =>
+    resumeJournalByCallId.get(callId) ?? options.resumeJournal?.get(index);
+  const ensureRetryHash = (entry: JournalEntry | undefined, hash: string, callId: string) => {
+    if (retryMode && entry && entry.hash !== hash) {
+      throw new WorkflowError(
+        `workflow retry journal mismatch for call ${callId}`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        {
+          recoverable: false,
+        },
+      );
     }
   };
 
@@ -400,7 +478,7 @@ export async function runWorkflow<T = unknown>(
 
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
-    const callIndex = state.callSeq++;
+    const { index: callIndex, callId } = nextCallIdentity();
     const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
 
     // Reserve the agent slot synchronously — atomic with the limit/budget gate
@@ -416,13 +494,26 @@ export async function runWorkflow<T = unknown>(
     // call. Once any call misses, it AND everything after it run live (matching
     // Claude Code's contract), so an edited upstream call never leaves stale
     // downstream results served from the journal.
-    const cached = options.resumeJournal?.get(callIndex);
+    const cached = cachedForCall(callId, callIndex);
+    ensureRetryHash(cached, callHash, callId);
     const hashMatches = cached != null && cached.hash === callHash;
-    const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+    const cachedSucceeded = isJournalSuccess(cached);
+    const cachedEmptyOutput = cachedSucceeded && isEmptyTextAgentResult(cached.result, agentOptions.schema);
+    if (hashMatches && cachedSucceeded && !cachedEmptyOutput && (retryMode || callIndex < state.firstMiss)) {
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
       options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
       return cached.result;
+    }
+    if (retryMode && cached?.status === "failed") {
+      if (!retryFailedCallIds.has(callId) || cached.retryable === false) {
+        throw new WorkflowError(
+          `workflow retry cannot rerun call ${callId}`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          {
+            recoverable: false,
+          },
+        );
+      }
     }
 
     if (budget.total !== null && budget.remaining() <= 0) {
@@ -447,15 +538,19 @@ export async function runWorkflow<T = unknown>(
         }
       }
     }
-    // A genuine miss (no journal entry, or the hash changed) marks where the
-    // unchanged prefix ends; this call and every later one then run live.
-    if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    // A genuine miss (no journal entry, failed entry, or hash change) marks where
+    // the unchanged prefix ends; this call and every later one then run live.
+    if (!retryMode && (!hashMatches || !cachedSucceeded || cachedEmptyOutput)) {
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+    }
 
     shared.activeCalls++;
     const work = limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
+      const durableAttempt = (cached?.status === "failed" ? (cached.attempt ?? 1) : 0) + 1;
+      const durableRetryable = agentOptions.retryable !== false;
 
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
 
@@ -532,7 +627,18 @@ export async function runWorkflow<T = unknown>(
           }
 
           const tokens = recordTokens(result);
-          options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
+          options.onAgentJournal?.({
+            index: callIndex,
+            callId,
+            kind: "agent",
+            status: "succeeded",
+            hash: callHash,
+            result,
+            attempt: durableAttempt,
+            retryable: durableRetryable,
+            label,
+            phase: assignedPhase,
+          });
           options.onAgentEnd?.({
             label,
             phase: assignedPhase,
@@ -544,7 +650,7 @@ export async function runWorkflow<T = unknown>(
         } catch (error) {
           if (options.signal?.aborted) throw error;
 
-          const workflowError = wrapError(error, { agentLabel: label });
+          const workflowError = wrapError(error, { agentLabel: label, callId });
           logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
           const tokens = recordTokens(null);
 
@@ -555,6 +661,24 @@ export async function runWorkflow<T = unknown>(
             continue;
           }
 
+          options.onAgentJournal?.({
+            index: callIndex,
+            callId,
+            kind: "agent",
+            status: "failed",
+            hash: callHash,
+            error: {
+              message: workflowError.message,
+              code: workflowError.code,
+              recoverable: workflowError.recoverable,
+              agentLabel: label,
+              phase: assignedPhase,
+            },
+            attempt: durableAttempt,
+            retryable: durableRetryable,
+            label,
+            phase: assignedPhase,
+          });
           options.onAgentEnd?.({
             label,
             phase: assignedPhase,
@@ -600,13 +724,17 @@ export async function runWorkflow<T = unknown>(
     if (typeof command !== "string" || !command.trim()) {
       throw new TypeError("bash(command, options?) needs a non-empty command string");
     }
-    const callIndex = state.callSeq++;
+    const { index: callIndex, callId } = nextCallIdentity();
     const callHash = hashBashCall(command, bashOptions.cwd, bashOptions.timeoutMs ?? null);
-    const cached = options.resumeJournal?.get(callIndex);
-    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+    const cached = cachedForCall(callId, callIndex);
+    ensureRetryHash(cached, callHash, callId);
+    const hashMatches = cached != null && cached.hash === callHash;
+    if (hashMatches && isJournalSuccess(cached) && (retryMode || callIndex < state.firstMiss)) {
       return cached.result as WorkflowBashResult;
     }
-    if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (!retryMode && (cached == null || cached.hash !== callHash || !isJournalSuccess(cached))) {
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+    }
 
     shared.activeCalls++;
     const work = (async () => {
@@ -624,7 +752,14 @@ export async function runWorkflow<T = unknown>(
         log(
           `$ ${shortCmd} (pid ${result.pid ?? "?"}, exit ${result.exitCode ?? "signal"}; stdout ${result.stdoutFile}; stderr ${result.stderrFile})`,
         );
-        options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
+        options.onAgentJournal?.({
+          index: callIndex,
+          callId,
+          kind: "bash",
+          status: "succeeded",
+          hash: callHash,
+          result,
+        });
         return result;
       } finally {
         shared.activeCalls--;
@@ -647,9 +782,13 @@ export async function runWorkflow<T = unknown>(
             "parallel() expects an array of zero-arg functions, not promises. Correct: parallel(items.map(item => () => agent(...))). Wrong: parallel(items.map(item => agent(...))) or parallel(items.map(async item => agent(...))).",
           );
         }
-        const branches = thunks.map((thunk) =>
-          trackCombinatorBranch(Promise.resolve().then(() => executionContext.run({ concurrent: true }, thunk))),
-        );
+        const branchBase = nextBranchBase("parallel");
+        const branches = thunks.map((thunk, index) => {
+          const path = `${branchBase}.${index}`;
+          return trackCombinatorBranch(
+            Promise.resolve().then(() => executionContext.run(childExecutionContext(path), thunk)),
+          );
+        });
         return Promise.all(branches);
       })(),
     );
@@ -665,10 +804,12 @@ export async function runWorkflow<T = unknown>(
         if (stages.some((stage) => typeof stage !== "function")) {
           throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
         }
-        const branches = items.map((item, index) =>
-          trackCombinatorBranch(
+        const branchBase = nextBranchBase("pipeline");
+        const branches = items.map((item, index) => {
+          const path = `${branchBase}.${index}`;
+          return trackCombinatorBranch(
             Promise.resolve().then(() =>
-              executionContext.run({ concurrent: true }, async () => {
+              executionContext.run(childExecutionContext(path), async () => {
                 let value: unknown = item;
                 for (const stage of stages) {
                   throwIfAborted();
@@ -678,8 +819,8 @@ export async function runWorkflow<T = unknown>(
                 return value;
               }),
             ),
-          ),
-        );
+          );
+        });
         return Promise.all(branches);
       })(),
     );
@@ -732,17 +873,25 @@ export async function runWorkflow<T = unknown>(
         { recoverable: false },
       );
     }
-    const callIndex = state.callSeq++;
+    const { index: callIndex, callId } = nextCallIdentity();
     const callHash = hashCheckpoint(promptText);
-    const cached = options.resumeJournal?.get(callIndex);
-    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+    const cached = cachedForCall(callId, callIndex);
+    ensureRetryHash(cached, callHash, callId);
+    if (
+      cached != null &&
+      cached.hash === callHash &&
+      isJournalSuccess(cached) &&
+      (retryMode || callIndex < state.firstMiss)
+    ) {
       shared.agentCount++;
       return cached.result;
     }
-    if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (!retryMode && (cached == null || cached.hash !== callHash || !isJournalSuccess(cached))) {
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+    }
     shared.agentCount++;
 
-    const pending: PendingCheckpoint = { callIndex, hash: callHash, prompt: promptText };
+    const pending: PendingCheckpoint = { callIndex, callId, hash: callHash, prompt: promptText };
     throw new WorkflowError(promptText, WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED, {
       recoverable: false,
       details: pending,
@@ -1038,6 +1187,7 @@ function hashAgentCall(
     cwd: options.cwd ?? null,
     forkFrom: options.forkFrom ?? null,
     sessionPath: options.sessionPath ?? null,
+    retryable: options.retryable ?? true,
   });
   return createHash("sha256").update(identity).digest("hex");
 }
@@ -1183,6 +1333,10 @@ function buildAgentInstructions(
   lines.push(context);
   // Note: options.model is applied for real via the session, not injected as prose.
   return lines.join("\n\n");
+}
+
+function isJournalSuccess(entry: JournalEntry | undefined): entry is JournalEntry & { result: unknown } {
+  return entry !== undefined && (entry.status === "succeeded" || (entry.status === undefined && "result" in entry));
 }
 
 function isEmptyTextAgentResult(result: unknown, schema: TSchema | undefined): boolean {

@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import { join } from "node:path";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
-import type { PendingCheckpoint } from "./workflow.js";
+import type { JournalEntry, PendingCheckpoint } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -45,6 +45,19 @@ export interface PersistedExecutionOptions {
   agentRetries?: number;
 }
 
+export interface AgentFailureRetryState {
+  failures: Array<{
+    callId: string;
+    label?: string;
+    phase?: string;
+    code?: WorkflowErrorCode;
+    message?: string;
+    attempt: number;
+    retryable: boolean;
+  }>;
+  pausedAt: string;
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -59,9 +72,13 @@ export interface PersistedRunState {
   sessionId?: string;
   status: RunStatus;
   /** Why a paused run is paused. */
-  pauseReason?: "manual" | "usage_limit" | "human_input";
+  pauseReason?: "manual" | "usage_limit" | "human_input" | "agent_failure";
   /** The durable checkpoint awaiting a parent-conversation reply. */
   pendingCheckpoint?: PendingCheckpoint;
+  /** Durable retry state for a paused retryable agent failure. */
+  retryState?: AgentFailureRetryState;
+  /** Selected failed call IDs for an in-progress retry attempt. */
+  activeRetryCallIds?: string[];
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
   phases: string[];
@@ -83,8 +100,8 @@ export interface PersistedRunState {
     cacheRead?: number;
     cacheWrite?: number;
   };
-  /** Cached agent results for resume, keyed by deterministic call index. */
-  journal?: Array<{ index: number; hash: string; result: unknown }>;
+  /** Cached runtime call states for resume/retry, keyed by deterministic call index/callId. */
+  journal?: JournalEntry[];
 }
 
 export interface RunPersistence {

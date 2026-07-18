@@ -27,7 +27,8 @@ return await checkpoint('Approve plan?')`;
   assert.equal(checkpoint.callIndex, 0);
   assert.equal(typeof checkpoint.hash, "string");
   assert.equal(checkpoint.prompt, "Approve plan?");
-  assert.deepEqual(Object.keys(checkpoint).sort(), ["callIndex", "hash", "prompt"]);
+  assert.equal(typeof checkpoint.callId, "string");
+  assert.deepEqual(Object.keys(checkpoint).sort(), ["callId", "callIndex", "hash", "prompt"]);
 });
 
 test("checkpoint(): rejects all options including removed default/headless flags", async () => {

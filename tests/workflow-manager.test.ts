@@ -87,6 +87,22 @@ phase('Work')
 const a = await agent('do it', { label: 'a' })
 return { a }`;
 
+const nonRetryableOneAgentScript = `export const meta = { name: 'tracked_demo', description: 'one agent' }
+phase('Work')
+const a = await agent('do it', { label: 'a', retryable: false })
+return { a }`;
+
+const retryParallelScript = `export const meta = { name: 'retry_parallel', description: 'retry failed branch', phases: [{ title: 'Review' }, { title: 'Synthesize' }] }
+phase('Review')
+const writer = await agent('writer', { label: 'writer', retryable: false })
+const reviews = await parallel([
+  () => agent('review good', { label: 'good' }),
+  () => agent('review bad', { label: 'bad', schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } }),
+])
+phase('Synthesize')
+const synth = await agent('synth ' + writer + ' ' + reviews.join(','), { label: 'synth' })
+return { writer, reviews, synth }`;
+
 /** Run each manager test with isolated cwd and HOME so workflow state is isolated. */
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
@@ -385,6 +401,476 @@ test(
 );
 
 test(
+  "retryable parallel agent failure pauses after journaling successful siblings",
+  withTempCwd(async (cwd) => {
+    const calls: string[] = [];
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          calls.push(prompt);
+          if (prompt === "review bad") {
+            throw new WorkflowError("invalid schema", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, {
+              recoverable: false,
+              agentLabel: "bad",
+            });
+          }
+          if (prompt === "review good") await new Promise((resolve) => setTimeout(resolve, 20));
+          return prompt;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    await assert.rejects(
+      manager.runSync(retryParallelScript),
+      (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.SCHEMA_NONCOMPLIANCE,
+    );
+
+    const run = manager.listRuns().find((entry) => entry.workflowName === "retry_parallel");
+    assert.equal(run?.status, "paused");
+    assert.equal(run?.pauseReason, "agent_failure");
+    assert.deepEqual(calls.sort(), ["review bad", "review good", "writer"].sort());
+    assert.equal(run?.journal?.length, 3);
+    assert.equal(run?.journal?.filter((entry) => entry.status === "succeeded").length, 2);
+    assert.equal(run?.journal?.filter((entry) => entry.status === "failed").length, 1);
+    assert.equal(run?.retryState?.failures[0]?.label, "bad");
+    assert.equal(run?.retryState?.failures[0]?.attempt, 1);
+  }),
+);
+
+test(
+  "retry replays successful calls, reruns only failed agents, and completes the same run",
+  withTempCwd(async (cwd) => {
+    const calls: Record<string, number> = { writer: 0, good: 0, bad: 0, synth: 0 };
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "writer") {
+            calls.writer++;
+            return "draft";
+          }
+          if (prompt === "review good") {
+            calls.good++;
+            return "good";
+          }
+          if (prompt === "review bad") {
+            calls.bad++;
+            if (calls.bad === 1) {
+              throw new WorkflowError("invalid schema", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, {
+                recoverable: false,
+                agentLabel: "bad",
+              });
+            }
+            return { ok: true };
+          }
+          if (prompt.startsWith("synth ")) {
+            calls.synth++;
+            return "final";
+          }
+          return prompt;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    await assert.rejects(manager.runSync(retryParallelScript));
+    const paused = manager.listRuns().find((entry) => entry.workflowName === "retry_parallel");
+    assert.equal(paused?.status, "paused");
+    assert.ok(paused?.runId);
+
+    assert.equal(await manager.retry(paused.runId), true);
+    const completed = await waitFor(() => {
+      const run = manager.listRuns().find((entry) => entry.runId === paused.runId);
+      return run?.status === "completed" ? run : undefined;
+    }, "retry should complete the original run");
+
+    assert.deepEqual(calls, { writer: 1, good: 1, bad: 2, synth: 1 });
+    assert.equal(completed.runId, paused.runId);
+    assert.deepEqual(completed.result, { writer: "draft", reviews: ["good", { ok: true }], synth: "final" });
+    assert.equal(completed.journal?.find((entry) => entry.label === "bad")?.attempt, 2);
+  }),
+);
+
+test(
+  "retry reruns multiple failed agents together and increments attempts on another pause",
+  withTempCwd(async (cwd) => {
+    const calls: Record<string, number> = { a: 0, b: 0 };
+    const script = `export const meta = { name: 'multi_retry', description: 'multiple failures' }
+const results = await parallel([
+  () => agent('a', { label: 'a' }),
+  () => agent('b', { label: 'b' }),
+])
+return { results }`;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          calls[prompt]++;
+          throw new WorkflowError(`boom ${prompt}`, WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+            recoverable: true,
+            agentLabel: prompt,
+          });
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    await assert.rejects(manager.runSync(script));
+    const paused = manager.listRuns().find((entry) => entry.workflowName === "multi_retry");
+    assert.equal(paused?.retryState?.failures.length, 2);
+    assert.ok(paused?.runId);
+
+    assert.equal(await manager.retry(paused.runId), true);
+    const pausedAgain = await waitFor(() => {
+      const run = manager.listRuns().find((entry) => entry.runId === paused.runId);
+      return run?.status === "paused" && run.retryState?.failures.every((failure) => failure.attempt === 2)
+        ? run
+        : undefined;
+    }, "failed retry should return to paused with incremented attempts");
+
+    assert.deepEqual(calls, { a: 2, b: 2 });
+    assert.equal(pausedAgain.pauseReason, "agent_failure");
+  }),
+);
+
+test(
+  "stop during retryable sibling drain is not overwritten by agent-failure pause",
+  withTempCwd(async (cwd) => {
+    const slow = createDeferred<string>();
+    let badCalls = 0;
+    let slowStarted = false;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "bad") {
+            badCalls++;
+            throw new WorkflowError("bad failed", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+              recoverable: true,
+              agentLabel: "bad",
+            });
+          }
+          if (prompt === "slow") {
+            slowStarted = true;
+            return slow.promise;
+          }
+          return prompt;
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'stop_retry_drain', description: 'stop while retry drain waits' }
+await parallel([
+  () => agent('bad', { label: 'bad' }),
+  () => agent('slow', { label: 'slow' }),
+])`;
+
+    const { runId, promise } = manager.startInBackground(script);
+    await waitFor(() => (badCalls === 1 && slowStarted ? true : undefined), "both branches should start");
+    assert.equal(manager.stop(runId), true);
+    await assert.rejects(promise);
+    slow.resolve("slow done");
+
+    const stopped = manager.listRuns().find((entry) => entry.runId === runId);
+    assert.equal(stopped?.status, "aborted");
+    assert.equal(stopped?.pauseReason, undefined);
+    assert.equal(stopped?.retryState, undefined);
+  }),
+);
+
+test(
+  "pausing an active retry preserves selective replay on resume",
+  withTempCwd(async (cwd) => {
+    let readerCalls = 0;
+    let writerCalls = 0;
+    const blockedRetryReader = createDeferred<string>();
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "reader") {
+            readerCalls++;
+            if (readerCalls === 1) {
+              throw new WorkflowError("reader failed", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+                recoverable: true,
+                agentLabel: "reader",
+              });
+            }
+            if (readerCalls === 2) return blockedRetryReader.promise;
+            return "reader ok";
+          }
+          if (prompt === "writer") {
+            writerCalls++;
+            return "writer ok";
+          }
+          return prompt;
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'pause_active_retry', description: 'active retry pause' }
+return await parallel([
+  () => agent('reader', { label: 'reader' }),
+  () => agent('writer', { label: 'writer', retryable: false }),
+])`;
+
+    await assert.rejects(manager.runSync(script));
+    const paused = manager.listRuns().find((entry) => entry.workflowName === "pause_active_retry");
+    assert.ok(paused?.runId);
+    assert.equal(writerCalls, 1);
+
+    assert.equal(await manager.retry(paused.runId), true);
+    await waitFor(() => (readerCalls === 2 ? true : undefined), "retry should start the failed reader");
+    assert.equal(manager.pause(paused.runId), true);
+    const manuallyPaused = manager.listRuns().find((entry) => entry.runId === paused.runId);
+    assert.equal(manuallyPaused?.status, "paused");
+    assert.equal(manuallyPaused?.pauseReason, "manual");
+    assert.equal(manuallyPaused?.activeRetryCallIds?.length, 1);
+
+    assert.equal(await manager.resume(paused.runId), true);
+    await waitFor(() => {
+      const run = manager.listRuns().find((entry) => entry.runId === paused.runId);
+      return run?.status === "completed" ? run : undefined;
+    }, "resume should complete the active retry");
+    blockedRetryReader.resolve("late old retry");
+
+    assert.equal(readerCalls, 3);
+    assert.equal(writerCalls, 1, "successful retryable:false sibling must not rerun after retry pause/resume");
+  }),
+);
+
+test(
+  "stale active retry recovery resumes selectively",
+  withTempCwd(async (cwd) => {
+    let readerCalls = 0;
+    let writerCalls = 0;
+    const script = `export const meta = { name: 'stale_active_retry', description: 'stale active retry' }
+return await parallel([
+  () => agent('reader', { label: 'reader' }),
+  () => agent('writer', { label: 'writer', retryable: false }),
+])`;
+    const agent = {
+      async run(prompt: string) {
+        if (prompt === "reader") {
+          readerCalls++;
+          if (readerCalls === 1) {
+            throw new WorkflowError("reader failed", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+              recoverable: true,
+              agentLabel: "reader",
+            });
+          }
+          return "reader ok";
+        }
+        if (prompt === "writer") {
+          writerCalls++;
+          return "writer ok";
+        }
+        return prompt;
+      },
+    };
+    const first = new WorkflowManager({ cwd, agent });
+    first.on("error", () => {});
+
+    await assert.rejects(first.runSync(script));
+    const paused = first.listRuns().find((entry) => entry.workflowName === "stale_active_retry");
+    assert.ok(paused?.runId);
+    const activeRetryCallIds = paused.retryState?.failures.map((failure) => failure.callId) ?? [];
+    assert.equal(activeRetryCallIds.length, 1);
+    first.getPersistence().save({
+      ...paused,
+      status: "running",
+      pauseReason: undefined,
+      retryState: undefined,
+      activeRetryCallIds,
+    });
+
+    const recovered = new WorkflowManager({ cwd, agent });
+    recovered.on("error", () => {});
+    const recoveredPaused = recovered.listRuns().find((entry) => entry.runId === paused.runId);
+    assert.equal(recoveredPaused?.status, "paused");
+    assert.deepEqual(recoveredPaused?.activeRetryCallIds, activeRetryCallIds);
+
+    assert.equal(await recovered.resume(paused.runId), true);
+    await waitFor(() => {
+      const run = recovered.listRuns().find((entry) => entry.runId === paused.runId);
+      return run?.status === "completed" ? run : undefined;
+    }, "recovered active retry should complete");
+
+    assert.equal(readerCalls, 2);
+    assert.equal(writerCalls, 1, "stale active retry recovery must not rerun the successful writer");
+  }),
+);
+
+test(
+  "repeated retry preserves journal indexes when pipeline scheduling changes",
+  withTempCwd(async (cwd) => {
+    const releaseSlowStage = createDeferred<string>();
+    let fastStageTwoCalls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      concurrency: 2,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "stage1 slow") return releaseSlowStage.promise;
+          if (prompt === "stage1 fast") return "fast one";
+          if (prompt === "stage2 fast") {
+            fastStageTwoCalls++;
+            throw new WorkflowError("fast failed", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+              recoverable: true,
+              agentLabel: "stage2-fast",
+            });
+          }
+          if (prompt === "stage2 slow") return "slow two";
+          return prompt;
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'pipeline_retry_indexes', description: 'pipeline retry indexes' }
+return await pipeline(
+  ['slow', 'fast'],
+  (item) => agent('stage1 ' + item, { label: 'stage1-' + item }),
+  (_previous, item) => agent('stage2 ' + item, { label: 'stage2-' + item }),
+)`;
+
+    const firstRun = manager.runSync(script);
+    await waitFor(() => (fastStageTwoCalls === 1 ? true : undefined), "fast second stage should fail first");
+    releaseSlowStage.resolve("slow one");
+    await assert.rejects(firstRun);
+    const paused = manager.listRuns().find((entry) => entry.workflowName === "pipeline_retry_indexes");
+    const originalFailedIndex = paused?.journal?.find((entry) => entry.label === "stage2-fast")?.index;
+    assert.equal(typeof originalFailedIndex, "number");
+    assert.ok(paused?.runId);
+
+    assert.equal(await manager.retry(paused.runId), true);
+    const pausedAgain = await waitFor(() => {
+      const run = manager.listRuns().find((entry) => entry.runId === paused.runId);
+      return run?.status === "paused" && fastStageTwoCalls === 2 ? run : undefined;
+    }, "retry should pause again after the selected pipeline call fails");
+    const retryFailedIndex = pausedAgain.journal?.find((entry) => entry.label === "stage2-fast")?.index;
+    const indexes = pausedAgain.journal?.map((entry) => entry.index) ?? [];
+
+    assert.equal(retryFailedIndex, originalFailedIndex);
+    assert.equal(new Set(indexes).size, indexes.length, "journal indexes must remain unique after replacement");
+  }),
+);
+
+test(
+  "retryable false agent failure is terminal and cannot be retried",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError("do not rerun", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+            recoverable: true,
+            agentLabel: "writer",
+          });
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'non_retryable', description: 'writer' }
+await agent('write files', { label: 'writer', retryable: false })
+return { ok: true }`;
+
+    await assert.rejects(manager.runSync(script));
+    const run = manager.listRuns().find((entry) => entry.workflowName === "non_retryable");
+    assert.equal(run?.status, "failed");
+    assert.equal(run?.pauseReason, undefined);
+    assert.ok(run?.runId);
+    assert.equal(await manager.retry(run.runId), false);
+  }),
+);
+
+test(
+  "retry does not refuse when cwd contents change between pause and retry",
+  withTempCwd(async (cwd) => {
+    let calls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          calls++;
+          if (calls === 1) {
+            throw new WorkflowError("try later", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+              recoverable: true,
+              agentLabel: "reader",
+            });
+          }
+          return "ok";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'cwd_change_retry', description: 'retry after cwd changes' }
+await agent('read only', { label: 'reader' })
+return { ok: true }`;
+
+    await assert.rejects(manager.runSync(script));
+    const paused = manager.listRuns().find((entry) => entry.workflowName === "cwd_change_retry");
+    assert.equal(paused?.status, "paused");
+    assert.ok(paused?.runId);
+    writeFileSync(join(cwd, "changed.txt"), "changed\n");
+
+    assert.equal(await manager.retry(paused.runId), true);
+    await waitFor(
+      () => manager.listRuns().find((entry) => entry.runId === paused.runId && entry.status === "completed"),
+      "retry should complete after rerunning the failed call",
+    );
+    assert.equal(calls, 2, "retry should execute the failed call again despite cwd changes");
+  }),
+);
+
+test(
+  "a fresh manager can retry a persisted paused agent failure",
+  withTempCwd(async (cwd) => {
+    const first = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "review bad") {
+            throw new WorkflowError("invalid schema", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, {
+              recoverable: false,
+              agentLabel: "bad",
+            });
+          }
+          return prompt === "writer" ? "draft" : "good";
+        },
+      },
+    });
+    first.on("error", () => {});
+    await assert.rejects(first.runSync(retryParallelScript));
+    const paused = first.listRuns().find((entry) => entry.workflowName === "retry_parallel");
+    assert.ok(paused?.runId);
+
+    const calls: string[] = [];
+    const second = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          calls.push(prompt);
+          if (prompt === "review bad") return { ok: true };
+          if (prompt.startsWith("synth ")) return "final";
+          throw new Error(`unexpected replay miss: ${prompt}`);
+        },
+      },
+    });
+
+    assert.equal(await second.retry(paused.runId), true);
+    const completed = await waitFor(() => {
+      const run = second.listRuns().find((entry) => entry.runId === paused.runId);
+      return run?.status === "completed" ? run : undefined;
+    }, "fresh manager retry should complete");
+
+    assert.deepEqual(calls, ["review bad", "synth draft good,[object Object]"]);
+    assert.equal(completed.runId, paused.runId);
+  }),
+);
+
+test(
   "manager persists the first parallel error before a passive sibling drain completes",
   withTempCwd(async (cwd) => {
     const slow = deferredAgent();
@@ -404,7 +890,7 @@ test(
     });
     manager.on("error", () => {});
     const script = `export const meta = { name: 'persist_siblings', description: 'passive sibling drain' }
-return await parallel([() => agent('bad', { label: 'bad' }), () => agent('slow', { label: 'slow' })])`;
+return await parallel([() => agent('bad', { label: 'bad', retryable: false }), () => agent('slow', { label: 'slow' })])`;
     const promise = manager.runSync(script, undefined, { concurrency: 2 });
     let failure: unknown;
     void promise.catch((error) => {
@@ -449,7 +935,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: slow.runner });
     manager.on("error", () => {});
     const started = new Promise<void>((resolve) => manager.once("agentStart", () => resolve()));
-    const promise = manager.runSync(oneAgentScript);
+    const promise = manager.runSync(nonRetryableOneAgentScript);
     await started;
 
     const run = manager.listRuns().find((entry) => entry.workflowName === "tracked_demo");
@@ -500,7 +986,7 @@ test(
     });
     manager.on("error", () => {});
     const script = `export const meta = { name: 'abort_passive_drain', description: 'host abort still wins' }
-return await parallel([() => agent('bad'), () => agent('slow')])`;
+return await parallel([() => agent('bad', { retryable: false }), () => agent('slow')])`;
     const promise = manager.runSync(script, undefined, { concurrency: 2, externalSignal: external.signal });
     let failure: unknown;
     void promise.catch((error) => {
@@ -547,7 +1033,7 @@ test(
     });
     manager.on("error", () => {});
     const script = `export const meta = { name: 'stop_failed_drain', description: 'stop surviving sibling' }
-return await parallel([() => agent('bad'), () => agent('slow')])`;
+return await parallel([() => agent('bad', { retryable: false }), () => agent('slow')])`;
     const promise = manager.runSync(script, undefined, { concurrency: 2 });
     await slowStarted.promise;
     await assert.rejects(promise, (error: unknown) => error instanceof WorkflowError);
@@ -645,6 +1131,9 @@ throw new Error('controller exploded')`;
     await assert.rejects(manager.runSync(script), /controller exploded/);
 
     const persisted = manager.listRuns().find((run) => run.workflowName === "later_failure");
+    assert.equal(persisted?.status, "failed");
+    assert.equal(persisted?.pauseReason, undefined);
+    assert.equal(persisted?.retryState, undefined);
     assert.equal(persisted?.error?.phase, "Controller");
     assert.equal(persisted?.error?.agentLabel, undefined);
   }),
@@ -1431,7 +1920,7 @@ test(
       },
     });
     manager.on("error", () => {});
-    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise } = manager.startInBackground(nonRetryableOneAgentScript);
     await promise.catch(() => {});
     assert.equal(manager.getRun(runId)?.status, "failed");
     const persisted = manager.listRuns().find((r) => r.runId === runId);
@@ -1632,7 +2121,7 @@ test(
     failing.getPersistence().save({
       runId,
       workflowName: "failed_once",
-      script: oneAgentScript,
+      script: nonRetryableOneAgentScript,
       status: "paused",
       phases: [],
       agents: [],
@@ -2174,7 +2663,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
 
-    const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise: origPromise } = manager.startInBackground(nonRetryableOneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
     // Pause while the deferred agent is in-flight
@@ -2248,7 +2737,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
 
-    const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise: origPromise } = manager.startInBackground(nonRetryableOneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
     // Pause the running run so we can resume with a failing agent
@@ -2290,7 +2779,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
 
-    const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise: origPromise } = manager.startInBackground(nonRetryableOneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
     // Pause the running run so we can resume with a failing agent
@@ -2332,7 +2821,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
 
-    const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
+    const { runId, promise: origPromise } = manager.startInBackground(nonRetryableOneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
     // Pause the running run

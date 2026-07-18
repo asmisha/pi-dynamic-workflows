@@ -6,6 +6,7 @@ import {
   lastAssistantError,
   resolveStructuredOutput,
   type StructuredSession,
+  throwIfAssistantExecutionError,
   throwIfProviderLimit,
 } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
@@ -117,6 +118,26 @@ describe("resolveStructuredOutput", () => {
     );
   });
 
+  it("surfaces transient assistant execution errors during repair as AGENT_EXECUTION_ERROR", async () => {
+    const { session, capture } = makeSession();
+    session.messages = [
+      {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "upstream overloaded, try again",
+      },
+    ];
+    await assert.rejects(
+      () => resolveStructuredOutput(session, capture, Schema, opts, () => "no json at all"),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+        assert.equal((err as { recoverable?: boolean }).recoverable, true);
+        return true;
+      },
+    );
+  });
+
   it("surfaces a provider usage limit hit during repair as PROVIDER_USAGE_LIMIT (not SCHEMA_NONCOMPLIANCE)", async () => {
     const { session, capture } = makeSession();
     // The repair re-prompts ran but the turn ended in a buried provider limit.
@@ -165,6 +186,29 @@ describe("lastAssistantError / throwIfProviderLimit", () => {
       (err: unknown) => {
         assert.equal((err as { code?: string }).code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
         assert.equal((err as { resetHint?: string }).resetHint, "Resets in ~3h");
+        assert.equal((err as { agentLabel?: string }).agentLabel, "lbl");
+        return true;
+      },
+    );
+  });
+
+  it("throws AGENT_EXECUTION_ERROR for non-limit assistant error metadata", () => {
+    assert.throws(
+      () =>
+        throwIfAssistantExecutionError(
+          [
+            {
+              role: "assistant",
+              content: [],
+              stopReason: "error",
+              errorMessage: "transport overloaded",
+            },
+          ],
+          "lbl",
+        ),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+        assert.equal((err as { recoverable?: boolean }).recoverable, true);
         assert.equal((err as { agentLabel?: string }).agentLabel, "lbl");
         return true;
       },

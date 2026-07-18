@@ -99,6 +99,20 @@ export function throwIfProviderLimit(messages: unknown[], label?: string): void 
   );
 }
 
+export function throwIfAssistantExecutionError(messages: unknown[], label?: string): void {
+  const err = lastAssistantError(messages);
+  if (err?.stopReason !== "error") return;
+  throwIfProviderLimit(messages, label);
+  throw new WorkflowError(
+    err.errorMessage ?? "Provider stopped with an execution error",
+    WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+    {
+      recoverable: true,
+      agentLabel: label,
+    },
+  );
+}
+
 /** Minimal session surface resolveStructuredOutput needs (real session or a test double). */
 export interface StructuredSession {
   prompt(text: string): Promise<void>;
@@ -197,9 +211,9 @@ export async function resolveStructuredOutput<T>(
     return extracted;
   }
 
-  // A repair re-prompt can itself hit the provider limit. Surface that as the real
-  // (recoverable) cause instead of the misleading non-recoverable SCHEMA_NONCOMPLIANCE.
-  throwIfProviderLimit(session.messages, options.label);
+  // A repair re-prompt can itself hit a provider/runtime error. Surface that as
+  // the retryable execution cause instead of misleading SCHEMA_NONCOMPLIANCE.
+  throwIfAssistantExecutionError(session.messages, options.label);
 
   throw new WorkflowError(
     "Subagent did not produce valid structured_output after repair attempts",
@@ -639,11 +653,9 @@ export class WorkflowAgent {
 
       if (options.signal?.aborted) throw abortError();
 
-      // The SDK buries a provider usage/quota limit in the assistant message rather
-      // than throwing; detect it here (before the schema/empty-text branches) so it
-      // is classified as a recoverable checkpoint, not a SCHEMA_NONCOMPLIANCE failure
-      // (schema path) or a silent empty-output null (non-schema path).
-      throwIfProviderLimit(session.messages, options.label);
+      // The SDK can bury provider/runtime errors in assistant metadata instead of
+      // throwing; detect them here before schema/empty-text handling.
+      throwIfAssistantExecutionError(session.messages, options.label);
 
       if (options.schema) {
         return (await resolveStructuredOutput(

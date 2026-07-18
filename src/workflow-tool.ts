@@ -61,6 +61,16 @@ export function agentTypeGuideline(cwd: string = process.cwd()): string | undefi
 
 const MAX_WORKFLOW_SCRIPT_BYTES = 1024 * 1024;
 
+function agentFailurePauseDetails(
+  error: WorkflowError,
+): { runId: string; pauseReason: "agent_failure"; retryState?: unknown } | undefined {
+  const details = error.details;
+  if (!details || typeof details !== "object") return undefined;
+  const value = details as { runId?: unknown; pauseReason?: unknown; retryState?: unknown };
+  if (typeof value.runId !== "string" || value.pauseReason !== "agent_failure") return undefined;
+  return { runId: value.runId, pauseReason: "agent_failure", retryState: value.retryState };
+}
+
 const workflowToolSchema = Type.Object({
   resumeRunId: Type.Optional(
     Type.String({
@@ -197,6 +207,14 @@ export function createWorkflowStatusTool(
       const pauseReason = live?.pauseReason ?? persisted?.pauseReason;
       const sourceError = live?.error ?? persisted?.error;
       const error = sourceError ? { code: sourceError.code, message: sourceError.message } : undefined;
+      const retryFailures = (live?.retryState ?? persisted?.retryState)?.failures.map((failure) => ({
+        label: failure.label,
+        phase: failure.phase,
+        code: failure.code,
+        message: failure.message,
+        attempt: failure.attempt,
+        retryable: failure.retryable,
+      }));
       const details = {
         runId: params.runId,
         workflowName,
@@ -205,6 +223,7 @@ export function createWorkflowStatusTool(
         agents,
         tokenUsage,
         pauseReason,
+        retryFailures,
         error,
       };
       const lines = [
@@ -213,6 +232,16 @@ export function createWorkflowStatusTool(
         `Agents: ${agents.done}/${agents.total} done, ${agents.running} running, ${agents.error} error.`,
         ...(tokenUsage ? [`Tokens: ${tokenUsage.total}.`] : []),
         ...(pauseReason ? [`Pause reason: ${pauseReason}.`] : []),
+        ...(retryFailures?.length
+          ? [
+              `Retryable failures: ${retryFailures
+                .map(
+                  (failure) =>
+                    `${failure.label ?? "agent"}${failure.phase ? ` (${failure.phase})` : ""}: ${failure.code ?? "error"}, attempt ${failure.attempt}, retryable ${failure.retryable}`,
+                )
+                .join("; ")}.`,
+            ]
+          : []),
         ...(error ? [`Error: ${error.code}: ${error.message}`] : []),
       ];
       return { content: [{ type: "text", text: lines.join("\n") }], details };
@@ -222,20 +251,24 @@ export function createWorkflowStatusTool(
 
 function createWorkflowControlTool(
   manager: WorkflowManager,
-  action: "pause" | "stop",
+  action: "pause" | "stop" | "retry",
 ): ToolDefinition<typeof workflowControlToolSchema, any> {
-  const pastTense = action === "pause" ? "paused" : "stopped";
+  const pastTense = action === "pause" ? "paused" : action === "stop" ? "stopped" : "retried";
   return defineTool({
     name: `workflow_${action}`,
-    label: action === "pause" ? "Pause Workflow" : "Stop Workflow",
+    label: action === "pause" ? "Pause Workflow" : action === "stop" ? "Stop Workflow" : "Retry Workflow",
     description:
       action === "pause"
         ? "Temporarily pause a running workflow in the current session. The run can be resumed later."
-        : "Stop a running or paused workflow in the current session. Stopped runs cannot be resumed.",
+        : action === "stop"
+          ? "Stop a running or paused workflow in the current session. Stopped runs cannot be resumed."
+          : "Retry a paused retryable agent failure in the same workflow run, replaying completed work.",
     promptSnippet:
       action === "pause"
         ? "Pause a running workflow when its work should be suspended but may continue later."
-        : "Stop a workflow when its remaining work should be aborted and must not continue.",
+        : action === "stop"
+          ? "Stop a workflow when its remaining work should be aborted and must not continue."
+          : "Retry a workflow paused after retryable agent failure without creating a replacement run.",
     promptGuidelines: [
       `Pass the exact runId returned by the workflow tool. Use workflow_${action} only for runs in the current parent session.`,
     ],
@@ -244,7 +277,8 @@ function createWorkflowControlTool(
       if (!manager.isRunInCurrentSession(params.runId)) {
         throw new Error(`Workflow ${params.runId} is unavailable in this session`);
       }
-      if (!manager[action](params.runId)) {
+      const ok = await manager[action](params.runId);
+      if (!ok) {
         throw new Error(`Workflow ${params.runId} cannot be ${pastTense} in its current state`);
       }
       return {
@@ -265,6 +299,12 @@ export function createWorkflowStopTool(
   manager: WorkflowManager,
 ): ToolDefinition<typeof workflowControlToolSchema, any> {
   return createWorkflowControlTool(manager, "stop");
+}
+
+export function createWorkflowRetryTool(
+  manager: WorkflowManager,
+): ToolDefinition<typeof workflowControlToolSchema, any> {
+  return createWorkflowControlTool(manager, "retry");
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
@@ -306,7 +346,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         "Globals: agent(prompt, opts), parallel(thunks: Array<() => Promise<unknown>>), pipeline(items, ...stages), phase(title), bash(cmd, {cwd?, timeoutMs?}), log(msg), args, cwd, budget, checkpoint(question). checkpoint always pauses and transfers its question to the parent conversation; continue the same run with the host workflow({resumeRunId, reply}) tool call.",
         "parallel() and pipeline() reject on branch failure. For best effort, catch inside each branch or pipeline stage (for example, () => agent(...).catch(() => fallback)); never attach .catch to parallel(...) or pipeline(...), because the aggregate can reject while sibling branches are still running. Results keep input order on success.",
         "bash(cmd) runs a shell command and returns {pid, exitCode, stdoutFile, stderrFile}. Full stdout/stderr go to those files; do not paste output directly through the workflow result. Use it for mechanical steps (grep/build/test), check exitCode, then pass the file paths to agent() so subagents can read/grep the files. Results are journaled so resume replays them without re-running.",
-        "Subagents have NO parent context unless you give it to them: each prompt must carry the task, relevant paths, and expected output. For machine-readable output pass a plain JSON Schema via opts.schema (not TypeScript/TypeBox). opts.cwd runs an agent in another directory. Session args: opts.forkFrom forks an existing Pi session file as read-only starting context; opts.sessionPath persists/continues this subagent's working session (relative paths resolve under ~/.pi/workflows/sessions/); using both forks into a new persistent session and is invalid if the target already exists. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle still applies. With multiple phases, call phase('Exact Title') before each phase's work so agents group correctly. End with a synthesis agent when combining results; return a compact JSON-serializable value.",
+        "Subagents have NO parent context unless you give it to them: each prompt must carry the task, relevant paths, and expected output. For machine-readable output pass a plain JSON Schema via opts.schema (not TypeScript/TypeBox). opts.cwd runs an agent in another directory. Agent calls are durable-retryable by default; set opts.retryable = false for agents that may edit files, post comments, submit forms, or otherwise duplicate side effects if rerun. Read-only reviewers/searchers should stay retryable. Session args: opts.forkFrom forks an existing Pi session file as read-only starting context; opts.sessionPath persists/continues this subagent's working session (relative paths resolve under ~/.pi/workflows/sessions/); using both forks into a new persistent session and is invalid if the target already exists. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle still applies. With multiple phases, call phase('Exact Title') before each phase's work so agents group correctly. End with a synthesis agent when combining results; return a compact JSON-serializable value.",
         modelRoutingGuideline(() => manager.getModelRegistry()),
         agentTypeGuideline(),
         "Runs are background by default (run ID now, result delivered when finished); background: false only when the result is needed inline this turn. Don't set tokenBudget/agentTimeoutMs unless the user asks to cap spend/time; to bound spend use tokenBudget, phase('Name', {budget: N}) (wrap in try/catch), or branch on budget.remaining(). Use low concurrency + agentRetries for flaky provider fan-outs.",
@@ -400,6 +440,22 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
             ],
             details: { runId: checkpoint.runId, paused: true, checkpoint },
           };
+        }
+        if (error instanceof WorkflowError) {
+          const pause = agentFailurePauseDetails(error);
+          if (pause) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Workflow ${pause.runId} paused after a retryable agent failure: ${error.message}\n` +
+                    `Retry it with workflow_retry({ runId: "${pause.runId}" }) or /workflows retry ${pause.runId}.`,
+                },
+              ],
+              details: { runId: pause.runId, paused: true, pauseReason: "agent_failure", retryState: pause.retryState },
+            };
+          }
         }
         const aborted =
           signal?.aborted || (error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED);

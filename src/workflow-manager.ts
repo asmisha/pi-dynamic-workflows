@@ -8,6 +8,7 @@ import type { WorkflowAgent } from "./agent.js";
 import { preview, resolveWorkflowFailureLocation, type WorkflowSnapshot } from "./display.js";
 import { errorStack, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import {
+  type AgentFailureRetryState,
   createRunPersistence,
   generateRunId,
   type PersistedExecutionOptions,
@@ -32,7 +33,8 @@ function checkpointFromError(error: WorkflowError): PendingCheckpoint | undefine
   if (
     !Number.isInteger(checkpoint.callIndex) ||
     typeof checkpoint.hash !== "string" ||
-    typeof checkpoint.prompt !== "string"
+    typeof checkpoint.prompt !== "string" ||
+    (checkpoint.callId !== undefined && typeof checkpoint.callId !== "string")
   ) {
     return undefined;
   }
@@ -47,6 +49,30 @@ function isValidRunId(runId: string): boolean {
 
 function isValidCheckpointReply(_checkpoint: PendingCheckpoint, reply: unknown): reply is string {
   return typeof reply === "string" && reply.trim().length > 0;
+}
+
+function failedAgentEntries(journal: JournalEntry[]): JournalEntry[] {
+  return journal.filter((entry) => entry.kind === "agent" && entry.status === "failed");
+}
+
+function retryableAgentFailureState(
+  journal: JournalEntry[],
+  escapedCallIds: Set<string>,
+): AgentFailureRetryState | undefined {
+  const failures = failedAgentEntries(journal).filter((entry) => entry.callId && escapedCallIds.has(entry.callId));
+  if (!failures.length || failures.some((entry) => !entry.callId || entry.retryable === false)) return undefined;
+  return {
+    failures: failures.map((entry) => ({
+      callId: entry.callId as string,
+      label: entry.label ?? entry.error?.agentLabel,
+      phase: entry.phase ?? entry.error?.phase,
+      code: entry.error?.code,
+      message: entry.error?.message,
+      attempt: entry.attempt ?? 1,
+      retryable: entry.retryable !== false,
+    })),
+    pausedAt: new Date().toISOString(),
+  };
 }
 
 export interface ManagedRun {
@@ -73,7 +99,11 @@ export interface ManagedRun {
   /** Durable checkpoint currently awaiting a reply from the parent conversation. */
   pendingCheckpoint?: PendingCheckpoint;
   /** Why this run is paused. */
-  pauseReason?: "manual" | "usage_limit" | "human_input";
+  pauseReason?: "manual" | "usage_limit" | "human_input" | "agent_failure";
+  /** Retry inventory for a durable agent-failure pause. */
+  retryState?: AgentFailureRetryState;
+  /** Selected failed call IDs for an in-progress retry attempt. */
+  activeRetryCallIds?: Set<string>;
   /** True after the user removes the run; suppresses final persistence from the unwinding execution. */
   deleted?: boolean;
   /** True while surviving runtime-owned siblings drain after the first terminal failure. */
@@ -93,8 +123,10 @@ export interface ManagedRun {
 export interface ExecOptions {
   /** Effective cwd for the workflow and its default subagent/bash execution. */
   cwd?: string;
-  /** Replay these journaled agent results for the unchanged prefix (resume). */
+  /** Replay these journaled call results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
+  /** Retry these failed structural agent calls while replaying successful siblings. */
+  retryFailedCallIds?: Set<string>;
   /** Cumulative usage already spent by the replayed prefix. */
   initialTokenUsage?: PersistedRunState["tokenUsage"];
   /** Cap on total agents for this run. */
@@ -375,6 +407,7 @@ export class WorkflowManager extends EventEmitter {
   ): Promise<WorkflowRunResult> {
     const {
       resumeJournal,
+      retryFailedCallIds,
       maxAgents,
       agentTimeoutMs,
       externalSignal,
@@ -398,6 +431,8 @@ export class WorkflowManager extends EventEmitter {
       onProgress?.(managed.snapshot);
       this.schedulePersist(managed);
     };
+    const escapedAgentFailureCallIds = new Set<string>();
+    if (retryFailedCallIds?.size) managed.activeRetryCallIds = new Set(retryFailedCallIds);
     const runtimeOwnedWork = new Set<Promise<unknown>>();
     const observeRuntimeOwnedWork = (work: Promise<unknown>) => {
       runtimeOwnedWork.add(work);
@@ -444,14 +479,23 @@ export class WorkflowManager extends EventEmitter {
         tokenBudget,
         initialTokenUsage,
         onRuntimeOwnedWorkStart: observeRuntimeOwnedWork,
+        onAgentFailureEscaped: (callId) => escapedAgentFailureCallIds.add(callId),
         resumeJournal,
+        retryFailedCallIds,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
         onAgentJournal: (entry) => {
           // Keep the latest entry per index, then persist (debounced: journal flushes
           // rewrite the whole run file, so per-agent-completion writes are coalesced).
-          const existing = managed.journal.findIndex((e) => e.index === entry.index);
-          if (existing >= 0) managed.journal[existing] = entry;
-          else managed.journal.push(entry);
+          const existing = managed.journal.findIndex((e) =>
+            entry.callId && e.callId ? e.callId === entry.callId : e.index === entry.index,
+          );
+          if (existing >= 0) {
+            const previous = managed.journal[existing];
+            managed.journal[existing] =
+              previous?.callId && previous.callId === entry.callId ? { ...entry, index: previous.index } : entry;
+          } else {
+            managed.journal.push(entry);
+          }
           this.schedulePersist(managed);
         },
         onLog: (message) => {
@@ -540,6 +584,7 @@ export class WorkflowManager extends EventEmitter {
             })
           : wrappedError;
 
+      if (workflowError.callId) escapedAgentFailureCallIds.add(workflowError.callId);
       const checkpoint = checkpointFromError(workflowError);
       const usageLimitPaused =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
@@ -576,6 +621,49 @@ export class WorkflowManager extends EventEmitter {
           recoverable: false,
           details: { ...checkpoint, runId: managed.runId },
         });
+      }
+
+      if (
+        !managed.controller.signal.aborted &&
+        !usageLimitPaused &&
+        failedAgentEntries(managed.journal).some((entry) => entry.retryable !== false)
+      ) {
+        await waitForRuntimeOwnedWork();
+        if (!managed.controller.signal.aborted && !managed.deleted && !managed.finalized) {
+          const retryState = retryableAgentFailureState(managed.journal, escapedAgentFailureCallIds);
+          if (retryState) {
+            managed.status = "paused";
+            managed.pauseReason = "agent_failure";
+            managed.retryState = retryState;
+            managed.activeRetryCallIds = undefined;
+            managed.error = workflowError;
+            if (!this.persistRun(managed)) {
+              const persistenceError = new WorkflowError(
+                "Could not persist the workflow retry state",
+                WorkflowErrorCode.PERSISTENCE_ERROR,
+                { recoverable: false, details: workflowError },
+              );
+              managed.status = "failed";
+              managed.pauseReason = undefined;
+              managed.retryState = undefined;
+              managed.error = persistenceError;
+              this.emit("error", { runId: managed.runId, error: persistenceError });
+              managed.finalized = true;
+              this.releaseRunLease(managed);
+              throw persistenceError;
+            }
+            this.emit("paused", { runId: managed.runId, reason: "agent_failure", retryState, error: workflowError });
+            managed.finalized = true;
+            this.releaseRunLease(managed);
+            throw new WorkflowError(workflowError.message, workflowError.code, {
+              recoverable: workflowError.recoverable,
+              agentLabel: workflowError.agentLabel,
+              details: { runId: managed.runId, pauseReason: "agent_failure", retryState },
+              resetHint: workflowError.resetHint,
+              callId: workflowError.callId,
+            });
+          }
+        }
       }
 
       let abortedByHost = false;
@@ -719,6 +807,13 @@ export class WorkflowManager extends EventEmitter {
           status: managed.status,
           pauseReason: managed.status === "paused" ? managed.pauseReason : undefined,
           pendingCheckpoint: managed.status === "paused" ? managed.pendingCheckpoint : undefined,
+          retryState:
+            managed.status === "paused" && managed.pauseReason === "agent_failure" ? managed.retryState : undefined,
+          activeRetryCallIds:
+            (managed.status === "running" || (managed.status === "paused" && managed.pauseReason === "manual")) &&
+            managed.activeRetryCallIds?.size
+              ? [...managed.activeRetryCallIds]
+              : undefined,
           resetHint:
             managed.status === "paused" && managed.pauseReason === "usage_limit" ? managed.error?.resetHint : undefined,
           phases: managed.snapshot.phases,
@@ -778,6 +873,7 @@ export class WorkflowManager extends EventEmitter {
     managed.controller.abort();
     managed.status = "paused";
     managed.pauseReason = "manual";
+    managed.retryState = undefined;
     this.emit("paused", { runId });
     // Persist the final paused state and release the lease NOW so the run is
     // immediately resumable; `finalized` suppresses the unwinding execution's
@@ -804,7 +900,8 @@ export class WorkflowManager extends EventEmitter {
       persisted.status === "completed" ||
       persisted.status === "failed" ||
       persisted.status === "aborted" ||
-      persisted.pendingCheckpoint
+      persisted.pendingCheckpoint ||
+      persisted.pauseReason === "agent_failure"
     ) {
       return false;
     }
@@ -843,7 +940,14 @@ export class WorkflowManager extends EventEmitter {
       }
       const journal = [
         ...(latest.journal ?? []).filter((entry) => entry.index !== currentCheckpoint.callIndex),
-        { index: currentCheckpoint.callIndex, hash: currentCheckpoint.hash, result: reply },
+        {
+          index: currentCheckpoint.callIndex,
+          callId: currentCheckpoint.callId,
+          kind: "checkpoint" as const,
+          status: "succeeded" as const,
+          hash: currentCheckpoint.hash,
+          result: reply,
+        },
       ].sort((left, right) => left.index - right.index);
       const resumedState: PersistedRunState = {
         ...latest,
@@ -851,6 +955,7 @@ export class WorkflowManager extends EventEmitter {
         pendingCheckpoint: undefined,
         pauseReason: undefined,
         resetHint: undefined,
+        retryState: undefined,
         updatedAt: new Date().toISOString(),
       };
       this.persistence.save(resumedState);
@@ -862,7 +967,12 @@ export class WorkflowManager extends EventEmitter {
     }
   }
 
-  private startResumedRun(persisted: PersistedRunState, lease: RunLease, journal: JournalEntry[]): void {
+  private startResumedRun(
+    persisted: PersistedRunState,
+    lease: RunLease,
+    journal: JournalEntry[],
+    retryFailedCallIds?: Set<string>,
+  ): void {
     const managed: ManagedRun = {
       runId: persisted.runId,
       status: "running",
@@ -884,18 +994,65 @@ export class WorkflowManager extends EventEmitter {
       cwd: persisted.cwd ?? this.cwd,
       executionOptions: persisted.executionOptions,
       journal,
+      retryState: persisted.retryState,
+      activeRetryCallIds:
+        retryFailedCallIds ?? (persisted.activeRetryCallIds ? new Set(persisted.activeRetryCallIds) : undefined),
       background: true,
       lease,
     };
     this.runs.set(persisted.runId, managed);
 
     const resumeJournal = new Map(journal.map((entry) => [entry.index, entry] as const));
+    const activeRetryCallIds = managed.activeRetryCallIds;
     this.emit("resumed", { runId: persisted.runId });
     void this.executeRun(managed, persisted.script, persisted.args, {
       ...persisted.executionOptions,
       resumeJournal,
+      retryFailedCallIds: activeRetryCallIds,
       initialTokenUsage: persisted.tokenUsage,
     }).catch(() => {});
+  }
+
+  async retry(runId: string): Promise<boolean> {
+    if (!isValidRunId(runId)) return false;
+    const active = this.runs.get(runId);
+    if (active?.status === "running" || active?.status === "aborted") return false;
+
+    const persisted = this.persistence.load(runId);
+    if (!persisted?.script || persisted.status !== "paused" || persisted.pauseReason !== "agent_failure") return false;
+    if (!persisted.retryState?.failures.length) return false;
+    if (!this.ownsCurrentSession(persisted.sessionId)) return false;
+
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) return false;
+    try {
+      const latest = this.persistence.load(runId);
+      if (!latest?.script || latest.status !== "paused" || latest.pauseReason !== "agent_failure") {
+        this.persistence.releaseRunLease(lease);
+        return false;
+      }
+      if (!latest.retryState?.failures.length || !this.ownsCurrentSession(latest.sessionId)) {
+        this.persistence.releaseRunLease(lease);
+        return false;
+      }
+      const retryFailedCallIds = new Set(latest.retryState.failures.map((failure) => failure.callId));
+      const resumedState: PersistedRunState = {
+        ...latest,
+        status: "running",
+        pauseReason: undefined,
+        pendingCheckpoint: undefined,
+        retryState: undefined,
+        activeRetryCallIds: [...retryFailedCallIds],
+        resetHint: undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      this.persistence.save(resumedState);
+      this.startResumedRun(resumedState, lease, latest.journal ?? [], retryFailedCallIds);
+      return true;
+    } catch (error) {
+      this.persistence.releaseRunLease(lease);
+      throw error;
+    }
   }
 
   private hasLiveExternalOwner(runId: string): boolean {
@@ -947,6 +1104,8 @@ export class WorkflowManager extends EventEmitter {
         pauseReason: undefined,
         pendingCheckpoint: undefined,
         resetHint: undefined,
+        retryState: undefined,
+        activeRetryCallIds: undefined,
       });
       this.emit("stopped", { runId });
       return true;

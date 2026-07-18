@@ -8,6 +8,7 @@ import { workflowProjectPaths } from "../src/workflow-paths.js";
 import {
   backgroundStartedText,
   createWorkflowPauseTool,
+  createWorkflowRetryTool,
   createWorkflowStatusTool,
   createWorkflowStopTool,
   createWorkflowTool,
@@ -175,6 +176,26 @@ test("createWorkflowTool with custom cwd creates tool", () => {
   assert.equal(tool.name, "workflow");
 });
 
+test("workflow retry tool invokes manager.retry", async () => {
+  const manager = {
+    isRunInCurrentSession: () => true,
+    retry: async (runId: string) => runId === "run-123",
+  } as unknown as WorkflowManager;
+  const retry = createWorkflowRetryTool(manager);
+
+  assert.equal(retry.name, "workflow_retry");
+  const result = await (retry.execute as (...args: any[]) => Promise<any>)(
+    "retry-call",
+    { runId: "run-123" },
+    new AbortController().signal,
+    () => {},
+    { hasUI: false },
+  );
+
+  assert.deepEqual(result.details, { runId: "run-123", retried: true });
+  assert.match(result.content[0].text, /retried/);
+});
+
 test("workflow status tool returns compact live progress", async () => {
   const manager = {
     isRunInCurrentSession: () => true,
@@ -248,6 +269,59 @@ test("workflow status tool reads terminal persisted runs without exposing their 
   assert.equal("script" in result.details, false);
   assert.equal("args" in result.details, false);
   assert.equal("result" in result.details, false);
+});
+
+test("workflow status tool exposes retryable failure inventory without source data", async () => {
+  const manager = {
+    isRunInCurrentSession: () => true,
+    getRun: () => undefined,
+    listRuns: () => [
+      {
+        runId: "retry-123",
+        workflowName: "paused_review",
+        script: "secret source",
+        status: "paused",
+        pauseReason: "agent_failure",
+        phases: ["Review"],
+        agents: [{ id: 1, label: "reviewer", prompt: "private prompt", status: "error" }],
+        logs: [],
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        retryState: {
+          pausedAt: new Date().toISOString(),
+          failures: [
+            {
+              callId: "root/0",
+              label: "reviewer",
+              phase: "Review",
+              code: "SCHEMA_NONCOMPLIANCE",
+              message: "invalid",
+              attempt: 2,
+              retryable: true,
+            },
+          ],
+        },
+      },
+    ],
+  } as unknown as WorkflowManager;
+  const execute = createWorkflowStatusTool(manager).execute as (...args: any[]) => Promise<any>;
+  const result = await execute("status-call", { runId: "retry-123" }, new AbortController().signal, () => {}, {
+    hasUI: false,
+  });
+
+  assert.equal(result.details.pauseReason, "agent_failure");
+  assert.deepEqual(result.details.retryFailures, [
+    {
+      label: "reviewer",
+      phase: "Review",
+      code: "SCHEMA_NONCOMPLIANCE",
+      message: "invalid",
+      attempt: 2,
+      retryable: true,
+    },
+  ]);
+  assert.match(result.content[0].text, /Retryable failures/);
+  assert.equal("script" in result.details, false);
 });
 
 test("workflow pause and stop tools expose agent-callable controls", async () => {
@@ -384,6 +458,46 @@ return await agent('unreachable')`;
       }),
       /AGENT_EXECUTION_ERROR: bootstrap exploded/,
     );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("foreground retryable agent failure returns paused run id and retry guidance", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-tool-agent-pause-"));
+  try {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new Error("temporary agent failure");
+        },
+      } as any,
+    });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const execute = tool.execute as (...args: any[]) => Promise<any>;
+    const script = `export const meta = { name: 'tool_agent_pause', description: 'foreground retry pause' }
+return await agent('try once', { label: 'reader' })`;
+
+    const result = await execute(
+      "call-agent-pause",
+      { script, background: false },
+      new AbortController().signal,
+      () => {},
+      {
+        hasUI: false,
+      },
+    );
+
+    assert.equal(result.details.paused, true);
+    assert.equal(result.details.pauseReason, "agent_failure");
+    assert.ok(result.details.runId);
+    assert.match(result.content[0].text, new RegExp(result.details.runId));
+    assert.match(result.content[0].text, /workflow_retry|\/workflows retry/);
+    const persisted = manager.listRuns().find((entry) => entry.runId === result.details.runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.pauseReason, "agent_failure");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

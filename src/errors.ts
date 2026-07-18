@@ -40,11 +40,19 @@ export class WorkflowError extends Error {
   readonly details?: unknown;
   /** For PROVIDER_USAGE_LIMIT: the provider's human reset hint, e.g. "Resets in ~3h" (verbatim). */
   readonly resetHint?: string;
+  /** Deterministic runtime call ID for an agent failure that escaped workflow code. */
+  readonly callId?: string;
 
   constructor(
     message: string,
     code: WorkflowErrorCode,
-    options: { recoverable?: boolean; agentLabel?: string; details?: unknown; resetHint?: string } = {},
+    options: {
+      recoverable?: boolean;
+      agentLabel?: string;
+      details?: unknown;
+      resetHint?: string;
+      callId?: string;
+    } = {},
   ) {
     super(message);
     this.name = "WorkflowError";
@@ -53,6 +61,7 @@ export class WorkflowError extends Error {
     this.agentLabel = options.agentLabel;
     this.details = options.details;
     this.resetHint = options.resetHint;
+    this.callId = options.callId;
   }
 }
 
@@ -125,6 +134,7 @@ export interface WorkflowFailureContext {
   runId?: string;
   phase?: string;
   agentLabel?: string;
+  callId?: string;
 }
 
 export function formatWorkflowFailure(error: unknown, context: WorkflowFailureContext = {}): string {
@@ -134,14 +144,17 @@ export function formatWorkflowFailure(error: unknown, context: WorkflowFailureCo
   return `Workflow${run} failed${stage ? ` at ${stage}` : ""}: ${workflowError.code}: ${workflowError.message}`;
 }
 
-export function wrapError(error: unknown, context?: { agentLabel?: string }): WorkflowError {
+export function wrapError(error: unknown, context?: { agentLabel?: string; callId?: string }): WorkflowError {
   if (isWorkflowError(error)) {
-    if (!context?.agentLabel || error.agentLabel) return error;
+    const agentLabel = error.agentLabel ?? context?.agentLabel;
+    const callId = error.callId ?? context?.callId;
+    if (agentLabel === error.agentLabel && callId === error.callId) return error;
     return new WorkflowError(error.message, error.code, {
       recoverable: error.recoverable,
-      agentLabel: context.agentLabel,
+      agentLabel,
       details: error.details ?? error,
       resetHint: error.resetHint,
+      callId,
     });
   }
 
@@ -157,6 +170,7 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
       recoverable: false,
       agentLabel,
       details: error,
+      callId: context?.callId,
     });
   }
 
@@ -164,6 +178,7 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
     return new WorkflowError(errorMessage(error) || "Workflow was aborted", WorkflowErrorCode.WORKFLOW_ABORTED, {
       recoverable: true,
       details: error,
+      callId: context?.callId,
     });
   }
 
@@ -172,6 +187,7 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
       recoverable: true,
       agentLabel: context?.agentLabel,
       details: error,
+      callId: context?.callId,
     });
   }
 
@@ -186,6 +202,7 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
       recoverable: false,
       agentLabel: context?.agentLabel,
       resetHint: limit.resetHint,
+      callId: context?.callId,
     });
   }
 
@@ -193,5 +210,6 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
     recoverable: true,
     agentLabel: context?.agentLabel,
     details: error,
+    callId: context?.callId,
   });
 }

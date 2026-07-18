@@ -64,7 +64,7 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 
 - **Fan-out orchestration** — `agent()`, `parallel()`, `pipeline()`, `phase()` in a sandboxed script. Up to 16 concurrent / 1000 total subagents; intermediate results stay in variables, not the chat.
 - **Real model routing** — `small` / `medium` / `big` tiers (or an exact `model`) per agent. It actually switches the subagent's model — cheap work on a light one, hard synthesis on a big one.
-- **Journaled resume** — a paused or interrupted run replays its finished prefix from a journal (no re-run, no tokens) and runs only what's left or what you changed. Failed runs are terminal rather than risking an unsafe sparse replay.
+- **Journaled resume + retry** — a paused or interrupted run replays finished work from a journal (no re-run, no tokens) and runs only what's left or what you changed. Retryable agent failures pause the same run; `/workflows retry` reruns only the failed retryable agents while completed agent, shell, and checkpoint work replays without side effects.
 - **Real token & cost accounting** — read from each subagent's session, not estimated. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` let you add explicit gates when you want them.
 - **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes. The panel is compact by default; `/workflows-progress detailed` expands it inline to per-phase/per-agent rows with tokens, cost, and a live tok/s rate (so a stalled agent shows as 0 tok/s) — no need to open `/workflows`.
 - **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, or remove runs from the keyboard.
@@ -88,7 +88,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 ```text
 /workflows                  open the interactive navigator (plain list in print mode)
 /workflows status <id>      watch a run live; print its result when it finishes
-/workflows pause|resume|stop|rm <id>
+/workflows pause|resume|retry|stop|rm <id>
 /workflows run <prompt>     force a dynamic workflow from <prompt> on demand;
                             the run shows in the panel + /workflows.
 /workflows-progress compact|detailed|status
@@ -98,7 +98,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows-models           map the small / medium / big tiers to real models
 ```
 
-Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, and `workflow_stop` tools; the slash commands remain available for manual control.
+Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, `workflow_retry`, and `workflow_stop` tools; the slash commands remain available for manual control.
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `d` remove · `r` restart · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
@@ -131,8 +131,9 @@ The essentials:
 | `schema` | JSON Schema → the subagent returns a validated object. |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
+| `retryable` | Whether an exhausted agent failure may pause the run for `/workflows retry`. Default `true`; set `false` for agents that edit files, post comments, submit forms, or can otherwise duplicate side effects. |
 
-A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. The host `workflow({ resumeRunId: "...", reply: ... })` tool call validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. A workflow run may call `checkpoint()` at most once. `/workflows resume` is for paused/interrupted runs; failed runs are intentionally terminal because parallel completion can leave a sparse journal that cannot be replayed safely.
+A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. The host `workflow({ resumeRunId: "...", reply: ... })` tool call validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. A workflow run may call `checkpoint()` at most once. `/workflows resume` is for paused/interrupted runs; `/workflows retry` is for runs paused by retryable agent failures. Ordinary failed runs remain terminal.
 
 Subagent sessions are temporary by default. Use `sessionPath` only when a reviewer/worker should keep context across runs; use `forkFrom` when it should start from an existing Pi conversation. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle applies normally.
 

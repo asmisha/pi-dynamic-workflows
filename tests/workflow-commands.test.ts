@@ -61,6 +61,10 @@ function harness(
       calls.push(`resume:${id}`);
       return false;
     },
+    retry: async (id: string) => {
+      calls.push(`retry:${id}`);
+      return true;
+    },
     deleteRun: (id: string) => {
       calls.push(`rm:${id}`);
       return true;
@@ -135,6 +139,13 @@ test("/workflows stop <id> calls manager.stop", async () => {
   const h = harness();
   await h.run("stop run-9");
   assert.deepEqual(h.calls, ["stop:run-9"]);
+});
+
+test("/workflows retry <id> calls manager.retry", async () => {
+  const h = harness();
+  await h.run("retry run-9");
+  assert.deepEqual(h.calls, ["retry:run-9"]);
+  assert.equal(h.notified[0].type, "info");
 });
 
 test("/workflows status <id> renders a persisted run", async () => {
@@ -283,10 +294,10 @@ test("/workflows resume <id> warns when resume returns false", async () => {
   const h = harness({ resume: async () => false });
   await h.run("resume run-fail");
   assert.ok(
-    h.notified.some((n) => n.message.includes("failed runs are terminal")),
-    "should explain the failed-run policy",
+    h.notified.some((n) => n.message.includes("Use retry for retryable agent failures")),
+    "should explain when to use retry",
   );
-  assert.equal(h.notified.find((n) => n.message.includes("failed runs are terminal"))?.type, "warning");
+  assert.equal(h.notified.find((n) => n.message.includes("Use retry for retryable agent failures"))?.type, "warning");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
