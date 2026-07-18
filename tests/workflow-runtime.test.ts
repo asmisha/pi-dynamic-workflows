@@ -105,6 +105,55 @@ return a`,
   assert.equal(journal.length, 1, "only the final success is journaled");
 });
 
+test("read-only agents retry once by default without rerunning a successful sibling", async () => {
+  const calls = { reviewer: 0, sibling: 0 };
+  const result = await runWorkflow(
+    `export const meta = { name: 'readonly_retry', description: 'read-only retry' }
+return await parallel([
+  () => agent('review', { label: 'reviewer', readOnly: true }),
+  () => agent('inspect', { label: 'sibling', readOnly: true }),
+])`,
+    {
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "inspect") {
+            calls.sibling++;
+            return "evidence";
+          }
+          calls.reviewer++;
+          return calls.reviewer === 1 ? "" : "reviewed";
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.deepEqual(result.result, ["reviewed", "evidence"]);
+  assert.deepEqual(calls, { reviewer: 2, sibling: 1 });
+});
+
+test("explicit retries zero disables the read-only retry default", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'readonly_no_retry', description: 'explicit read-only retry override' }
+return await agent('review', { label: 'reviewer', readOnly: true, retries: 0 })`,
+        {
+          agent: {
+            async run() {
+              calls++;
+              return "";
+            },
+          },
+          persistLogs: false,
+        },
+      ),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_EMPTY_OUTPUT,
+  );
+  assert.equal(calls, 1);
+});
+
 test("runWorkflow retries schema noncompliance without rerunning a successful sibling", async () => {
   const calls = { reviewer: 0, sibling: 0 };
   const result = await runWorkflow(

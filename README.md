@@ -45,17 +45,17 @@ export const meta = {
 }
 
 phase('Scan')
-const files = await agent('List every route file under src/routes/.', { tier: 'small' })
+const files = await agent('List every route file under src/routes/.', { tier: 'small', readOnly: true })
 
 phase('Review')
 const findings = await parallel(
   files.split('\n').filter(Boolean).map((file) =>
-    () => agent(`Audit ${file} for missing auth checks.`, { tier: 'medium' }),
+    () => agent(`Audit ${file} for missing auth checks.`, { tier: 'medium', readOnly: true }),
   ),
 )
 
 phase('Verify')
-return await agent('Synthesize and double-check these findings:\n' + findings.join('\n\n'), { tier: 'big' })
+return await agent('Synthesize and double-check these findings:\n' + findings.join('\n\n'), { tier: 'big', readOnly: true })
 ```
 
 `agent()` spawns an isolated subagent, `parallel()` runs many at once, `phase()` groups them in the live view, and `tier` routes each one to the right model. That's the whole idea.
@@ -75,7 +75,7 @@ export async function run(context) {
 // audit.mjs
 export async function audit({ agent, checkpoint }, target) {
   const answer = await checkpoint(`Audit ${target}?`)
-  return await agent(`Audit ${target}; user answer: ${answer}`)
+  return await agent(`Audit ${target}; user answer: ${answer}`, { readOnly: true })
 }
 ```
 
@@ -85,7 +85,7 @@ Pass `workflow.mjs` through `scriptPath`. The exported `run(context)` receives t
 
 - **Fan-out orchestration** — `agent()`, `parallel()`, `pipeline()`, `phase()` in a sandboxed script. Up to 16 concurrent / 1000 total subagents; intermediate results stay in variables, not the chat.
 - **Real model routing** — `small` / `medium` / `big` tiers (or an exact `model`) per agent. It actually switches the subagent's model — cheap work on a light one, hard synthesis on a big one.
-- **Journaled resume + retry** — a paused or interrupted run replays finished work from a journal (no re-run, no tokens) and runs only what's left or what you changed. Retryable agent failures pause the same run; `/workflows retry` reruns only the failed retryable agents while completed agent, shell, and checkpoint work replays without side effects.
+- **Automatic + durable retry** — read-only agents retry one recoverable failure automatically. If a retryable failure is exhausted, the same run pauses; `/workflows retry` reruns only failed calls while completed agent, shell, and checkpoint work replays without side effects.
 - **Real token & cost accounting** — read from each subagent's session, not estimated. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` let you add explicit gates when you want them.
 - **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes. The panel is compact by default; `/workflows-progress detailed` expands it inline to per-phase/per-agent rows with tokens, cost, and a live tok/s rate (so a stalled agent shows as 0 tok/s) — no need to open `/workflows`.
 - **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, or remove runs from the keyboard.
@@ -151,9 +151,9 @@ The essentials:
 | `sessionPath` | Persist/continue this agent's working session. Existing files are continued; missing files are created. Relative paths resolve under `~/.pi/workflows/sessions/`. Combined with `forkFrom`, the target must not already exist. |
 | `schema` | JSON Schema → the subagent returns a validated object. |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
-| `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty or schema-invalid output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
-| `retryable` | Whether automatic retries or `/workflows retry` may rerun this agent. Default `true`; set `false` for agents that edit files, post comments, submit forms, or can otherwise duplicate side effects. |
-| `readOnly` | Set `true` for reviewers/searchers to exclude code-writing tools (`bash`, `edit`, `write`, and AST replacement) while preserving read-only tools. |
+| `retries` | Explicit retry attempts after a recoverable failure for this agent. Overrides all defaults; use `0` to disable automatic retry. |
+| `retryable` | Whether automatic retries or `/workflows retry` may rerun this agent. Default `true`; set `false` for any agent that can duplicate side effects. |
+| `readOnly` | Set `true` for reviewers/searchers. It excludes code-writing tools (`bash`, `edit`, `write`, and AST replacement) and defaults to one automatic retry unless `retries` overrides it. |
 
 A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. The host `workflow({ resumeRunId: "...", reply: ... })` tool call validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. A workflow run may call `checkpoint()` at most once. `/workflows resume` is for paused/interrupted runs; `/workflows retry` is for runs paused by retryable agent failures. Ordinary failed runs remain terminal.
 
@@ -161,7 +161,7 @@ Subagent sessions are temporary by default. Use `sessionPath` only when a review
 
 By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 
-For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (max agents running at once, clamped to the runtime maximum of `16`) and `agentRetries` (retry attempts after a recoverable agent failure such as a timeout, connection failure, or empty or schema-invalid output). Both can be defaulted in `~/.pi/workflows/settings.json` as `{ "defaultConcurrency": 4, "defaultAgentRetries": 2 }`; a per-run tool value overrides the default, and a per-agent `retries` overrides `agentRetries`. Retries default to `0` (off) unless configured or passed, and only retryable agents with recoverable failures retry — nonrecoverable errors still abort the run.
+For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (max agents running at once, clamped to `16`) and `agentRetries` (run-level retry attempts after recoverable agent failures). Both can be defaulted in `~/.pi/workflows/settings.json`; per-agent `retries` overrides the run value. Read-only agents get at least one automatic retry by default. Other agents default to `0`, and side-effecting agents must set `retryable: false`. Nonrecoverable errors never retry.
 
 The live "Workflows running" panel is configured in the same `~/.pi/workflows/settings.json`: `"progressPanelMode"` is `"compact"` (default, one line per run) or `"detailed"` (per-phase/per-agent rows with tokens, cost, and a live tok/s rate), and `"progressPanelMaxAgents"` (default `8`, range `1`–`1000`) caps how many agents each phase shows in detailed mode before a `… N earlier agents` line. Toggle them live with `/workflows-progress compact|detailed` and `/workflows-progress-max <N>` — changes take effect on the next render without a restart.
 

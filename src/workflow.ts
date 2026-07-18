@@ -92,7 +92,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    */
   agentRegistry?: AgentRegistry;
   concurrency?: number;
-  /** Retry attempts after a recoverable agent failure. Default 0. */
+  /** Run-level retry attempts after a recoverable agent failure. Read-only calls default to at least one. */
   agentRetries?: number;
   tokenBudget?: number | null;
   /** Trusted native ESM workflow loaded from scriptPath. Inline workflows omit this. */
@@ -190,11 +190,11 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   agentType?: string;
   /** Override timeout for this specific agent. null means no hard timeout. */
   timeoutMs?: number | null;
-  /** Retry attempts after a recoverable failure for this specific agent. */
+  /** Retry attempts after a recoverable failure for this agent. Defaults to one for read-only calls. */
   retries?: number;
   /** Whether automatic and durable failure recovery may rerun this agent. Defaults to true. */
   retryable?: boolean;
-  /** Exclude tools that can change code, including shell, edit, write, and AST replacement tools. */
+  /** Exclude code-writing tools and default this call to one automatic recoverable retry. */
   readOnly?: boolean;
   /** Run this agent in a different working directory (tools + session bind to it). */
   cwd?: string;
@@ -580,7 +580,10 @@ export async function runWorkflow<T = unknown>(
     const work = limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const mayRetry = agentOptions.retryable !== false;
-      const retryAttempts = mayRetry ? normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0) : 0;
+      const defaultRetries = agentOptions.readOnly
+        ? Math.max(options.agentRetries ?? 0, 1)
+        : (options.agentRetries ?? 0);
+      const retryAttempts = mayRetry ? normalizeAgentRetries(agentOptions.retries ?? defaultRetries) : 0;
       const maxAttempts = retryAttempts + 1;
       const durableAttempt = (cached?.status === "failed" ? (cached.attempt ?? 1) : 0) + 1;
 

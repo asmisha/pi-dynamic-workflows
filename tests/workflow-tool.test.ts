@@ -107,7 +107,8 @@ test("createWorkflowTool schema exposes concurrency and agentRetries", () => {
   const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
 
   assert.match(parameters.properties?.concurrency?.description ?? "", /Maximum concurrent agents/i);
-  assert.match(parameters.properties?.agentRetries?.description ?? "", /Retry attempts/i);
+  assert.match(parameters.properties?.agentRetries?.description ?? "", /retry attempts/i);
+  assert.match(parameters.properties?.agentRetries?.description ?? "", /read-only agents default to at least 1/i);
 });
 
 test("createWorkflowTool promptGuidelines mention retry and concurrency controls", () => {
@@ -116,6 +117,8 @@ test("createWorkflowTool promptGuidelines mention retry and concurrency controls
 
   assert.match(all, /low concurrency/i);
   assert.match(all, /agentRetries/i);
+  assert.match(all, /readOnly = true.*one automatic recoverable retry/i);
+  assert.match(all, /retryable = false.*duplicate side effects/i);
   assert.match(all, /catch/i);
 });
 

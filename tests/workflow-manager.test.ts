@@ -401,6 +401,36 @@ test(
 );
 
 test(
+  "read-only agent automatically retries before pausing an exhausted failure",
+  withTempCwd(async (cwd) => {
+    let calls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          calls++;
+          throw new WorkflowError("transient review failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+            recoverable: true,
+            agentLabel: "reviewer",
+          });
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    await assert.rejects(
+      manager.runSync(`export const meta = { name: 'readonly_pause', description: 'read-only retry before pause' }
+return await agent('review', { label: 'reviewer', readOnly: true })`),
+    );
+
+    const run = manager.listRuns().find((entry) => entry.workflowName === "readonly_pause");
+    assert.equal(calls, 2);
+    assert.equal(run?.status, "paused");
+    assert.equal(run?.pauseReason, "agent_failure");
+  }),
+);
+
+test(
   "retryable parallel agent failure pauses after journaling successful siblings",
   withTempCwd(async (cwd) => {
     const calls: string[] = [];
