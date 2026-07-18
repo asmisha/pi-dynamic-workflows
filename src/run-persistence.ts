@@ -13,6 +13,7 @@ export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed
 
 export interface PersistedAgentState {
   id: number;
+  callId?: string;
   label: string;
   phase?: string;
   prompt: string;
@@ -22,6 +23,7 @@ export interface PersistedAgentState {
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;
   history?: AgentHistoryEntry[];
+  tokens?: number;
   startedAt?: string;
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */

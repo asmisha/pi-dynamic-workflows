@@ -529,6 +529,7 @@ export class WorkflowManager extends EventEmitter {
         onAgentStart: (event) => {
           managed.snapshot.agents.push({
             id: managed.snapshot.agents.length + 1,
+            callId: event.callId,
             label: event.label,
             phase: event.phase,
             prompt: event.prompt,
@@ -540,9 +541,7 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentEnd: (event) => {
-          const agent = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+          const agent = managed.snapshot.agents.find((candidate) => candidate.callId === event.callId);
           if (agent) {
             agent.status = event.result === null ? "error" : "done";
             agent.resultPreview = preview(event.result);
@@ -557,14 +556,16 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentHistory: (event) => {
-          const agent = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+          const agent = managed.snapshot.agents.find((candidate) => candidate.callId === event.callId);
           if (agent) {
             agent.history = event.history;
           }
           this.emit("agentHistory", { runId: managed.runId, ...event });
           progress();
+        },
+        onAgentUsage: (event) => {
+          const agent = managed.snapshot.agents.find((candidate) => candidate.callId === event.callId);
+          if (agent) agent.tokens = event.tokens;
         },
         onTokenUsage: (usage) => {
           managed.snapshot.tokenUsage = usage;

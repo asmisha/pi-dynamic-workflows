@@ -320,6 +320,138 @@ test("runWorkflow accumulates real per-agent usage (incl. cost + cache tokens)",
   assert.equal(result.tokenUsage?.cacheWrite, 20, "cacheWrite accumulates across agents");
 });
 
+test("runWorkflow aggregates absolute live usage across parallel agents without double counting", async () => {
+  const release = createDeferred<void>();
+  const reporters = new Map<string, (usage: AgentUsage) => void>();
+  const liveTotals: number[] = [];
+  const liveAgentTotals = new Map<string, number[]>();
+  const endedAgentTotals = new Map<string, number>();
+  const finalUsage: Record<string, AgentUsage> = {
+    a: { input: 10, output: 8, total: 18, cost: 0.018, cacheRead: 4, cacheWrite: 2 },
+    b: { input: 15, output: 7, total: 22, cost: 0.022, cacheRead: 3, cacheWrite: 1 },
+  };
+  const runner = {
+    async run(prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+      if (options.onUsage) reporters.set(prompt, options.onUsage);
+      await release.promise;
+      options.onUsage?.(finalUsage[prompt]);
+      return `ok:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'live_parallel', description: 'live usage' }
+const results = await parallel(['a', 'b'].map((p) => () => agent(p, { label: p })))
+return results`;
+
+  const run = runWorkflow(script, {
+    agent: runner,
+    concurrency: 2,
+    persistLogs: false,
+    initialTokenUsage: { input: 3, output: 2, total: 5, cost: 0.1, cacheRead: 1, cacheWrite: 2 },
+    onAgentUsage: ({ label, tokens }) => {
+      const totals = liveAgentTotals.get(label) ?? [];
+      totals.push(tokens);
+      liveAgentTotals.set(label, totals);
+    },
+    onAgentEnd: ({ label, tokens }) => endedAgentTotals.set(label, tokens ?? 0),
+    onTokenUsage: (usage) => liveTotals.push(usage.total),
+  });
+
+  while (reporters.size < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+  reporters.get("a")?.({ input: 6, output: 4, total: 10, cost: 0.01, cacheRead: 2, cacheWrite: 1 });
+  reporters.get("a")?.({ input: 6, output: 4, total: 10, cost: 0.01, cacheRead: 2, cacheWrite: 1 });
+  reporters.get("b")?.({ input: 12, output: 8, total: 20, cost: 0.02, cacheRead: 2, cacheWrite: 1 });
+  reporters.get("a")?.({ input: 9, output: 6, total: 15, cost: 0.015, cacheRead: 3, cacheWrite: 1 });
+
+  assert.deepEqual(liveTotals, [15, 15, 35, 40], "repeated absolute snapshots must not be added twice");
+  assert.deepEqual(liveAgentTotals.get("a"), [10, 10, 15], "an active agent's usage should update monotonically");
+  assert.deepEqual(liveAgentTotals.get("b"), [20]);
+
+  release.resolve();
+  const result = await run;
+
+  assert.deepEqual(result.tokenUsage, {
+    input: 28,
+    output: 17,
+    total: 45,
+    cost: 0.14,
+    cacheRead: 8,
+    cacheWrite: 5,
+  });
+  assert.equal(endedAgentTotals.get("a"), 18);
+  assert.equal(endedAgentTotals.get("b"), 22);
+  assert.equal(liveTotals[liveTotals.length - 1], 45, "the final emitted aggregate stays exact");
+});
+
+test("runWorkflow keeps logical-agent usage cumulative across retries", async () => {
+  let attempt = 0;
+  const liveAgentTotals: number[] = [];
+  let endedTokens = 0;
+  const runner = {
+    async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+      attempt++;
+      if (attempt === 1) {
+        options.onUsage?.({ input: 100, output: 0, total: 100, cost: 0.1, cacheRead: 0, cacheWrite: 0 });
+        throw new Error("retry me");
+      }
+      options.onUsage?.({ input: 20, output: 0, total: 20, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
+      return "ok";
+    },
+  };
+
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_usage', description: 'retry usage' }
+return await agent('work', { label: 'worker' })`,
+    {
+      agent: runner,
+      agentRetries: 1,
+      persistLogs: false,
+      onAgentUsage: ({ tokens }) => liveAgentTotals.push(tokens),
+      onAgentEnd: ({ tokens }) => (endedTokens = tokens ?? 0),
+    },
+  );
+
+  assert.equal(result.tokenUsage.input, 120);
+  assert.equal(result.tokenUsage.total, 120);
+  assert.ok(Math.abs(result.tokenUsage.cost - 0.12) < 1e-9);
+  assert.equal(endedTokens, 120);
+  assert.deepEqual(liveAgentTotals, [100, 120]);
+});
+
+test("runWorkflow settles timed-out attempts before starting a retry", async () => {
+  let attempt = 0;
+  let endedTokens = 0;
+  const runner = {
+    async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+      attempt++;
+      if (attempt === 1) {
+        options.onUsage?.({ input: 10, output: 0, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        options.onUsage?.({ input: 20, output: 0, total: 20, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
+        return "too late";
+      }
+      options.onUsage?.({ input: 5, output: 0, total: 5, cost: 0.005, cacheRead: 0, cacheWrite: 0 });
+      return "ok";
+    },
+  };
+
+  const result = await runWorkflow(
+    `export const meta = { name: 'timeout_usage', description: 'timeout usage' }
+return await agent('work', { label: 'worker', timeoutMs: 5 })`,
+    {
+      agent: runner,
+      agentRetries: 1,
+      persistLogs: false,
+      onAgentEnd: ({ tokens }) => (endedTokens = tokens ?? 0),
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(result.tokenUsage.input, 25);
+  assert.equal(result.tokenUsage.total, 25);
+  assert.ok(Math.abs(result.tokenUsage.cost - 0.025) < 1e-9);
+  assert.equal(endedTokens, 25);
+});
+
 test("meta.model is parsed and routes as the default model for agents", async () => {
   let seenModel: string | undefined;
   const recorder = {

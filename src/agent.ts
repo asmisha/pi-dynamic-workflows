@@ -418,9 +418,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   instructions?: string;
   signal?: AbortSignal;
   /**
-   * Called once with this subagent's real usage, read from the session right
-   * before disposal. Fires on both the success and error paths so partial
-   * usage is never lost. `total === 0` means the provider reported no usage.
+   * Called with this subagent's cumulative usage after each assistant response
+   * and once more before disposal. `total === 0` means the provider reported no usage.
    */
   onUsage?: (usage: AgentUsage) => void;
   /**
@@ -629,7 +628,7 @@ export class WorkflowAgent {
     })();
 
     let removeAbortListener: (() => void) | undefined;
-    let removeHistoryListener: (() => void) | undefined;
+    let removeSessionListener: (() => void) | undefined;
     let lastHistoryEmit = 0;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
     const maybeEmitHistory = () => {
@@ -641,6 +640,35 @@ export class WorkflowAgent {
       lastHistoryEmit = now;
       emitHistory();
     };
+    const usage: AgentUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
+    let lastAssistantUsage: AgentUsage | undefined;
+    const emitUsage = () => {
+      try {
+        options.onUsage?.({ ...usage });
+      } catch {
+        // Usage is best-effort; never let its observer mask the real result/error.
+      }
+    };
+    const applyUsage = (change: AgentUsage, direction: 1 | -1) => {
+      usage.input += change.input * direction;
+      usage.output += change.output * direction;
+      usage.cacheRead += change.cacheRead * direction;
+      usage.cacheWrite += change.cacheWrite * direction;
+      usage.total += change.total * direction;
+      usage.cost += change.cost * direction;
+      emitUsage();
+    };
+    const recordAssistantUsage = (message: AssistantMessage) => {
+      lastAssistantUsage = {
+        input: message.usage.input,
+        output: message.usage.output,
+        cacheRead: message.usage.cacheRead,
+        cacheWrite: message.usage.cacheWrite,
+        total: message.usage.input + message.usage.output + message.usage.cacheRead + message.usage.cacheWrite,
+        cost: message.usage.cost.total,
+      };
+      applyUsage(lastAssistantUsage, 1);
+    };
     try {
       if (options.signal?.aborted) throw abortError();
       if (options.signal) {
@@ -651,8 +679,16 @@ export class WorkflowAgent {
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
-      if (options.onHistory) {
-        removeHistoryListener = session.subscribe(() => maybeEmitHistory());
+      if (options.onHistory || options.onUsage) {
+        removeSessionListener = session.subscribe((event) => {
+          maybeEmitHistory();
+          if (event.type === "message_end" && event.message.role === "assistant") {
+            recordAssistantUsage(event.message);
+          } else if (event.type === "agent_end" && event.willRetry && lastAssistantUsage) {
+            applyUsage(lastAssistantUsage, -1);
+            lastAssistantUsage = undefined;
+          }
+        });
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
@@ -685,28 +721,13 @@ export class WorkflowAgent {
       return text as AgentRunResult<TSchemaDef>;
     } finally {
       removeAbortListener?.();
-      removeHistoryListener?.();
+      removeSessionListener?.();
       try {
         emitHistory();
       } catch {
         // History is diagnostic only; never let it mask the real result/error.
       }
-      // Read real usage before disposing — dispose tears down the session state.
-      if (options.onUsage) {
-        try {
-          const { tokens, cost } = session.getSessionStats();
-          options.onUsage({
-            input: tokens.input,
-            output: tokens.output,
-            cacheRead: tokens.cacheRead,
-            cacheWrite: tokens.cacheWrite,
-            total: tokens.total,
-            cost,
-          });
-        } catch {
-          // Usage is best-effort; never let stats failure mask the real result/error.
-        }
-      }
+      emitUsage();
       session.dispose();
       forked?.cleanup();
     }

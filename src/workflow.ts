@@ -122,8 +122,9 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onAgentFailureEscaped?: (callId: string) => void;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentStart?: (event: { callId: string; label: string; phase?: string; prompt: string; model?: string }) => void;
   onAgentEnd?: (event: {
+    callId: string;
     label: string;
     phase?: string;
     result: unknown;
@@ -133,7 +134,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
   }) => void;
-  onAgentHistory?: (event: { label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
+  onAgentHistory?: (event: { callId: string; label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
+  onAgentUsage?: (event: { callId: string; label: string; phase?: string; tokens: number }) => void;
   onTokenUsage?: (usage: {
     input: number;
     output: number;
@@ -532,8 +534,15 @@ export async function runWorkflow<T = unknown>(
     const cachedSucceeded = isJournalSuccess(cached);
     const cachedEmptyOutput = cachedSucceeded && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && cachedSucceeded && !cachedEmptyOutput && (retryMode || callIndex < state.firstMiss)) {
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
-      options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
+      options.onAgentStart?.({ callId, label, phase: assignedPhase, prompt, model: displayModel });
+      options.onAgentEnd?.({
+        callId,
+        label,
+        phase: assignedPhase,
+        result: cached.result,
+        tokens: 0,
+        model: displayModel,
+      });
       return cached.result;
     }
     if (retryMode && cached?.status === "failed") {
@@ -587,28 +596,47 @@ export async function runWorkflow<T = unknown>(
       const maxAttempts = retryAttempts + 1;
       const durableAttempt = (cached?.status === "failed" ? (cached.attempt ?? 1) : 0) + 1;
 
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
+      options.onAgentStart?.({ callId, label, phase: assignedPhase, prompt, model: displayModel });
 
-      // Captured from the subagent's real session usage; falls back to an
-      // estimate when the provider reports no usage (total === 0). Usage is reset
-      // per retry attempt so a failed attempt does not double-count the next one.
-      let usage: AgentUsage | undefined;
-      const recordTokens = (result: unknown): number => {
-        const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(prompt);
-        if (usage) {
-          shared.tokenUsage.input += usage.input;
-          shared.tokenUsage.output += usage.output;
-          shared.tokenUsage.cost += usage.cost;
-          shared.tokenUsage.cacheRead += usage.cacheRead;
-          shared.tokenUsage.cacheWrite += usage.cacheWrite;
-        }
-        shared.tokenUsage.total += tokens;
-        shared.spent += tokens;
-        options.onTokenUsage?.(shared.tokenUsage);
-        return tokens;
-      };
+      // Each retry attempt reports cumulative snapshots from zero. Keep its
+      // baseline local while publishing the logical agent's cumulative total.
+      let committedTokens = 0;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        usage = undefined;
+        let usage: AgentUsage | undefined;
+        let acceptingUsage = true;
+        const updateUsage = (next: AgentUsage) => {
+          if (!acceptingUsage) return;
+          const previous = usage;
+          shared.tokenUsage.input += next.input - (previous?.input ?? 0);
+          shared.tokenUsage.output += next.output - (previous?.output ?? 0);
+          shared.tokenUsage.cost += next.cost - (previous?.cost ?? 0);
+          shared.tokenUsage.cacheRead += next.cacheRead - (previous?.cacheRead ?? 0);
+          shared.tokenUsage.cacheWrite += next.cacheWrite - (previous?.cacheWrite ?? 0);
+          const tokenDelta = next.total - (previous?.total ?? 0);
+          shared.tokenUsage.total += tokenDelta;
+          shared.spent += tokenDelta;
+          usage = next;
+          options.onAgentUsage?.({
+            callId,
+            label,
+            phase: assignedPhase,
+            tokens: committedTokens + next.total,
+          });
+          options.onTokenUsage?.(shared.tokenUsage);
+        };
+        const commitUsage = (result: unknown) => {
+          let tokens = usage?.total ?? 0;
+          if (tokens > 0) {
+            committedTokens += tokens;
+            return;
+          }
+          tokens = estimateTokens(result) + estimateTokens(prompt);
+          shared.tokenUsage.total += tokens;
+          shared.spent += tokens;
+          committedTokens += tokens;
+          options.onAgentUsage?.({ callId, label, phase: assignedPhase, tokens: committedTokens });
+          options.onTokenUsage?.(shared.tokenUsage);
+        };
         // Per-attempt abort scope: fires on run abort AND on timeout, so a timed-out
         // attempt's session is actually torn down instead of running (and consuming
         // tokens/RAM outside the concurrency cap) until it finishes naturally.
@@ -642,11 +670,9 @@ export async function runWorkflow<T = unknown>(
                 // Make the silent degrade visible in /workflows, not just console.
                 log(`${label}: model "${spec}" unavailable — using the session default`);
               },
-              onUsage: (u: AgentUsage) => {
-                usage = u;
-              },
+              onUsage: updateUsage,
               onHistory: (history: AgentHistoryEntry[]) => {
-                options.onAgentHistory?.({ label, phase: assignedPhase, history });
+                options.onAgentHistory?.({ callId, label, phase: assignedPhase, history });
               },
             }),
             timeout,
@@ -654,6 +680,7 @@ export async function runWorkflow<T = unknown>(
             () => attemptController.abort(),
           );
 
+          acceptingUsage = false;
           throwIfAborted();
           if (isEmptyTextAgentResult(result, agentOptions.schema)) {
             throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
@@ -662,7 +689,7 @@ export async function runWorkflow<T = unknown>(
             });
           }
 
-          const tokens = recordTokens(result);
+          commitUsage(result);
           options.onAgentJournal?.({
             index: callIndex,
             callId,
@@ -676,19 +703,21 @@ export async function runWorkflow<T = unknown>(
             phase: assignedPhase,
           });
           options.onAgentEnd?.({
+            callId,
             label,
             phase: assignedPhase,
             result,
-            tokens,
+            tokens: committedTokens,
             model: displayModel,
           });
           return result;
         } catch (error) {
+          acceptingUsage = false;
           if (options.signal?.aborted) throw error;
 
           const workflowError = wrapError(error, { agentLabel: label, callId });
           logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
-          const tokens = recordTokens(null);
+          commitUsage(null);
 
           if (workflowError.recoverable && attempt < maxAttempts) {
             log(
@@ -716,10 +745,11 @@ export async function runWorkflow<T = unknown>(
             phase: assignedPhase,
           });
           options.onAgentEnd?.({
+            callId,
             label,
             phase: assignedPhase,
             result: null,
-            tokens,
+            tokens: committedTokens,
             model: displayModel,
             error: workflowError.message,
             errorCode: workflowError.code,
@@ -733,6 +763,7 @@ export async function runWorkflow<T = unknown>(
           }
           throw workflowError;
         } finally {
+          acceptingUsage = false;
           options.signal?.removeEventListener("abort", onRunAbort);
         }
       }
@@ -1432,9 +1463,9 @@ function normalizeAgentRetries(value: unknown): number {
 }
 
 /**
- * Run a promise with a timeout. `onTimeout` fires before the rejection so the
- * caller can abort the underlying work (otherwise a timed-out subagent session
- * would keep running — and consuming tokens — outside the concurrency cap).
+ * Abort work at the deadline, then wait for its cleanup before releasing the
+ * concurrency slot. This keeps a timed-out attempt's final usage and events
+ * from racing a retry or a finalized workflow.
  */
 async function withTimeout<T>(
   promise: Promise<T>,
@@ -1445,27 +1476,30 @@ async function withTimeout<T>(
   if (ms === null) return promise;
 
   let timeoutId: NodeJS.Timeout | undefined;
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
+  const settled = promise.then(
+    (value) => ({ type: "resolved" as const, value }),
+    (error: unknown) => ({ type: "rejected" as const, error }),
+  );
+  const timedOut = new Promise<{ type: "timedOut" }>((resolve) => {
     timeoutId = setTimeout(() => {
       try {
         onTimeout?.();
       } catch {
         // aborting is best-effort; the timeout error is the real signal
       }
-      reject(
-        new WorkflowError(
-          `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
-          WorkflowErrorCode.AGENT_TIMEOUT,
-          { recoverable: true },
-        ),
-      );
+      resolve({ type: "timedOut" });
     }, ms);
   });
 
-  try {
-    return await Promise.race([promise, timeoutPromise]);
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
-  }
+  const outcome = await Promise.race([settled, timedOut]);
+  if (timeoutId) clearTimeout(timeoutId);
+  if (outcome.type === "resolved") return outcome.value;
+  if (outcome.type === "rejected") throw outcome.error;
+
+  await settled;
+  throw new WorkflowError(
+    `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
+    WorkflowErrorCode.AGENT_TIMEOUT,
+    { recoverable: true },
+  );
 }

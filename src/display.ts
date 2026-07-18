@@ -7,6 +7,8 @@ export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "ski
 
 export interface WorkflowAgentSnapshot {
   id: number;
+  /** Stable structural identity for this invocation; label is display-only. */
+  callId?: string;
   label: string;
   phase?: string;
   prompt: string;

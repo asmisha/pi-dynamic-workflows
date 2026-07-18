@@ -9,14 +9,14 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { DefaultResourceLoader, defineTool, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { WorkflowAgent } from "../src/agent.js";
+import { type AgentUsage, WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -156,6 +156,34 @@ test("a read-only real subagent excludes write-capable tools and preserves read-
     for (const name of ["bash", "edit", "write", "ast_grep_replace"]) {
       assert.ok(!activeTools.includes(name), `expected ${name} to be excluded, got ${activeTools.join(", ")}`);
     }
+  }));
+
+test("live usage removes an assistant response discarded by SDK auto-retry", () =>
+  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+    const agentDir = getAgentDir();
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } }),
+    );
+    setResponses([
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 server error" }),
+      fauxAssistantMessage("done", { stopReason: "stop" }),
+    ]);
+
+    const snapshots: AgentUsage[] = [];
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    const text = await agent.run("do the task", { label: "auto-retry", onUsage: (usage) => snapshots.push(usage) });
+
+    assert.equal(text, "done");
+    assert.ok((snapshots[0]?.total ?? 0) > 0, "the failed response is visible before SDK retry");
+    const resetIndex = snapshots.findIndex((usage) => usage.total === 0);
+    assert.ok(resetIndex > 0, "SDK retry removes the discarded response");
+    assert.deepEqual(
+      snapshots[snapshots.length - 1],
+      snapshots[resetIndex + 1],
+      "final usage contains only the replacement response",
+    );
   }));
 
 test("a real subagent session binds extensions so session_start-registered tools become active", () =>

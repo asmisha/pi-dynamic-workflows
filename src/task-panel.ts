@@ -361,12 +361,8 @@ export function renderPanelDetailed(
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
-    // The run-level tokenUsage aggregate is only finalized when the run ends, so
-    // it reads 0 for the whole live run. Per-agent `tokens` update on each agent
-    // completion, so sum those for a live total (and keep the header consistent
-    // with the per-phase subtotals). Note: tokens land at agent-completion
-    // granularity, so the rate reflects completion throughput — it decays to 0
-    // during a single long-running agent or a stall (which is the intended signal).
+    // Sum per-agent usage so the run header stays consistent with the phase
+    // subtotals. Running agents update after each provider response.
     const total = agents.reduce((n, a) => n + (a.tokens ?? 0), 0);
     // Sample the running total and derive the rolling token/s. Paused runs don't
     // accrue tokens, so their rate is suppressed (a stalled rate would mislead).

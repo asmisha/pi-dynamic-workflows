@@ -356,6 +356,97 @@ test(
 );
 
 test(
+  "running agent usage reaches the live snapshot",
+  withTempCwd(async (cwd) => {
+    const started = createDeferred<void>();
+    const gate = createDeferred<void>();
+    let reportUsage: ((usage: AgentUsage) => void) | undefined;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options?: { onUsage?: (usage: AgentUsage) => void }) {
+          reportUsage = options?.onUsage;
+          started.resolve();
+          await gate.promise;
+          return "done";
+        },
+      },
+    });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+
+    try {
+      await started.promise;
+      reportUsage?.({
+        input: 20,
+        output: 10,
+        cacheRead: 4,
+        cacheWrite: 2,
+        total: 30,
+        cost: 0.03,
+      });
+
+      const live = manager.getRun(runId)?.snapshot;
+      assert.equal(live?.agents[0]?.tokens, 30);
+      assert.equal(live?.tokenUsage?.total, 30);
+    } finally {
+      gate.resolve();
+      await promise;
+    }
+  }),
+);
+
+test(
+  "live usage is attributed by invocation when parallel agents share a label",
+  withTempCwd(async (cwd) => {
+    const reporters = new Map<string, (usage: AgentUsage) => void>();
+    const release = createDeferred<void>();
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options?: { onUsage?: (usage: AgentUsage) => void }) {
+          if (options?.onUsage) reporters.set(prompt, options.onUsage);
+          await release.promise;
+          return `done:${prompt}`;
+        },
+      },
+    });
+    const script = `export const meta = { name: 'same_labels', description: 'same labels' }
+return await parallel([
+  () => agent('first prompt', { label: 'review' }),
+  () => agent('second prompt', { label: 'review' }),
+])`;
+    const { runId, promise } = manager.startInBackground(script, undefined, { concurrency: 2 });
+
+    try {
+      await waitFor(() => (reporters.size === 2 ? true : undefined), "both agents should start");
+      reporters.get("first prompt")?.({
+        input: 10,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 10,
+        cost: 0.01,
+      });
+      reporters.get("second prompt")?.({
+        input: 20,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 20,
+        cost: 0.02,
+      });
+
+      const agents = manager.getRun(runId)?.snapshot.agents ?? [];
+      assert.equal(agents.find((agent) => agent.prompt === "first prompt")?.tokens, 10);
+      assert.equal(agents.find((agent) => agent.prompt === "second prompt")?.tokens, 20);
+    } finally {
+      release.resolve();
+      await promise;
+    }
+  }),
+);
+
+test(
   "each agent's model is recorded for /workflows: explicit opts.model, else the main model",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent(), mainModel: "anthropic/claude-opus-4-8" });
