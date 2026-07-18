@@ -105,6 +105,62 @@ return a`,
   assert.equal(journal.length, 1, "only the final success is journaled");
 });
 
+test("runWorkflow retries schema noncompliance without rerunning a successful sibling", async () => {
+  const calls = { reviewer: 0, sibling: 0 };
+  const result = await runWorkflow(
+    `export const meta = { name: 'schema_retry', description: 'schema retry' }
+return await parallel([
+  () => agent('review', { label: 'reviewer' }),
+  () => agent('inspect', { label: 'sibling' }),
+])`,
+    {
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "inspect") {
+            calls.sibling++;
+            return "evidence";
+          }
+          calls.reviewer++;
+          if (calls.reviewer === 1) {
+            throw new WorkflowError("invalid structured output", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, {
+              recoverable: true,
+            });
+          }
+          return "reviewed";
+        },
+      },
+      agentRetries: 1,
+      persistLogs: false,
+    },
+  );
+
+  assert.deepEqual(result.result, ["reviewed", "evidence"]);
+  assert.deepEqual(calls, { reviewer: 2, sibling: 1 });
+});
+
+test("runWorkflow never automatically retries an agent marked retryable false", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'no_writer_retry', description: 'no writer retry' }
+return await agent('write files', { label: 'writer', retryable: false })`,
+        {
+          agent: {
+            async run() {
+              calls++;
+              return "";
+            },
+          },
+          agentRetries: 2,
+          persistLogs: false,
+        },
+      ),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_EMPTY_OUTPUT,
+  );
+  assert.equal(calls, 1);
+});
+
 test("runWorkflow throws the classified recoverable error when retries are exhausted", async () => {
   let calls = 0;
   const logs: string[] = [];

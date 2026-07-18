@@ -175,8 +175,8 @@ async function waitForSubagentIdle(session: IdleTrackedSession, signal?: AbortSi
  * Resolve a schema agent's result. If the tool was called, return the captured
  * value. Otherwise re-prompt up to maxSchemaRetries (tools restricted to
  * structured_output), then try strict schema-validated prose extraction, else
- * throw SCHEMA_NONCOMPLIANCE (non-recoverable — surfaced, never a silent null).
- * Module-level with an injected `lastText` so it is unit-testable.
+ * throw retryable SCHEMA_NONCOMPLIANCE so the workflow's bounded agent retry can
+ * start a fresh session. Module-level with an injected `lastText` for unit tests.
  */
 export async function resolveStructuredOutput<T>(
   session: StructuredSession,
@@ -220,7 +220,7 @@ export async function resolveStructuredOutput<T>(
   throw new WorkflowError(
     "Subagent did not produce valid structured_output after repair attempts",
     WorkflowErrorCode.SCHEMA_NONCOMPLIANCE,
-    { recoverable: false, agentLabel: options.label },
+    { recoverable: true, agentLabel: options.label },
   );
 }
 

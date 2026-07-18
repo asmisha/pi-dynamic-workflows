@@ -100,11 +100,15 @@ describe("resolveStructuredOutput", () => {
     assert.deepEqual(r, { word: "fromProse" });
   });
 
-  it("throws SCHEMA_NONCOMPLIANCE when repair and extraction both fail", async () => {
+  it("throws retryable SCHEMA_NONCOMPLIANCE when repair and extraction both fail", async () => {
     const { session, capture } = makeSession();
     await assert.rejects(
       () => resolveStructuredOutput(session, capture, Schema, opts, () => "no json at all"),
-      /structured_output/i,
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, WorkflowErrorCode.SCHEMA_NONCOMPLIANCE);
+        assert.equal((err as { recoverable?: boolean }).recoverable, true);
+        return true;
+      },
     );
   });
 

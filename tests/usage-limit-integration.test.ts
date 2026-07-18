@@ -43,10 +43,10 @@ async function loadFaux(): Promise<typeof import("@earendil-works/pi-ai")> {
 }
 
 /**
- * Run `fn` with an isolated HOME and a dummy provider key so hasConfiguredAuth()
- * passes via env — no real credentials are touched, and the faux api means the
- * key is never actually used. A faux "deepseek" provider is registered/torn down
- * around `fn`; `setResponses` queues the scripted turns.
+ * Run `fn` with isolated Pi settings and a dummy provider key so
+ * hasConfiguredAuth() passes via env — no real credentials are touched, and the
+ * faux api means the key is never actually used. A faux "deepseek" provider is
+ * registered/torn down around `fn`; `setResponses` queues the scripted turns.
  */
 async function withFauxSession(
   fn: (ctx: {
@@ -60,7 +60,11 @@ async function withFauxSession(
   const home = mkdtempSync(join(tmpdir(), "pi-dw-i26-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-i26-cwd-"));
   const prevKey = process.env.DEEPSEEK_API_KEY;
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.DEEPSEEK_API_KEY = "faux-dummy-key-not-used";
+  // An explicit host PI_CODING_AGENT_DIR overrides HOME. Isolate it too so a
+  // user's compaction settings cannot consume faux responses between test turns.
+  process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
   const faux = registerFauxProvider({
     provider: "deepseek",
     models: [{ id: "faux-deepseek", name: "Faux DeepSeek", contextWindow: 128000, maxTokens: 4096 }],
@@ -78,6 +82,8 @@ async function withFauxSession(
     faux.unregister();
     if (prevKey === undefined) delete process.env.DEEPSEEK_API_KEY;
     else process.env.DEEPSEEK_API_KEY = prevKey;
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
     rmSync(home, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   }

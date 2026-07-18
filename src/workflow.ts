@@ -192,7 +192,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
-  /** Whether this agent may be rerun after a durable agent-failure pause. Defaults to true. */
+  /** Whether automatic and durable failure recovery may rerun this agent. Defaults to true. */
   retryable?: boolean;
   /** Exclude tools that can change code, including shell, edit, write, and AST replacement tools. */
   readOnly?: boolean;
@@ -579,10 +579,10 @@ export async function runWorkflow<T = unknown>(
     shared.activeCalls++;
     const work = limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
-      const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
+      const mayRetry = agentOptions.retryable !== false;
+      const retryAttempts = mayRetry ? normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0) : 0;
       const maxAttempts = retryAttempts + 1;
       const durableAttempt = (cached?.status === "failed" ? (cached.attempt ?? 1) : 0) + 1;
-      const durableRetryable = agentOptions.retryable !== false;
 
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
 
@@ -668,7 +668,7 @@ export async function runWorkflow<T = unknown>(
             hash: callHash,
             result,
             attempt: durableAttempt,
-            retryable: durableRetryable,
+            retryable: mayRetry,
             label,
             phase: assignedPhase,
           });
@@ -708,7 +708,7 @@ export async function runWorkflow<T = unknown>(
               phase: assignedPhase,
             },
             attempt: durableAttempt,
-            retryable: durableRetryable,
+            retryable: mayRetry,
             label,
             phase: assignedPhase,
           });
