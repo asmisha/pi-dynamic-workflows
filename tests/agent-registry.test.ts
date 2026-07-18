@@ -174,6 +174,7 @@ function capturingAgent() {
     tier?: string;
     toolNames?: string[];
     disallowedToolNames?: string[];
+    readOnly?: boolean;
     instructions?: string;
     cwd?: string;
     cwdExists?: boolean;
@@ -185,6 +186,7 @@ function capturingAgent() {
         tier: options.tier as string | undefined,
         toolNames: options.toolNames as string[] | undefined,
         disallowedToolNames: options.disallowedToolNames as string[] | undefined,
+        readOnly: options.readOnly as boolean | undefined,
         instructions: options.instructions as string | undefined,
         cwd: options.cwd as string | undefined,
         cwdExists: typeof options.cwd === "string" ? existsSync(options.cwd) : undefined,
@@ -223,6 +225,15 @@ return r`;
     assert.deepEqual(seen[0].toolNames, ["read", "grep"], "allowlist forwarded");
     assert.deepEqual(seen[0].disallowedToolNames, ["write", "bash"], "denylist forwarded");
     assert.ok(seen[0].instructions?.includes("You are a security auditor."), "body prompt injected");
+  });
+
+  it("forwards the read-only flag", async () => {
+    const { seen, runner } = capturingAgent();
+    const script = `export const meta = { name: 'at', description: 'agentType' }
+await agent('audit', { label: 'a', readOnly: true })
+return {}`;
+    await runWorkflow(script, { agent: runner, persistLogs: false, agentRegistry: registry });
+    assert.equal(seen[0].readOnly, true);
   });
 
   it("explicit opts.model beats the agentType model", async () => {

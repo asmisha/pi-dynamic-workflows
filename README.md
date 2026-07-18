@@ -153,6 +153,7 @@ The essentials:
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
 | `retryable` | Whether an exhausted agent failure may pause the run for `/workflows retry`. Default `true`; set `false` for agents that edit files, post comments, submit forms, or can otherwise duplicate side effects. |
+| `readOnly` | Set `true` for reviewers/searchers to exclude code-writing tools (`bash`, `edit`, `write`, and AST replacement) while preserving read-only tools. |
 
 A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. The host `workflow({ resumeRunId: "...", reply: ... })` tool call validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. A workflow run may call `checkpoint()` at most once. `/workflows resume` is for paused/interrupted runs; `/workflows retry` is for runs paused by retryable agent failures. Ordinary failed runs remain terminal.
 

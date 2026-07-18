@@ -108,6 +108,50 @@ test("a successful real turn whose text merely mentions 'rate limit' is NOT misc
     assert.ok(typeof text === "string" && text.includes("Done."), `expected normal text, got ${String(text)}`);
   }));
 
+test("a read-only real subagent excludes write-capable tools and preserves read-only tools", () =>
+  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+    let activeTools: string[] = [];
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          pi.on("session_start", () => {
+            for (const name of ["ast_grep_search", "ast_grep_replace"]) {
+              pi.registerTool(
+                defineTool({
+                  name,
+                  description: `${name} test tool`,
+                  parameters: Type.Object({}),
+                  async execute() {
+                    return { content: [{ type: "text", text: "ok" }] };
+                  },
+                }),
+              );
+            }
+            activeTools = pi.getActiveTools();
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never, resourceLoader } });
+    await agent.run("review the code", { label: "read-only", readOnly: true });
+
+    assert.ok(activeTools.includes("read"), `expected read to remain active, got ${activeTools.join(", ")}`);
+    assert.ok(
+      activeTools.includes("ast_grep_search"),
+      `expected ast_grep_search to remain active, got ${activeTools.join(", ")}`,
+    );
+    for (const name of ["bash", "edit", "write", "ast_grep_replace"]) {
+      assert.ok(!activeTools.includes(name), `expected ${name} to be excluded, got ${activeTools.join(", ")}`);
+    }
+  }));
+
 test("a real subagent session binds extensions so session_start-registered tools become active", () =>
   withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
     let sessionStartRan = false;

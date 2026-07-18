@@ -194,6 +194,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   retries?: number;
   /** Whether this agent may be rerun after a durable agent-failure pause. Defaults to true. */
   retryable?: boolean;
+  /** Exclude tools that can change code, including shell, edit, write, and AST replacement tools. */
+  readOnly?: boolean;
   /** Run this agent in a different working directory (tools + session bind to it). */
   cwd?: string;
   /**
@@ -626,6 +628,7 @@ export async function runWorkflow<T = unknown>(
               modelRegistry: options.modelRegistry,
               toolNames: agentDef?.tools,
               disallowedToolNames: agentDef?.disallowedTools,
+              readOnly: agentOptions.readOnly,
               cwd: agentOptions.cwd ?? baseCwd,
               forkFrom: agentOptions.forkFrom,
               sessionPath: agentOptions.sessionPath,
@@ -1255,6 +1258,7 @@ function hashAgentCall(
     forkFrom: options.forkFrom ?? null,
     sessionPath: options.sessionPath ?? null,
     retryable: options.retryable ?? true,
+    readOnly: options.readOnly ?? false,
   });
   return createHash("sha256").update(identity).digest("hex");
 }

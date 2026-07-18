@@ -22,6 +22,8 @@ import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./m
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 import { resolveWorkflowSessionPath } from "./workflow-paths.js";
 
+const READ_ONLY_EXCLUDED_TOOL_NAMES = ["bash", "edit", "write", "ast_grep_replace"];
+
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
  * else the first balanced {...} or [...]. Best-effort (the schema check is the
@@ -467,6 +469,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   toolNames?: string[];
   /** Remove these coding-tool names after the allowlist (an agentType `disallowedTools` denylist). */
   disallowedToolNames?: string[];
+  /** Exclude tools that can change code, including shell, edit, write, and AST replacement tools. */
+  readOnly?: boolean;
   /**
    * With `schema`: how many extra repair turns to allow if the model finishes
    * without calling structured_output. Each retry re-prompts (tools restricted to
@@ -608,6 +612,9 @@ export class WorkflowAgent {
           ...this.sessionOptions,
           // Per-call model wins over any sessionOptions.model.
           ...(resolvedModel ? { model: resolvedModel } : {}),
+          ...(options.readOnly
+            ? { excludeTools: [...(this.sessionOptions.excludeTools ?? []), ...READ_ONLY_EXCLUDED_TOOL_NAMES] }
+            : {}),
         });
         // createAgentSession loads configured extensions, but hooks (including
         // compaction/autocontinue extensions and session_start tool setup) only run
