@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { defineTool, type ModelRegistry, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -14,7 +14,12 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { formatWorkflowFailure, WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
+import {
+  loadWorkflowModule,
+  parseWorkflowScript,
+  type WorkflowModuleDefinition,
+  type WorkflowRunResult,
+} from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
 
@@ -88,7 +93,7 @@ const workflowToolSchema = Type.Object({
   scriptPath: Type.Optional(
     Type.String({
       description:
-        "Absolute path to a workflow JavaScript file. Pass exactly one of script or scriptPath; the file is read once at launch and its contents are persisted for resume.",
+        "Absolute path to a trusted native ESM workflow exporting `meta` and `run(context)`. Normal Node.js imports are supported. Pass exactly one of script or scriptPath.",
     }),
   ),
   cwd: Type.Optional(
@@ -327,7 +332,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       "To start, pass exactly one source: inline script or absolute scriptPath. To answer a paused checkpoint, pass only resumeRunId and reply.",
     ].join(" "),
     promptSnippet:
-      "Run a deterministic workflow from one source: inline script or absolute scriptPath. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
+      "Run a workflow from one source: an inline deterministic script, or a trusted native ESM scriptPath exporting `meta` and `run(context)`.",
     // Lazy accessor: the SDK re-reads definition.promptGuidelines on every
     // tool-registry refresh, so each read sees the manager's registry as it
     // stands then (setModelRegistry runs on session_start, after tool creation).
@@ -337,13 +342,14 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return [
         "Use workflow only when the user explicitly asks for a workflow, fan-out, or multi-agent orchestration — for decomposable work (repo inspection, independent checks, multi-perspective review, fan-out/fan-in synthesis), not a single quick read/edit.",
         [
-          "Use exactly one source: script for generated JavaScript, or scriptPath for a trusted reusable local workflow file. Scripts use no fences, prose, TypeScript/imports/require/fs/Date.now()/Math.random()/new Date(). Skeleton:",
+          "Use exactly one source. For generated inline JavaScript, use no fences, prose, TypeScript/imports/require/fs/Date.now()/Math.random()/new Date(). Inline skeleton:",
           "export const meta = { name: 'short_snake_case', description: 'non-empty', phases: [{ title: 'Phase' }] }",
           "phase('Phase')",
           "const results = await parallel(items.map(item => () => agent('task + context + paths', { label: 'unique 2-4 words', tier: 'small' })))",
           "return { ok: true, verdict: '...', results }",
+          "For a trusted reusable scriptPath, use native ESM: export literal `meta` and `async function run(context)`, use normal Node.js imports, and destructure workflow APIs from context. Keep its source files unchanged while a run is resumable.",
         ].join("\n"),
-        "Globals: agent(prompt, opts), parallel(thunks: Array<() => Promise<unknown>>), pipeline(items, ...stages), phase(title), bash(cmd, {cwd?, timeoutMs?}), log(msg), args, cwd, budget, checkpoint(question). checkpoint always pauses and transfers its question to the parent conversation; continue the same run with the host workflow({resumeRunId, reply}) tool call.",
+        "Inline globals and native run(context) fields: agent(prompt, opts), parallel(thunks: Array<() => Promise<unknown>>), pipeline(items, ...stages), phase(title), bash(cmd, {cwd?, timeoutMs?}), log(msg), args, cwd, budget, checkpoint(question). checkpoint always pauses and transfers its question to the parent conversation; continue the same run with the host workflow({resumeRunId, reply}) tool call.",
         "parallel() and pipeline() reject on branch failure. For best effort, catch inside each branch or pipeline stage (for example, () => agent(...).catch(() => fallback)); never attach .catch to parallel(...) or pipeline(...), because the aggregate can reject while sibling branches are still running. Results keep input order on success.",
         "bash(cmd) runs a shell command and returns {pid, exitCode, stdoutFile, stderrFile}. Full stdout/stderr go to those files; do not paste output directly through the workflow result. Use it for mechanical steps (grep/build/test), check exitCode, then pass the file paths to agent() so subagents can read/grep the files. Results are journaled so resume replays them without re-running.",
         "Subagents have NO parent context unless you give it to them: each prompt must carry the task, relevant paths, and expected output. For machine-readable output pass a plain JSON Schema via opts.schema (not TypeScript/TypeBox). opts.cwd runs an agent in another directory. Agent calls are durable-retryable by default; set opts.retryable = false for agents that may edit files, post comments, submit forms, or otherwise duplicate side effects if rerun. Read-only reviewers/searchers should stay retryable. Session args: opts.forkFrom forks an existing Pi session file as read-only starting context; opts.sessionPath persists/continues this subagent's working session (relative paths resolve under ~/.pi/workflows/sessions/); using both forks into a new persistent session and is invalid if the target already exists. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle still applies. With multiple phases, call phase('Exact Title') before each phase's work so agents group correctly. End with a synthesis agent when combining results; return a compact JSON-serializable value.",
@@ -375,16 +381,18 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         };
       }
 
-      const script = resolveWorkflowScript(params);
+      const source = await resolveWorkflowSource(params);
       const runCwd = resolveWorkflowCwd(params.cwd);
-      const parsed = parseWorkflowScript(script);
+      const parsed = source.workflowModule ? { meta: source.workflowModule.meta } : parseWorkflowScript(source.script);
 
       // Background execution is the default: return immediately so the turn ends
       // and the user isn't blocked. The result is delivered back into the
       // conversation when the run finishes (see installResultDelivery). Only an
       // explicit `background: false` blocks for the result inline.
       if (params.background ?? true) {
-        const { runId } = manager.startInBackground(script, params.args, {
+        const { runId } = manager.startInBackground(source.script, params.args, {
+          workflowModulePath: source.workflowModulePath,
+          workflowModule: source.workflowModule,
           maxAgents: params.maxAgents,
           concurrency: params.concurrency,
           agentRetries: params.agentRetries,
@@ -412,7 +420,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 
       let result: WorkflowRunResult;
       try {
-        result = await manager.runSync(script, params.args, {
+        result = await manager.runSync(source.script, params.args, {
+          workflowModulePath: source.workflowModulePath,
+          workflowModule: source.workflowModule,
           maxAgents: params.maxAgents,
           concurrency: params.concurrency,
           agentRetries: params.agentRetries,
@@ -621,8 +631,12 @@ function validateAbsolutePath(value: unknown, field: string): asserts value is s
   }
 }
 
-function resolveWorkflowScript(input: WorkflowToolInput): string {
-  if (input.script !== undefined) return normalizeWorkflowScript(input.script);
+async function resolveWorkflowSource(input: WorkflowToolInput): Promise<{
+  script: string;
+  workflowModulePath?: string;
+  workflowModule?: WorkflowModuleDefinition;
+}> {
+  if (input.script !== undefined) return { script: normalizeWorkflowScript(input.script) };
   if (!input.scriptPath) throw new Error("workflow requires exactly one of `script` or `scriptPath`");
   try {
     const stat = statSync(input.scriptPath);
@@ -630,14 +644,15 @@ function resolveWorkflowScript(input: WorkflowToolInput): string {
     if (stat.size > MAX_WORKFLOW_SCRIPT_BYTES) {
       throw new Error(`file exceeds ${MAX_WORKFLOW_SCRIPT_BYTES} byte limit`);
     }
-    const source = readFileSync(input.scriptPath);
-    if (source.byteLength > MAX_WORKFLOW_SCRIPT_BYTES) {
-      throw new Error(`file exceeds ${MAX_WORKFLOW_SCRIPT_BYTES} byte limit`);
-    }
-    return normalizeWorkflowScript(source.toString("utf-8"));
+    const workflowModule = await loadWorkflowModule(input.scriptPath);
+    return {
+      script: `export const meta = ${JSON.stringify(workflowModule.meta)}`,
+      workflowModulePath: input.scriptPath,
+      workflowModule,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Could not read workflow scriptPath ${input.scriptPath}: ${message}`, { cause: error });
+    throw new Error(`Could not load workflow scriptPath ${input.scriptPath}: ${message}`, { cause: error });
   }
 }
 

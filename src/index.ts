@@ -54,10 +54,12 @@ export type {
   WorkflowBashResult,
   WorkflowMeta,
   WorkflowMetaPhase,
+  WorkflowModuleDefinition,
   WorkflowRunOptions,
   WorkflowRunResult,
+  WorkflowRuntimeContext,
 } from "./workflow.js";
-export { parseWorkflowScript, runWorkflow } from "./workflow.js";
+export { loadWorkflowModule, parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { buildForcedWorkflowPrompt, registerWorkflowCommands, WORKFLOW_TOOL_NAME } from "./workflow-commands.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";

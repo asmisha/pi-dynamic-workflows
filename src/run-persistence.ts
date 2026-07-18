@@ -61,7 +61,10 @@ export interface AgentFailureRetryState {
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
+  /** Inline source or persisted metadata header for a native module workflow. */
   script: string;
+  /** Trusted native ESM entry point for a file-backed workflow. */
+  workflowModulePath?: string;
   args?: unknown;
   /** Effective cwd used by this run; absent only on legacy persisted runs. */
   cwd?: string;

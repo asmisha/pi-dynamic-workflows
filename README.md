@@ -35,7 +35,7 @@ Pi writes the script and runs it in the background — your turn ends immediatel
 
 ## What a workflow looks like
 
-Plain JavaScript. The first statement exports literal metadata; then you orchestrate:
+Inline workflows are plain JavaScript: the first statement exports literal metadata, then the script orchestrates with runtime globals:
 
 ```js
 export const meta = {
@@ -60,6 +60,27 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 
 `agent()` spawns an isolated subagent, `parallel()` runs many at once, `phase()` groups them in the live view, and `tier` routes each one to the right model. That's the whole idea.
 
+Reusable file-backed workflows are trusted native ESM modules, so they can use normal JavaScript imports:
+
+```js
+// workflow.mjs
+import { audit } from './audit.mjs'
+
+export const meta = { name: 'shared_audit', description: 'Audit with shared code' }
+
+export async function run(context) {
+  return await audit(context, context.args.target)
+}
+
+// audit.mjs
+export async function audit({ agent, checkpoint }, target) {
+  const answer = await checkpoint(`Audit ${target}?`)
+  return await agent(`Audit ${target}; user answer: ${answer}`)
+}
+```
+
+Pass `workflow.mjs` through `scriptPath`. The exported `run(context)` receives the same `agent`, `parallel`, `pipeline`, `phase`, `bash`, `checkpoint`, `log`, `args`, `cwd`, and `budget` APIs available as globals in inline workflows. Native modules execute as trusted Node.js code; keep the entry and imported source files unchanged while a run remains resumable.
+
 ## Highlights
 
 - **Fan-out orchestration** — `agent()`, `parallel()`, `pipeline()`, `phase()` in a sandboxed script. Up to 16 concurrent / 1000 total subagents; intermediate results stay in variables, not the chat.
@@ -75,7 +96,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 
 | Claude Code dynamic workflows | pi-dynamic-workflows (on Pi) |
 | --- | --- |
-| Code-mode orchestration — the model writes a script that drives subagents | A JS `workflow` tool running `agent()` / `parallel()` / `pipeline()` / `phase()` in a vm sandbox |
+| Code-mode orchestration — the model writes a script that drives subagents | A JS `workflow` tool running inline scripts in a VM or trusted file-backed workflows as native ESM |
 | Subagents with isolated context | Fresh in-memory Pi sessions; results held in script variables, not the chat |
 | Structured outputs | JSON-Schema `schema` → a validated object, with bounded repair if the model misses |
 | Background runs | Non-blocking by default, a live task panel, and auto-continue delivery |
@@ -143,7 +164,7 @@ For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (
 
 The live "Workflows running" panel is configured in the same `~/.pi/workflows/settings.json`: `"progressPanelMode"` is `"compact"` (default, one line per run) or `"detailed"` (per-phase/per-agent rows with tokens, cost, and a live tok/s rate), and `"progressPanelMaxAgents"` (default `8`, range `1`–`1000`) caps how many agents each phase shows in detailed mode before a `… N earlier agents` line. Toggle them live with `/workflows-progress compact|detailed` and `/workflows-progress-max <N>` — changes take effect on the next render without a restart.
 
-Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()`, and `require`/`import`/`fs`/network are unavailable, so runs stay reproducible — which is what makes resume reliable.
+Inline workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()`, and `require`/`import`/`fs`/network are unavailable. File-backed `scriptPath` workflows are trusted native ESM modules and are responsible for remaining deterministic and unchanged while a run is resumable.
 
 ## Development
 

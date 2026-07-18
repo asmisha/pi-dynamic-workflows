@@ -19,9 +19,11 @@ import {
 } from "./run-persistence.js";
 import {
   type JournalEntry,
+  loadWorkflowModule,
   type PendingCheckpoint,
   parseWorkflowScript,
   runWorkflow,
+  type WorkflowModuleDefinition,
   type WorkflowRunResult,
 } from "./workflow.js";
 
@@ -83,8 +85,10 @@ export interface ManagedRun {
   error?: WorkflowError;
   controller: AbortController;
   startedAt: Date;
-  /** The real script, kept so the run can be resumed. */
+  /** Inline script or persisted metadata header for a native module workflow. */
   script: string;
+  /** Trusted native ESM entry point for file-backed workflows. */
+  workflowModulePath?: string;
   args?: unknown;
   /** Parent Pi session that owns delivery and checkpoint replies. */
   sessionId?: string;
@@ -123,6 +127,10 @@ export interface ManagedRun {
 export interface ExecOptions {
   /** Effective cwd for the workflow and its default subagent/bash execution. */
   cwd?: string;
+  /** Trusted native ESM entry point for a file-backed workflow. */
+  workflowModulePath?: string;
+  /** Already-loaded module for the initial execution; resumes load workflowModulePath. */
+  workflowModule?: WorkflowModuleDefinition;
   /** Replay these journaled call results for the unchanged prefix (resume). */
   resumeJournal?: Map<number, JournalEntry>;
   /** Retry these failed structural agent calls while replaying successful siblings. */
@@ -276,7 +284,7 @@ export class WorkflowManager extends EventEmitter {
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
     const runId = generateRunId();
     const controller = new AbortController();
-    const parsed = parseWorkflowScript(script);
+    const parsed = exec.workflowModule ? { meta: exec.workflowModule.meta } : parseWorkflowScript(script);
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${runId}`);
 
@@ -297,6 +305,7 @@ export class WorkflowManager extends EventEmitter {
       controller,
       startedAt: new Date(),
       script,
+      workflowModulePath: exec.workflowModulePath,
       args,
       sessionId: this.sessionId,
       cwd: exec.cwd ?? this.cwd,
@@ -314,6 +323,7 @@ export class WorkflowManager extends EventEmitter {
         runId,
         workflowName: parsed.meta.name,
         script,
+        workflowModulePath: managed.workflowModulePath,
         args,
         cwd: managed.cwd,
         executionOptions: managed.executionOptions,
@@ -362,7 +372,7 @@ export class WorkflowManager extends EventEmitter {
 
   /** Build a fresh managed run with an empty snapshot. */
   private createManaged(script: string, args?: unknown, exec: ExecOptions = {}): ManagedRun {
-    const parsed = parseWorkflowScript(script);
+    const parsed = exec.workflowModule ? { meta: exec.workflowModule.meta } : parseWorkflowScript(script);
     return {
       runId: generateRunId(),
       status: "running",
@@ -380,6 +390,7 @@ export class WorkflowManager extends EventEmitter {
       controller: new AbortController(),
       startedAt: new Date(),
       script,
+      workflowModulePath: exec.workflowModulePath,
       args,
       sessionId: this.sessionId,
       cwd: exec.cwd ?? this.cwd,
@@ -464,6 +475,9 @@ export class WorkflowManager extends EventEmitter {
     }
     this.startHeartbeat(managed);
     try {
+      const workflowModule =
+        exec.workflowModule ??
+        (managed.workflowModulePath ? await loadWorkflowModule(managed.workflowModulePath) : undefined);
       const result = await runWorkflow(script, {
         runId: managed.runId,
         cwd: managed.cwd,
@@ -477,6 +491,7 @@ export class WorkflowManager extends EventEmitter {
         maxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget,
+        workflowModule,
         initialTokenUsage,
         onRuntimeOwnedWorkStart: observeRuntimeOwnedWork,
         onAgentFailureEscaped: (callId) => escapedAgentFailureCallIds.add(callId),
@@ -799,6 +814,7 @@ export class WorkflowManager extends EventEmitter {
           // Persist the real script + journal so the run can be resumed. Runs live
           // in workflow run storage — protect via directory permissions, not blanking.
           script: managed.script,
+          workflowModulePath: managed.workflowModulePath,
           args: managed.args,
           cwd: managed.cwd,
           executionOptions: managed.executionOptions,
@@ -989,6 +1005,7 @@ export class WorkflowManager extends EventEmitter {
       controller: new AbortController(),
       startedAt: new Date(),
       script: persisted.script,
+      workflowModulePath: persisted.workflowModulePath,
       args: persisted.args,
       sessionId: persisted.sessionId,
       cwd: persisted.cwd ?? this.cwd,

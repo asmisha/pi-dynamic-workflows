@@ -667,7 +667,7 @@ test("foreground execution loads scriptPath once and runs in the requested cwd",
     const scriptPath = join(hostCwd, "workflow.mjs");
     writeFileSync(
       scriptPath,
-      "export const meta = { name: 'file_run', description: 'file source run' }\nawait agent('ok')\nreturn cwd\n",
+      "export const meta = { name: 'file_run', description: 'file source run' }\nexport async function run({ agent, cwd }) {\n  await agent('ok')\n  return cwd\n}\n",
     );
     const manager = new WorkflowManager({ cwd: hostCwd, agent: { run: async () => "ok" } as any });
     const tool = createWorkflowTool({ cwd: hostCwd, manager });

@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { closeSync, mkdirSync, openSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
@@ -94,6 +95,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
   tokenBudget?: number | null;
+  /** Trusted native ESM workflow loaded from scriptPath. Inline workflows omit this. */
+  workflowModule?: WorkflowModuleDefinition;
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
@@ -219,6 +222,31 @@ export interface WorkflowBashResult {
   stderrFile: string;
 }
 
+export interface WorkflowRuntimeContext {
+  agent: (prompt: string, options?: AgentOptions) => Promise<unknown>;
+  bash: (command: string, options?: { cwd?: string; timeoutMs?: number | null }) => Promise<WorkflowBashResult>;
+  parallel: (thunks: Array<() => Promise<unknown>>) => Promise<unknown[]>;
+  pipeline: (
+    items: unknown[],
+    ...stages: Array<(previous: unknown, original: unknown, index: number) => unknown>
+  ) => Promise<unknown[]>;
+  checkpoint: (question: string) => unknown;
+  log: (message: string) => void;
+  phase: (title: string, options?: { budget?: number }) => void;
+  args: unknown;
+  cwd: string;
+  budget: {
+    total: number | null;
+    spent: () => number;
+    remaining: () => number;
+  };
+}
+
+export interface WorkflowModuleDefinition {
+  meta: WorkflowMeta;
+  run: (context: WorkflowRuntimeContext) => unknown | Promise<unknown>;
+}
+
 /** Persisted identity of the one checkpoint currently awaiting a parent-chat reply. */
 export interface PendingCheckpoint {
   callIndex: number;
@@ -300,7 +328,9 @@ export async function runWorkflow<T = unknown>(
   options: WorkflowRunOptions = {},
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
-  const { meta, body } = parseWorkflowScript(script);
+  const { meta, body } = options.workflowModule
+    ? { meta: options.workflowModule.meta, body: "" }
+    : parseWorkflowScript(script);
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
@@ -898,7 +928,7 @@ export async function runWorkflow<T = unknown>(
     });
   };
 
-  const context = vm.createContext({
+  const workflowContext: WorkflowRuntimeContext = Object.freeze({
     agent,
     bash,
     parallel,
@@ -908,25 +938,34 @@ export async function runWorkflow<T = unknown>(
     phase,
     args: options.args,
     cwd: options.cwd ?? process.cwd(),
-    process: Object.freeze({ cwd: () => options.cwd ?? process.cwd() }),
-    // Checkpoint workflows must use the provided sequential/parallel primitives;
-    // native Promise scheduling can detach work from the durable journal boundary.
-    Promise: /\bcheckpoint\s*\(/.test(body) ? undefined : Promise,
     budget,
-    console: {
-      log,
-      info: log,
-      warn: (m: unknown) => log(`[warn] ${String(m)}`),
-      error: (m: unknown) => log(`[error] ${String(m)}`),
-    },
-    // Object/Array/JSON/Math/Date/Promise/Set/Map/etc. come from the vm realm
-    // itself — we deliberately do NOT inject host built-ins, whose .constructor
-    // would be the host Function (a determinism-guard bypass). Math/Date are
-    // neutered in-realm by DETERMINISM_PRELUDE below.
   });
 
-  const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
-  const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+  let result: unknown;
+  if (options.workflowModule) {
+    result = await options.workflowModule.run(workflowContext);
+  } else {
+    const context = vm.createContext({
+      ...workflowContext,
+      process: Object.freeze({ cwd: () => options.cwd ?? process.cwd() }),
+      // Checkpoint workflows must use the provided sequential/parallel primitives;
+      // native Promise scheduling can detach work from the durable journal boundary.
+      Promise: /\bcheckpoint\s*\(/.test(body) ? undefined : Promise,
+      console: {
+        log,
+        info: log,
+        warn: (m: unknown) => log(`[warn] ${String(m)}`),
+        error: (m: unknown) => log(`[error] ${String(m)}`),
+      },
+      // Object/Array/JSON/Math/Date/Promise/Set/Map/etc. come from the vm realm
+      // itself — we deliberately do NOT inject host built-ins, whose .constructor
+      // would be the host Function (a determinism-guard bypass). Math/Date are
+      // neutered in-realm by DETERMINISM_PRELUDE below.
+    });
+    result = await new vm.Script(`${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`, {
+      filename: `${meta.name || "workflow"}.js`,
+    }).runInContext(context);
+  }
   if (shared.activeCalls > 0) {
     throw new WorkflowError(
       "workflow returned while runtime work was still active; await all work before returning",
@@ -1014,6 +1053,34 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
   return {
     meta,
     body: script.slice(0, first.start) + script.slice(first.end),
+  };
+}
+
+export async function loadWorkflowModule(modulePath: string): Promise<WorkflowModuleDefinition> {
+  let loaded: Record<string, unknown>;
+  try {
+    loaded = (await import(pathToFileURL(modulePath).href)) as Record<string, unknown>;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not load workflow module ${modulePath}: ${message}`, { cause: error });
+  }
+
+  if (!Object.hasOwn(loaded, "meta")) {
+    throw new Error(`Workflow module ${modulePath} must export \`meta\``);
+  }
+  try {
+    validateMeta(loaded.meta);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Workflow module ${modulePath} has invalid \`meta\`: ${message}`, { cause: error });
+  }
+  if (typeof loaded.run !== "function") {
+    throw new Error(`Workflow module ${modulePath} must export function \`run(context)\``);
+  }
+
+  return {
+    meta: loaded.meta,
+    run: loaded.run as WorkflowModuleDefinition["run"],
   };
 }
 

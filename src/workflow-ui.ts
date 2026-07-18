@@ -520,7 +520,10 @@ export function openWorkflowNavigator(
               ui.notify(id ? `Cannot restart ${id} (no persisted script)` : "No run selected to restart", "warning");
               break;
             }
-            const { runId: newId } = manager.startInBackground(run.script, run.args, { cwd: run.cwd });
+            const { runId: newId } = manager.startInBackground(run.script, run.args, {
+              cwd: run.cwd,
+              workflowModulePath: run.workflowModulePath,
+            });
             ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
             break;
           }
