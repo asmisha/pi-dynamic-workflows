@@ -331,9 +331,16 @@ test("runWorkflow aggregates absolute live usage across parallel agents without 
     b: { input: 15, output: 7, total: 22, cost: 0.022, cacheRead: 3, cacheWrite: 1 },
   };
   const runner = {
-    async run(prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
-      if (options.onUsage) reporters.set(prompt, options.onUsage);
+    async run(
+      prompt: string,
+      options: {
+        onUsage?: (usage: AgentUsage) => void;
+        onUsageUpdate?: (usage: AgentUsage) => void;
+      },
+    ) {
+      if (options.onUsageUpdate) reporters.set(prompt, options.onUsageUpdate);
       await release.promise;
+      options.onUsageUpdate?.(finalUsage[prompt]);
       options.onUsage?.(finalUsage[prompt]);
       return `ok:${prompt}`;
     },
@@ -421,15 +428,15 @@ test("runWorkflow settles timed-out attempts before starting a retry", async () 
   let attempt = 0;
   let endedTokens = 0;
   const runner = {
-    async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+    async run(_prompt: string, options: { onUsageUpdate?: (usage: AgentUsage) => void }) {
       attempt++;
       if (attempt === 1) {
-        options.onUsage?.({ input: 10, output: 0, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+        options.onUsageUpdate?.({ input: 10, output: 0, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
         await new Promise((resolve) => setTimeout(resolve, 30));
-        options.onUsage?.({ input: 20, output: 0, total: 20, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
+        options.onUsageUpdate?.({ input: 20, output: 0, total: 20, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
         return "too late";
       }
-      options.onUsage?.({ input: 5, output: 0, total: 5, cost: 0.005, cacheRead: 0, cacheWrite: 0 });
+      options.onUsageUpdate?.({ input: 5, output: 0, total: 5, cost: 0.005, cacheRead: 0, cacheWrite: 0 });
       return "ok";
     },
   };
@@ -450,6 +457,30 @@ return await agent('work', { label: 'worker', timeoutMs: 5 })`,
   assert.equal(result.tokenUsage.total, 25);
   assert.ok(Math.abs(result.tokenUsage.cost - 0.025) < 1e-9);
   assert.equal(endedTokens, 25);
+});
+
+test("runWorkflow bounds cleanup and does not retry a timed-out runner that never settles", async () => {
+  let attempts = 0;
+  const runner = {
+    async run() {
+      attempts++;
+      return new Promise<never>(() => {});
+    },
+  };
+  const started = Date.now();
+
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'stuck_timeout', description: 'stuck timeout' }
+return await agent('work', { label: 'worker', timeoutMs: 5 })`,
+      { agent: runner, agentRetries: 1, persistLogs: false },
+    ),
+    (error: unknown) =>
+      error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_TIMEOUT && !error.recoverable,
+  );
+
+  assert.equal(attempts, 1, "an abandoned attempt must not overlap a retry");
+  assert.ok(Date.now() - started < 2500, "timeout cleanup must remain bounded");
 });
 
 test("meta.model is parsed and routes as the default model for agents", async () => {

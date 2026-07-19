@@ -172,8 +172,13 @@ test("live usage removes an assistant response discarded by SDK auto-retry", () 
     ]);
 
     const snapshots: AgentUsage[] = [];
+    const finalUsage: AgentUsage[] = [];
     const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
-    const text = await agent.run("do the task", { label: "auto-retry", onUsage: (usage) => snapshots.push(usage) });
+    const text = await agent.run("do the task", {
+      label: "auto-retry",
+      onUsageUpdate: (usage) => snapshots.push(usage),
+      onUsage: (usage) => finalUsage.push(usage),
+    });
 
     assert.equal(text, "done");
     assert.ok((snapshots[0]?.total ?? 0) > 0, "the failed response is visible before SDK retry");
@@ -184,6 +189,7 @@ test("live usage removes an assistant response discarded by SDK auto-retry", () 
       snapshots[resetIndex + 1],
       "final usage contains only the replacement response",
     );
+    assert.deepEqual(finalUsage, [snapshots[snapshots.length - 1]], "legacy onUsage remains one-shot");
   }));
 
 test("a real subagent session binds extensions so session_start-registered tools become active", () =>

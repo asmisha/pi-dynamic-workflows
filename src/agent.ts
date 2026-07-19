@@ -417,11 +417,10 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   tools?: ToolDefinition[];
   instructions?: string;
   signal?: AbortSignal;
-  /**
-   * Called with this subagent's cumulative usage after each assistant response
-   * and once more before disposal. `total === 0` means the provider reported no usage.
-   */
+  /** Called once before disposal with this subagent run's final usage. */
   onUsage?: (usage: AgentUsage) => void;
+  /** Called with cumulative usage after each completed assistant response or SDK retry rollback. */
+  onUsageUpdate?: (usage: AgentUsage) => void;
   /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`. When it can't be resolved, the session default is used and
@@ -642,9 +641,9 @@ export class WorkflowAgent {
     };
     const usage: AgentUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
     let lastAssistantUsage: AgentUsage | undefined;
-    const emitUsage = () => {
+    const emitUsage = (callback: ((usage: AgentUsage) => void) | undefined) => {
       try {
-        options.onUsage?.({ ...usage });
+        callback?.({ ...usage });
       } catch {
         // Usage is best-effort; never let its observer mask the real result/error.
       }
@@ -656,7 +655,7 @@ export class WorkflowAgent {
       usage.cacheWrite += change.cacheWrite * direction;
       usage.total += change.total * direction;
       usage.cost += change.cost * direction;
-      emitUsage();
+      emitUsage(options.onUsageUpdate);
     };
     const recordAssistantUsage = (message: AssistantMessage) => {
       lastAssistantUsage = {
@@ -679,7 +678,7 @@ export class WorkflowAgent {
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
-      if (options.onHistory || options.onUsage) {
+      if (options.onHistory || options.onUsageUpdate) {
         removeSessionListener = session.subscribe((event) => {
           maybeEmitHistory();
           if (event.type === "message_end" && event.message.role === "assistant") {
@@ -727,7 +726,7 @@ export class WorkflowAgent {
       } catch {
         // History is diagnostic only; never let it mask the real result/error.
       }
-      emitUsage();
+      emitUsage(options.onUsage);
       session.dispose();
       forked?.cleanup();
     }

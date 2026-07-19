@@ -364,8 +364,8 @@ test(
     const manager = new WorkflowManager({
       cwd,
       agent: {
-        async run(_prompt: string, options?: { onUsage?: (usage: AgentUsage) => void }) {
-          reportUsage = options?.onUsage;
+        async run(_prompt: string, options?: { onUsageUpdate?: (usage: AgentUsage) => void }) {
+          reportUsage = options?.onUsageUpdate;
           started.resolve();
           await gate.promise;
           return "done";
@@ -403,8 +403,8 @@ test(
     const manager = new WorkflowManager({
       cwd,
       agent: {
-        async run(prompt: string, options?: { onUsage?: (usage: AgentUsage) => void }) {
-          if (options?.onUsage) reporters.set(prompt, options.onUsage);
+        async run(prompt: string, options?: { onUsageUpdate?: (usage: AgentUsage) => void }) {
+          if (options?.onUsageUpdate) reporters.set(prompt, options.onUsageUpdate);
           await release.promise;
           return `done:${prompt}`;
         },

@@ -25,6 +25,8 @@ import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
+const AGENT_TIMEOUT_CLEANUP_GRACE_MS = 1000;
+
 export interface WorkflowMetaPhase {
   title: string;
   detail?: string;
@@ -451,7 +453,9 @@ export async function runWorkflow<T = unknown>(
     remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.spent)),
   });
 
+  let abandonedAgentError: WorkflowError | undefined;
   const throwIfAborted = () => {
+    if (abandonedAgentError) throw abandonedAgentError;
     if (options.signal?.aborted) {
       throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
     }
@@ -587,6 +591,7 @@ export async function runWorkflow<T = unknown>(
 
     shared.activeCalls++;
     const work = limiter(async () => {
+      throwIfAborted();
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const mayRetry = agentOptions.retryable !== false;
       const defaultRetries = agentOptions.readOnly
@@ -670,7 +675,19 @@ export async function runWorkflow<T = unknown>(
                 // Make the silent degrade visible in /workflows, not just console.
                 log(`${label}: model "${spec}" unavailable — using the session default`);
               },
-              onUsage: updateUsage,
+              onUsageUpdate: updateUsage,
+              onUsage: (finalUsage) => {
+                if (
+                  usage?.input !== finalUsage.input ||
+                  usage?.output !== finalUsage.output ||
+                  usage?.cacheRead !== finalUsage.cacheRead ||
+                  usage?.cacheWrite !== finalUsage.cacheWrite ||
+                  usage?.total !== finalUsage.total ||
+                  usage?.cost !== finalUsage.cost
+                ) {
+                  updateUsage(finalUsage);
+                }
+              },
               onHistory: (history: AgentHistoryEntry[]) => {
                 options.onAgentHistory?.({ callId, label, phase: assignedPhase, history });
               },
@@ -716,6 +733,9 @@ export async function runWorkflow<T = unknown>(
           if (options.signal?.aborted) throw error;
 
           const workflowError = wrapError(error, { agentLabel: label, callId });
+          if (workflowError.code === WorkflowErrorCode.AGENT_TIMEOUT && !workflowError.recoverable) {
+            abandonedAgentError ??= workflowError;
+          }
           logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
           commitUsage(null);
 
@@ -1003,6 +1023,7 @@ export async function runWorkflow<T = unknown>(
       filename: `${meta.name || "workflow"}.js`,
     }).runInContext(context);
   }
+  if (abandonedAgentError) throw abandonedAgentError;
   if (shared.activeCalls > 0) {
     throw new WorkflowError(
       "workflow returned while runtime work was still active; await all work before returning",
@@ -1496,7 +1517,21 @@ async function withTimeout<T>(
   if (outcome.type === "resolved") return outcome.value;
   if (outcome.type === "rejected") throw outcome.error;
 
-  await settled;
+  let cleanupTimer: NodeJS.Timeout | undefined;
+  const cleanupFinished = await Promise.race([
+    settled.then(() => true),
+    new Promise<false>((resolve) => {
+      cleanupTimer = setTimeout(() => resolve(false), AGENT_TIMEOUT_CLEANUP_GRACE_MS);
+    }),
+  ]);
+  if (cleanupTimer) clearTimeout(cleanupTimer);
+  if (!cleanupFinished) {
+    throw new WorkflowError(
+      `Agent "${label}" timed out after ${ms}ms and did not stop within ${AGENT_TIMEOUT_CLEANUP_GRACE_MS}ms`,
+      WorkflowErrorCode.AGENT_TIMEOUT,
+      { recoverable: false },
+    );
+  }
   throw new WorkflowError(
     `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
     WorkflowErrorCode.AGENT_TIMEOUT,
