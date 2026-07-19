@@ -619,7 +619,6 @@ export async function runWorkflow<T = unknown>(
           shared.tokenUsage.cacheWrite += next.cacheWrite - (previous?.cacheWrite ?? 0);
           const tokenDelta = next.total - (previous?.total ?? 0);
           shared.tokenUsage.total += tokenDelta;
-          shared.spent += tokenDelta;
           usage = next;
           options.onAgentUsage?.({
             callId,
@@ -632,6 +631,7 @@ export async function runWorkflow<T = unknown>(
         const commitUsage = (result: unknown) => {
           let tokens = usage?.total ?? 0;
           if (tokens > 0) {
+            shared.spent += tokens;
             committedTokens += tokens;
             return;
           }

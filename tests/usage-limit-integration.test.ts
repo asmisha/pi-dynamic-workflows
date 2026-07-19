@@ -114,6 +114,31 @@ test("a successful real turn whose text merely mentions 'rate limit' is NOT misc
     assert.ok(typeof text === "string" && text.includes("Done."), `expected normal text, got ${String(text)}`);
   }));
 
+test("onUsage alone receives one nonzero final snapshot from a real subagent session", () =>
+  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+    setResponses([fauxAssistantMessage("done", { stopReason: "stop" })]);
+    const snapshots: AgentUsage[] = [];
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+
+    const text = await agent.run("do the task", {
+      label: "final-usage-only",
+      onUsage: (usage) => snapshots.push(usage),
+    });
+
+    assert.equal(text, "done");
+    assert.equal(snapshots.length, 1);
+    const usage = snapshots[0];
+    assert.ok(usage.total > 0);
+    assert.deepEqual(usage, {
+      input: usage.input,
+      output: 1,
+      cacheRead: usage.cacheRead,
+      cacheWrite: usage.cacheWrite,
+      total: usage.input + 1 + usage.cacheRead + usage.cacheWrite,
+      cost: 0,
+    });
+  }));
+
 test("a read-only real subagent excludes write-capable tools and preserves read-only tools", () =>
   withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
     let activeTools: string[] = [];

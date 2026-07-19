@@ -389,6 +389,60 @@ return results`;
   assert.equal(liveTotals[liveTotals.length - 1], 45, "the final emitted aggregate stays exact");
 });
 
+test("provisional SDK-retry usage does not block a concurrent pipeline stage", async () => {
+  const provisionalReported = createDeferred<void>();
+  const rollBackProvisional = createDeferred<void>();
+  const usage = (total: number): AgentUsage => ({
+    input: total,
+    output: 0,
+    total,
+    cost: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+  });
+  const runner = {
+    async run(prompt: string, options: { onUsageUpdate?: (usage: AgentUsage) => void }) {
+      if (prompt === "retrying") {
+        options.onUsageUpdate?.(usage(100));
+        provisionalReported.resolve();
+        await rollBackProvisional.promise;
+        options.onUsageUpdate?.(usage(0));
+        options.onUsageUpdate?.(usage(10));
+        return "first:retrying";
+      }
+      if (prompt === "fast") {
+        await provisionalReported.promise;
+        options.onUsageUpdate?.(usage(10));
+        setTimeout(() => rollBackProvisional.resolve(), 0);
+        return "first:fast";
+      }
+      options.onUsageUpdate?.(usage(10));
+      return prompt;
+    },
+  };
+  const script = `export const meta = { name: 'provisional_budget', description: 'provisional usage' }
+const results = await pipeline(
+  ['retrying', 'fast'],
+  item => agent(item, { label: 'first:' + item }),
+  (_first, item) => agent('next:' + item, { label: 'second:' + item }),
+)
+return { results, spent: budget.spent(), remaining: budget.remaining() }`;
+
+  const result = await runWorkflow<{ results: string[]; spent: number; remaining: number }>(script, {
+    agent: runner,
+    concurrency: 2,
+    tokenBudget: 50,
+    persistLogs: false,
+  });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    results: ["next:retrying", "next:fast"],
+    spent: 40,
+    remaining: 10,
+  });
+  assert.equal(result.tokenUsage.total, 40, "the rolled-back response stays out of final aggregate usage");
+});
+
 test("runWorkflow keeps logical-agent usage cumulative across retries", async () => {
   let attempt = 0;
   const liveAgentTotals: number[] = [];

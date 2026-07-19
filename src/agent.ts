@@ -678,7 +678,7 @@ export class WorkflowAgent {
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
-      if (options.onHistory || options.onUsageUpdate) {
+      if (options.onHistory || options.onUsageUpdate || options.onUsage) {
         removeSessionListener = session.subscribe((event) => {
           maybeEmitHistory();
           if (event.type === "message_end" && event.message.role === "assistant") {
