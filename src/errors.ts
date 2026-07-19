@@ -73,6 +73,13 @@ export function isProviderUsageLimit(error: unknown): error is WorkflowError {
   return isWorkflowError(error) && error.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
 }
 
+/** Whether a provider failure means the selected model cannot authenticate. */
+export function isProviderAuthFailure(error: unknown): boolean {
+  return /no api key|missing api key|invalid api key|invalid x-api-key|authentication(?:\s+failed|\s+error)?|unauthorized|invalid authentication|expired (?:oauth )?token|token (?:has )?expired|\b401\b|permission denied|access denied/i.test(
+    errorMessage(error),
+  );
+}
+
 /**
  * Detect a provider subscription/usage/quota/rate-limit exhaustion from free-form
  * error text, and extract the provider's human reset hint when present.

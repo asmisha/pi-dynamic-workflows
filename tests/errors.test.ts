@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   classifyProviderLimit,
+  isProviderAuthFailure,
   isProviderUsageLimit,
   WorkflowError,
   WorkflowErrorCode,
@@ -64,6 +65,21 @@ describe("wrapError provider-limit classification", () => {
   it("passes an existing WorkflowError through unchanged", () => {
     const orig = new WorkflowError("nope", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, { recoverable: false });
     assert.equal(wrapError(orig), orig);
+  });
+});
+
+describe("isProviderAuthFailure", () => {
+  it("matches authentication failures without treating ordinary execution failures as auth errors", () => {
+    for (const error of [
+      new Error("No API key for anthropic/claude-fable-5"),
+      new Error("401 unauthorized"),
+      new Error("OAuth token has expired"),
+      new Error("invalid x-api-key"),
+    ]) {
+      assert.equal(isProviderAuthFailure(error), true);
+    }
+    assert.equal(isProviderAuthFailure(new Error("503 overloaded_error")), false);
+    assert.equal(isProviderAuthFailure(new Error("schema validation failed")), false);
   });
 });
 

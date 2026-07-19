@@ -178,6 +178,12 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    */
   model?: string;
   /**
+   * Continue this same subagent session on an exact backup model when the
+   * primary model is unavailable, unauthenticated, or hits a provider usage
+   * limit. The handoff preserves prior tool calls and side effects.
+   */
+  fallbackModel?: string;
+  /**
    * Coarse model tier ("small" | "medium" | "big"), resolved from the user's
    * model-tiers config (see /workflows-models). An explicit `model` takes
    * precedence; a tier takes precedence over the phase model. When the tier has
@@ -660,6 +666,7 @@ export async function runWorkflow<T = unknown>(
               signal: attemptController.signal,
               instructions: buildAgentInstructions(meta, assignedPhase, agentOptions, agentDef),
               model: modelSpec,
+              fallbackModel: agentOptions.fallbackModel,
               tier: agentOptions.tier,
               modelRegistry: options.modelRegistry,
               toolNames: agentDef?.tools,
@@ -671,9 +678,13 @@ export async function runWorkflow<T = unknown>(
               onModelResolved: (id: string) => {
                 displayModel = id;
               },
-              onModelFallback: (spec: string) => {
-                // Make the silent degrade visible in /workflows, not just console.
-                log(`${label}: model "${spec}" unavailable — using the session default`);
+              onModelFallback: (spec: string, fallbackSpec?: string, reason?: string) => {
+                // Make model handoffs and the legacy session-default degrade visible.
+                log(
+                  fallbackSpec
+                    ? `${label}: ${reason ?? `model "${spec}" unavailable`} — continuing on ${fallbackSpec}`
+                    : `${label}: model "${spec}" unavailable — using the session default`,
+                );
               },
               onUsageUpdate: updateUsage,
               onUsage: (finalUsage) => {
@@ -1302,6 +1313,7 @@ function hashAgentCall(
   const identity = JSON.stringify({
     prompt,
     model: model ?? null,
+    fallbackModel: options.fallbackModel ?? null,
     tier: options.tier ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,

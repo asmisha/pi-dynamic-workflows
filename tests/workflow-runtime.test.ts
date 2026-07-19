@@ -641,6 +641,23 @@ test("runWorkflow routes models: explicit opts.model > phase model > default", a
   assert.deepEqual(seen, ["explicit-model", "phase-a-model", undefined]);
 });
 
+test("runWorkflow forwards an exact fallback model with the primary route", async () => {
+  const seen: Array<{ model?: string; fallbackModel?: string }> = [];
+  const capturingAgent = {
+    async run(_prompt: string, options: { model?: string; fallbackModel?: string }) {
+      seen.push({ model: options.model, fallbackModel: options.fallbackModel });
+      return "ok";
+    },
+  };
+
+  const script = `export const meta = { name: 'fallback_routing', description: 'fallback routing' }
+  await agent('task', { label: 'routed', model: 'anthropic/fable', fallbackModel: 'openai/gpt' })
+  return {}`;
+  await runWorkflow(script, { agent: capturingAgent, persistLogs: false });
+
+  assert.deepEqual(seen, [{ model: "anthropic/fable", fallbackModel: "openai/gpt" }]);
+});
+
 test("runWorkflow plumbs opts.tier through to the agent with correct precedence", async () => {
   // Regression guard: tier must reach WorkflowAgent.run() (it was previously
   // dropped). Precedence: explicit model > tier > phase model.
@@ -1367,6 +1384,7 @@ return r`;
     [", cwd: '/tmp/x'", "cwd"],
     [", forkFrom: '/tmp/source.jsonl'", "forkFrom"],
     [", sessionPath: 'persistent-reviewer'", "sessionPath"],
+    [", fallbackModel: 'openai/gpt'", "fallbackModel"],
   ] as const) {
     const rerun = countingAgent();
     await runWorkflow(script(extra), {

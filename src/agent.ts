@@ -17,7 +17,13 @@ import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
-import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import {
+  classifyProviderLimit,
+  isProviderAuthFailure,
+  isProviderUsageLimit,
+  WorkflowError,
+  WorkflowErrorCode,
+} from "./errors.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 import { resolveWorkflowSessionPath } from "./workflow-paths.js";
@@ -428,6 +434,12 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    */
   model?: string;
   /**
+   * Continue the same subagent session on this model when the primary model is
+   * unavailable, unauthenticated, or reaches a provider usage limit. This is a
+   * model handoff, not a fresh agent retry, so completed tool work is preserved.
+   */
+  fallbackModel?: string;
+  /**
    * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
    * config before `run()` starts, falling back to the session's main model when
@@ -438,8 +450,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   tier?: string;
   /** Called with the resolved model id once known (for display/telemetry). */
   onModelResolved?: (modelId: string) => void;
-  /** Called when `model`/`tier`/phase resolved to a spec that wasn't found (fell back to session default). */
-  onModelFallback?: (requestedSpec: string) => void;
+  /** Called when the primary model falls back to another model or the session default. */
+  onModelFallback?: (requestedSpec: string, fallbackSpec?: string, reason?: string) => void;
   /** Called with a compact snapshot of this subagent's message/tool history. */
   onHistory?: (history: AgentHistoryEntry[]) => void;
   /** Run this agent in a different working directory. */
@@ -547,6 +559,12 @@ export class WorkflowAgent {
     return registry.getAvailable().find((m) => m.id === spec) ?? registry.getAll().find((m) => m.id === spec);
   }
 
+  private modelIsAvailable(model: Model<any>, perRunRegistry?: ModelRegistry): boolean {
+    return this.getRegistry(perRunRegistry)
+      .getAvailable()
+      .some((candidate) => candidate.provider === model.provider && candidate.id === model.id);
+  }
+
   async run<TSchemaDef extends TSchema | undefined = undefined>(
     prompt: string,
     options: AgentRunOptions<TSchemaDef> = {},
@@ -573,13 +591,38 @@ export class WorkflowAgent {
     // options.model when a phase pattern matches — so an explicit model wins.
     const modelSpec = resolveAgentModelSpec(options, this.mainModel);
 
-    // Resolve a requested model spec to a Model object. A given-but-unresolved
-    // spec falls back to the session default (with a warning) rather than failing.
+    const fallbackSpec = options.fallbackModel?.trim();
+    if (fallbackSpec && !modelSpec) {
+      throw new WorkflowError("fallbackModel requires a primary model", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+        recoverable: false,
+        agentLabel: options.label,
+      });
+    }
+
+    // An explicit fallback makes model availability a fail-closed route: use the
+    // fallback immediately when the primary lacks auth, and reject a fallback
+    // that cannot itself run. Without one, preserve the existing session-default
+    // behavior for unresolved model specs.
     let resolvedModel: Model<any> | undefined;
+    let resolvedFallbackModel: Model<any> | undefined;
+    if (fallbackSpec) {
+      resolvedFallbackModel = this.resolveModel(fallbackSpec, options.modelRegistry);
+      if (!resolvedFallbackModel || !this.modelIsAvailable(resolvedFallbackModel, options.modelRegistry)) {
+        throw new WorkflowError(
+          `Fallback model "${fallbackSpec}" is unavailable or unauthenticated`,
+          WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+          { recoverable: false, agentLabel: options.label },
+        );
+      }
+    }
     if (modelSpec) {
       resolvedModel = this.resolveModel(modelSpec, options.modelRegistry);
-      if (resolvedModel) {
+      if (resolvedModel && (!fallbackSpec || this.modelIsAvailable(resolvedModel, options.modelRegistry))) {
         options.onModelResolved?.(`${resolvedModel.provider}/${resolvedModel.id}`);
+      } else if (resolvedFallbackModel && fallbackSpec) {
+        resolvedModel = resolvedFallbackModel;
+        options.onModelFallback?.(modelSpec, fallbackSpec, "primary model is unavailable or unauthenticated");
+        options.onModelResolved?.(`${resolvedFallbackModel.provider}/${resolvedFallbackModel.id}`);
       } else {
         console.warn(`[workflow] model "${modelSpec}" not found; using session default`);
         options.onModelFallback?.(modelSpec);
@@ -690,34 +733,75 @@ export class WorkflowAgent {
         });
       }
 
-      await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
-      await waitForSubagentIdle(session, options.signal);
+      const completeTurn = async (): Promise<AgentRunResult<TSchemaDef>> => {
+        if (options.signal?.aborted) throw abortError();
 
-      if (options.signal?.aborted) throw abortError();
+        // The SDK can bury provider/runtime errors in assistant metadata instead of
+        // throwing; detect them before schema/empty-text handling.
+        throwIfAssistantExecutionError(session.messages, options.label);
 
-      // The SDK can bury provider/runtime errors in assistant metadata instead of
-      // throwing; detect them here before schema/empty-text handling.
-      throwIfAssistantExecutionError(session.messages, options.label);
+        if (options.schema) {
+          return (await resolveStructuredOutput(
+            session,
+            capture,
+            options.schema,
+            options,
+            (m) => this.lastAssistantText(m),
+            () => waitForSubagentIdle(session, options.signal),
+          )) as AgentRunResult<TSchemaDef>;
+        }
 
-      if (options.schema) {
-        return (await resolveStructuredOutput(
-          session,
-          capture,
-          options.schema,
-          options,
-          (m) => this.lastAssistantText(m),
-          () => waitForSubagentIdle(session, options.signal),
-        )) as AgentRunResult<TSchemaDef>;
+        const text = this.lastAssistantText(session.messages);
+        if (!text.trim()) {
+          throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
+            recoverable: true,
+            agentLabel: options.label,
+          });
+        }
+        return text as AgentRunResult<TSchemaDef>;
+      };
+
+      try {
+        await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+        await waitForSubagentIdle(session, options.signal);
+        return await completeTurn();
+      } catch (error) {
+        const fallbackModel = resolvedFallbackModel;
+        const canHandoff =
+          resolvedModel &&
+          fallbackModel &&
+          (resolvedModel.provider !== fallbackModel.provider || resolvedModel.id !== fallbackModel.id);
+        if (
+          !modelSpec ||
+          !fallbackModel ||
+          !canHandoff ||
+          (!isProviderUsageLimit(error) && !isProviderAuthFailure(error))
+        ) {
+          throw error;
+        }
+
+        const reason = isProviderUsageLimit(error)
+          ? "primary provider usage limit"
+          : "primary provider authentication failed";
+        resolvedModel = fallbackModel;
+        // Keep the same transcript and tool state so a writer that already edited
+        // files remains one logical agent. Avoid AgentSession.setModel(), which
+        // would also overwrite the user's global default model.
+        session.agent.state.model = fallbackModel;
+        session.sessionManager.appendModelChange(fallbackModel.provider, fallbackModel.id);
+        session.setThinkingLevel(session.thinkingLevel);
+        options.onModelFallback?.(modelSpec, fallbackSpec, reason);
+        options.onModelResolved?.(`${fallbackModel.provider}/${fallbackModel.id}`);
+
+        const structuredReminder = options.schema
+          ? " Finish by calling structured_output exactly once with the required replacement result."
+          : "";
+        await session.prompt(
+          `The primary model became unavailable. Continue the same task from this transcript and current tool state. Do not restart or repeat completed work. Verify actual state, finish the original task, and satisfy the original output contract.${structuredReminder}`,
+        );
+        await waitForSubagentIdle(session, options.signal);
+        return await completeTurn();
       }
-
-      const text = this.lastAssistantText(session.messages);
-      if (!text.trim()) {
-        throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
-          recoverable: true,
-          agentLabel: options.label,
-        });
-      }
-      return text as AgentRunResult<TSchemaDef>;
     } finally {
       removeAbortListener?.();
       removeSessionListener?.();

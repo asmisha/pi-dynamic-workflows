@@ -145,6 +145,7 @@ The essentials:
 | --- | --- |
 | `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`). |
 | `model` | Exact `provider/modelId` (always wins over `tier`). |
+| `fallbackModel` | Exact backup model. If the primary is unavailable, unauthenticated, or hits a provider usage limit, the same subagent session continues on this model with its transcript and completed tool work intact. |
 | `agentType` | A named definition (`.pi/agents/<name>.md`) binding tools + model + role prompt. |
 | `cwd` | Run this agent in a different working directory (tools + session bind to it). |
 | `forkFrom` | Fork an existing Pi session file (JSONL) as starting context. The source file is never mutated; without `sessionPath`, the fork is temporary. |
@@ -162,6 +163,8 @@ Subagent sessions are temporary by default. Use `sessionPath` only when a review
 By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 
 For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (max agents running at once, clamped to `16`) and `agentRetries` (run-level retry attempts after recoverable agent failures). Both can be defaulted in `~/.pi/workflows/settings.json`; per-agent `retries` overrides the run value. Read-only agents get at least one automatic retry by default. Other agents default to `0`, and side-effecting agents must set `retryable: false`. Nonrecoverable errors never retry.
+
+`fallbackModel` is deliberately narrower than retry: it activates only when the primary model lacks availability/authentication or reaches a provider usage limit. A mid-task handoff switches the existing subagent session rather than launching another agent, so an editing agent retains its transcript and completed side effects. If the backup model is itself unavailable, the call fails before starting.
 
 The live "Workflows running" panel is configured in the same `~/.pi/workflows/settings.json`: `"progressPanelMode"` is `"compact"` (default, one line per run) or `"detailed"` (per-phase/per-agent rows with tokens, cost, and a live tok/s rate), and `"progressPanelMaxAgents"` (default `8`, range `1`–`1000`) caps how many agents each phase shows in detailed mode before a `… N earlier agents` line. Toggle them live with `/workflows-progress compact|detailed` and `/workflows-progress-max <N>` — changes take effect on the next render without a restart.
 

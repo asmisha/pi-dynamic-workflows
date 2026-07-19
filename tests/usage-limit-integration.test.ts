@@ -52,36 +52,69 @@ async function withFauxSession(
   fn: (ctx: {
     cwd: string;
     model: unknown;
+    fallbackModel: unknown;
     setResponses: (msgs: unknown[]) => void;
+    anthropicCallCount: () => number;
     fauxAssistantMessage: typeof import("@earendil-works/pi-ai").fauxAssistantMessage;
+    fauxToolCall: typeof import("@earendil-works/pi-ai").fauxToolCall;
   }) => Promise<void>,
 ): Promise<void> {
-  const { registerFauxProvider, fauxAssistantMessage } = await loadFaux();
+  const { registerFauxProvider, fauxAssistantMessage, fauxToolCall } = await loadFaux();
   const home = mkdtempSync(join(tmpdir(), "pi-dw-i26-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-i26-cwd-"));
   const prevKey = process.env.DEEPSEEK_API_KEY;
+  const prevAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  const prevAnthropicToken = process.env.ANTHROPIC_OAUTH_TOKEN;
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.DEEPSEEK_API_KEY = "faux-dummy-key-not-used";
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_OAUTH_TOKEN;
   // An explicit host PI_CODING_AGENT_DIR overrides HOME. Isolate it too so a
   // user's compaction settings cannot consume faux responses between test turns.
-  process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
+  const agentDir = join(home, ".pi", "agent");
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const anthropicFaux = registerFauxProvider({
+    provider: "anthropic",
+    models: [{ id: "faux-anthropic", name: "Faux Anthropic", contextWindow: 128000, maxTokens: 4096 }],
+  });
   const faux = registerFauxProvider({
     provider: "deepseek",
-    models: [{ id: "faux-deepseek", name: "Faux DeepSeek", contextWindow: 128000, maxTokens: 4096 }],
+    models: [
+      { id: "faux-deepseek", name: "Faux DeepSeek", contextWindow: 128000, maxTokens: 4096 },
+      { id: "faux-deepseek-fallback", name: "Faux DeepSeek Fallback", contextWindow: 128000, maxTokens: 4096 },
+    ],
   });
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(
+    join(agentDir, "models.json"),
+    JSON.stringify({
+      providers: {
+        anthropic: { models: anthropicFaux.models },
+        deepseek: { models: faux.models },
+      },
+    }),
+  );
   try {
     await withFakeHomeAsync(home, () =>
       fn({
         cwd,
-        model: faux.getModel(),
+        model: faux.getModel("faux-deepseek"),
+        fallbackModel: faux.getModel("faux-deepseek-fallback"),
         setResponses: (msgs) => faux.setResponses(msgs as never),
+        anthropicCallCount: () => anthropicFaux.state.callCount,
         fauxAssistantMessage,
+        fauxToolCall,
       }),
     );
   } finally {
     faux.unregister();
+    anthropicFaux.unregister();
     if (prevKey === undefined) delete process.env.DEEPSEEK_API_KEY;
     else process.env.DEEPSEEK_API_KEY = prevKey;
+    if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
+    if (prevAnthropicToken === undefined) delete process.env.ANTHROPIC_OAUTH_TOKEN;
+    else process.env.ANTHROPIC_OAUTH_TOKEN = prevAnthropicToken;
     if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
     rmSync(home, { recursive: true, force: true });
@@ -104,6 +137,70 @@ test("a real subagent session that hits a usage limit surfaces PROVIDER_USAGE_LI
         return true;
       },
     );
+  }));
+
+test("an unauthenticated primary model starts directly on fallbackModel", () =>
+  withFauxSession(async ({ cwd, setResponses, anthropicCallCount, fauxAssistantMessage }) => {
+    setResponses([fauxAssistantMessage("fallback ready", { stopReason: "stop" })]);
+    const agent = new WorkflowAgent({ cwd });
+    const handoffs: Array<{ requested: string; fallback?: string; reason?: string }> = [];
+    const result = await agent.run("do the task", {
+      label: "auth-fallback-probe",
+      model: "anthropic/faux-anthropic",
+      fallbackModel: "deepseek/faux-deepseek-fallback",
+      onModelFallback: (requested, fallback, reason) => handoffs.push({ requested, fallback, reason }),
+    });
+
+    assert.equal(result, "fallback ready");
+    assert.equal(anthropicCallCount(), 0, "the unauthenticated primary must not receive a request");
+    assert.deepEqual(handoffs, [
+      {
+        requested: "anthropic/faux-anthropic",
+        fallback: "deepseek/faux-deepseek-fallback",
+        reason: "primary model is unavailable or unauthenticated",
+      },
+    ]);
+  }));
+
+test("a provider usage limit continues the same structured-output session on fallbackModel", () =>
+  withFauxSession(async ({ cwd, setResponses, fauxAssistantMessage, fauxToolCall }) => {
+    const fallbackRequests: Array<{ model: string; messages: number }> = [];
+    setResponses([
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: USAGE_LIMIT_MSG }),
+      (context: unknown, _options: unknown, _state: unknown, requestModel: { id: string }) => {
+        fallbackRequests.push({
+          model: requestModel.id,
+          messages: (context as { messages?: unknown[] }).messages?.length ?? 0,
+        });
+        return fauxAssistantMessage(fauxToolCall("structured_output", { ok: true }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("done", { stopReason: "stop" }),
+    ]);
+    const agent = new WorkflowAgent({ cwd });
+    const handoffs: Array<{ requested: string; fallback?: string; reason?: string }> = [];
+    const result = await agent.run("do the task", {
+      label: "fallback-probe",
+      model: "deepseek/faux-deepseek",
+      fallbackModel: "deepseek/faux-deepseek-fallback",
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["ok"],
+        properties: { ok: { type: "boolean" } },
+      },
+      onModelFallback: (requested, fallback, reason) => handoffs.push({ requested, fallback, reason }),
+    });
+
+    assert.deepEqual(result, { ok: true });
+    assert.equal(fallbackRequests[0]?.model, "faux-deepseek-fallback");
+    assert.ok(fallbackRequests[0]?.messages >= 2, "the fallback request should retain the original transcript");
+    assert.deepEqual(handoffs, [
+      {
+        requested: "deepseek/faux-deepseek",
+        fallback: "deepseek/faux-deepseek-fallback",
+        reason: "primary provider usage limit",
+      },
+    ]);
   }));
 
 test("a successful real turn whose text merely mentions 'rate limit' is NOT misclassified", () =>
