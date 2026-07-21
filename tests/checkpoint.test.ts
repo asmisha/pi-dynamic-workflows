@@ -130,7 +130,7 @@ return 'unreachable'`;
   );
 });
 
-test("checkpoint(): allows at most one parent decision per run", async () => {
+test("checkpoint(): supports multiple sequential parent decisions in one run", async () => {
   const script = `export const meta = { name: 'c', description: 'checkpoint' }
 const first = await checkpoint('first')
 const second = await checkpoint('second')
@@ -142,13 +142,34 @@ return { first, second }`;
     if (error instanceof WorkflowError) first = error.details as PendingCheckpoint;
   }
   assert.ok(first);
+
   const journal = new Map<number, JournalEntry>([
-    [first.callIndex, { index: first.callIndex, hash: first.hash, result: "answer" }],
+    [first.callIndex, { index: first.callIndex, hash: first.hash, result: "first answer" }],
   ]);
-  await assert.rejects(
-    () => runWorkflow(script, { agent: noopAgent, persistLogs: false, resumeJournal: journal }),
-    /at most once/i,
-  );
+  let second: PendingCheckpoint | undefined;
+  try {
+    await runWorkflow(script, { agent: noopAgent, persistLogs: false, resumeJournal: journal });
+  } catch (error) {
+    if (error instanceof WorkflowError) second = error.details as PendingCheckpoint;
+  }
+  assert.ok(second);
+  assert.equal(second.prompt, "second");
+  assert.notEqual(second.callIndex, first.callIndex);
+
+  journal.set(second.callIndex, {
+    index: second.callIndex,
+    hash: second.hash,
+    result: "second answer",
+  });
+  const resumed = await runWorkflow<{ first: string; second: string }>(script, {
+    agent: noopAgent,
+    persistLogs: false,
+    resumeJournal: journal,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(resumed.result)), {
+    first: "first answer",
+    second: "second answer",
+  });
 });
 
 test("checkpoint(): rejects workflows with phase token sub-budgets", async () => {

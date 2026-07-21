@@ -259,7 +259,7 @@ export interface WorkflowModuleDefinition {
   run: (context: WorkflowRuntimeContext) => unknown | Promise<unknown>;
 }
 
-/** Persisted identity of the one checkpoint currently awaiting a parent-chat reply. */
+/** Persisted identity of the checkpoint currently awaiting a parent-chat reply. */
 export interface PendingCheckpoint {
   callIndex: number;
   callId?: string;
@@ -288,8 +288,6 @@ interface RuntimeState {
   phases: string[];
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
   callSeq: number;
-  /** At most one durable parent checkpoint is allowed per run. */
-  checkpointSeen: boolean;
   /**
    * Index of the first call that missed the resume journal (changed or new).
    * Longest-unchanged-prefix resume: a cached result is replayed only while
@@ -371,7 +369,6 @@ export async function runWorkflow<T = unknown>(
     currentPhase: meta.phases?.[0]?.title,
     phaseBudgets: new Map(),
     callSeq: 0,
-    checkpointSeen: false,
     firstMiss: Number.POSITIVE_INFINITY,
   };
 
@@ -956,14 +953,6 @@ export async function runWorkflow<T = unknown>(
         { recoverable: false },
       );
     }
-    if (state.checkpointSeen) {
-      throw new WorkflowError(
-        "checkpoint() may be called at most once per workflow run",
-        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-        { recoverable: false },
-      );
-    }
-    state.checkpointSeen = true;
     if (shared.agentCount >= maxAgents) {
       throw new WorkflowError(
         `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,

@@ -928,7 +928,7 @@ export class WorkflowManager extends EventEmitter {
     return true;
   }
 
-  /** Supply the one pending checkpoint reply and continue the same persisted run. */
+  /** Supply the current pending checkpoint reply and continue the same persisted run. */
   async resumeWithReply(runId: string, reply: unknown): Promise<boolean> {
     if (!isValidRunId(runId)) return false;
     const active = this.runs.get(runId);

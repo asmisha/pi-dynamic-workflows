@@ -3099,6 +3099,61 @@ return await checkpoint('must persist')`;
   }
 });
 
+test("background checkpoints can pause and resume the same run repeatedly", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workflow-multiple-checkpoints-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      let calls = 0;
+      const agent = {
+        async run(prompt: string) {
+          calls++;
+          return `ran:${prompt}`;
+        },
+      };
+      const manager = new WorkflowManager({ cwd: process.cwd(), agent });
+      manager.setSessionId("multiple-checkpoints-session");
+      const script = `export const meta = { name: 'multiple_checkpoints', description: 'pause and resume repeatedly' }
+const before = await agent('before', { label: 'before' })
+const first = await checkpoint('First question?')
+const middle = await agent('middle:' + first, { label: 'middle' })
+const second = await checkpoint('Second question?')
+const after = await agent('after:' + second, { label: 'after' })
+return { before, first, middle, second, after }`;
+
+      const firstPause = new Promise<void>((resolve) => manager.once("paused", () => resolve()));
+      const { runId } = manager.startInBackground(script);
+      await firstPause;
+      assert.equal(manager.getPersistence().load(runId)?.pendingCheckpoint?.prompt, "First question?");
+
+      const secondPause = new Promise<void>((resolve) => manager.once("paused", () => resolve()));
+      assert.equal(await manager.resumeWithReply(runId, "first answer"), true);
+      await secondPause;
+      const afterFirstReply = manager.getPersistence().load(runId);
+      assert.equal(afterFirstReply?.status, "paused");
+      assert.equal(afterFirstReply?.pendingCheckpoint?.prompt, "Second question?");
+      assert.equal(afterFirstReply?.journal?.length, 3);
+
+      const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
+      assert.equal(await manager.resumeWithReply(runId, "second answer"), true);
+      await completed;
+
+      const run = manager.getRun(runId);
+      assert.equal(run?.status, "completed");
+      assert.equal(run?.result?.runId, runId);
+      assert.deepEqual(JSON.parse(JSON.stringify(run?.result?.result)), {
+        before: "ran:before",
+        first: "first answer",
+        middle: "ran:middle:first answer",
+        second: "second answer",
+        after: "ran:after:second answer",
+      });
+      assert.equal(calls, 3, "completed work is replayed rather than rerun across checkpoints");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("background checkpoint pauses durably and resumes the same run with a reply", async () => {
   const home = mkdtempSync(join(tmpdir(), "workflow-checkpoint-home-"));
   try {
