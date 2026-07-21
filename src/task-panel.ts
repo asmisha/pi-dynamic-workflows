@@ -102,11 +102,9 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
   const m = manager as unknown as {
     __deliveryInstalled?: boolean;
     __holder?: { pi: ExtensionAPI };
-    __deliverPendingCheckpoints?: () => void;
   };
   if (m.__deliveryInstalled) {
     if (m.__holder) m.__holder.pi = pi;
-    m.__deliverPendingCheckpoints?.();
     return;
   }
   m.__deliveryInstalled = true;
@@ -137,14 +135,6 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     `${prompt}\n\n` +
     `Ask the user this question. Do not start a new run. After the user replies, continue the same run with ` +
     `workflow({resumeRunId: "${runId}", reply: <user reply>}).`;
-
-  m.__deliverPendingCheckpoints = () => {
-    for (const run of manager.listRuns()) {
-      if (run.status === "paused" && run.pauseReason === "human_input" && run.pendingCheckpoint) {
-        deliver(run.runId, checkpointText(run.runId, run.pendingCheckpoint.prompt));
-      }
-    }
-  };
 
   manager.on("complete", ({ runId }: { runId: string }) => {
     const run = manager.getRun(runId);
@@ -204,8 +194,6 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
       );
     },
   );
-
-  m.__deliverPendingCheckpoints();
 }
 
 export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {

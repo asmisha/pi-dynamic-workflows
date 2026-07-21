@@ -289,7 +289,7 @@ describe("installResultDelivery", () => {
     assert.ok(!calls[0].content.includes("failed"), "should not say failed");
   });
 
-  it("replays a persisted human checkpoint when delivery installs after reload", () => {
+  it("does not replay a persisted human checkpoint when delivery installs after reload", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
     manager.listRuns = () => [
@@ -297,16 +297,14 @@ describe("installResultDelivery", () => {
         runId: "persisted-run",
         status: "paused",
         pauseReason: "human_input",
-        pendingCheckpoint: { prompt: "Persisted question?" },
+        pendingCheckpoint: { prompt: "Already delivered question?" },
       },
     ];
 
     mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
 
     const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1);
-    assert.match(calls[0].content, /Persisted question\?/);
-    assert.match(calls[0].content, /persisted-run/);
+    assert.equal(calls.length, 0);
   });
 
   it("delivers a human checkpoint to the parent conversation", () => {
