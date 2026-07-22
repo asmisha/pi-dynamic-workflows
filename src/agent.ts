@@ -25,10 +25,22 @@ import {
   WorkflowErrorCode,
 } from "./errors.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
+import { createReadOnlyBashSession } from "./read-only-bash.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 import { resolveWorkflowSessionPath } from "./workflow-paths.js";
 
-const READ_ONLY_EXCLUDED_TOOL_NAMES = ["bash", "edit", "write", "ast_grep_replace"];
+const READ_ONLY_TOOL_NAMES = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "bash",
+  "ffgrep",
+  "fffind",
+  "ast_grep_search",
+  "web_search",
+  "structured_output",
+];
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -479,7 +491,7 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   toolNames?: string[];
   /** Remove these coding-tool names after the allowlist (an agentType `disallowedTools` denylist). */
   disallowedToolNames?: string[];
-  /** Exclude tools that can change code, including shell, edit, write, and AST replacement tools. */
+  /** Restrict tools to repository reads plus a filesystem-sandboxed bash when supported. */
   readOnly?: boolean;
   /**
    * With `schema`: how many extra repair turns to allow if the model finishes
@@ -573,18 +585,26 @@ export class WorkflowAgent {
     // Per-call cwd (e.g. a worktree) needs coding tools bound to that directory,
     // since tools capture their cwd at construction and can't be relocated.
     const runCwd = options.cwd ?? this.cwd;
+    const readOnlyBash = options.readOnly ? createReadOnlyBashSession(runCwd) : undefined;
     const baseTools = runCwd === this.cwd ? this.baseTools : createCodingTools(runCwd);
+    const modeTools = options.readOnly
+      ? [
+          ...baseTools.filter((tool) => tool.name !== "bash"),
+          ...(readOnlyBash?.tool ? [readOnlyBash.tool] : []),
+          ...(options.tools ?? []).filter((tool) => tool.name !== "bash"),
+        ]
+      : [...baseTools, ...(options.tools ?? [])];
     // Apply the agentType tool policy BEFORE adding structured_output, so a
     // restrictive allowlist never strips the schema tool.
-    const customTools: ToolDefinition[] = applyToolPolicy(
-      [...baseTools, ...(options.tools ?? [])],
-      options.toolNames,
-      options.disallowedToolNames,
-    );
+    const customTools: ToolDefinition[] = applyToolPolicy(modeTools, options.toolNames, options.disallowedToolNames);
+    const sandboxedBashEnabled = Boolean(readOnlyBash?.tool && customTools.some((tool) => tool === readOnlyBash.tool));
 
     if (options.schema) {
       customTools.push(createStructuredOutputTool({ schema: options.schema, capture }) as unknown as ToolDefinition);
     }
+    const readOnlyToolNames = READ_ONLY_TOOL_NAMES.filter(
+      (name) => (name !== "bash" || sandboxedBashEnabled) && (name !== "structured_output" || options.schema),
+    );
 
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
@@ -653,9 +673,7 @@ export class WorkflowAgent {
           ...this.sessionOptions,
           // Per-call model wins over any sessionOptions.model.
           ...(resolvedModel ? { model: resolvedModel } : {}),
-          ...(options.readOnly
-            ? { excludeTools: [...(this.sessionOptions.excludeTools ?? []), ...READ_ONLY_EXCLUDED_TOOL_NAMES] }
-            : {}),
+          ...(options.readOnly ? { tools: readOnlyToolNames } : {}),
         });
         // createAgentSession loads configured extensions, but hooks (including
         // compaction/autocontinue extensions and session_start tool setup) only run
@@ -664,6 +682,7 @@ export class WorkflowAgent {
         await created.session.bindExtensions({});
         return created.session;
       } catch (error) {
+        readOnlyBash?.cleanup();
         forked.cleanup();
         throw error;
       }
@@ -811,8 +830,12 @@ export class WorkflowAgent {
         // History is diagnostic only; never let it mask the real result/error.
       }
       emitUsage(options.onUsage);
-      session.dispose();
-      forked?.cleanup();
+      try {
+        session.dispose();
+      } finally {
+        readOnlyBash?.cleanup();
+        forked?.cleanup();
+      }
     }
   }
 

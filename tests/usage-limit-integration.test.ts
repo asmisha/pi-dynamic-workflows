@@ -247,7 +247,18 @@ test("a read-only real subagent excludes write-capable tools and preserves read-
       extensionFactories: [
         (pi) => {
           pi.on("session_start", () => {
-            for (const name of ["ast_grep_search", "ast_grep_replace"]) {
+            for (const name of [
+              "grep",
+              "find",
+              "ls",
+              "ffgrep",
+              "fffind",
+              "ast_grep_search",
+              "web_search",
+              "ast_grep_replace",
+              "structured_return",
+              "workflow",
+            ]) {
               pi.registerTool(
                 defineTool({
                   name,
@@ -271,11 +282,16 @@ test("a read-only real subagent excludes write-capable tools and preserves read-
     await agent.run("review the code", { label: "read-only", readOnly: true });
 
     assert.ok(activeTools.includes("read"), `expected read to remain active, got ${activeTools.join(", ")}`);
-    assert.ok(
-      activeTools.includes("ast_grep_search"),
-      `expected ast_grep_search to remain active, got ${activeTools.join(", ")}`,
+    for (const name of ["grep", "find", "ls", "ffgrep", "fffind", "ast_grep_search", "web_search"]) {
+      assert.ok(activeTools.includes(name), `expected ${name} to remain active, got ${activeTools.join(", ")}`);
+    }
+    const sandboxedBashAvailable = process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec");
+    assert.equal(
+      activeTools.includes("bash"),
+      sandboxedBashAvailable,
+      `expected bash availability to match the read-only sandbox, got ${activeTools.join(", ")}`,
     );
-    for (const name of ["bash", "edit", "write", "ast_grep_replace"]) {
+    for (const name of ["edit", "write", "ast_grep_replace", "structured_return", "workflow"]) {
       assert.ok(!activeTools.includes(name), `expected ${name} to be excluded, got ${activeTools.join(", ")}`);
     }
   }));

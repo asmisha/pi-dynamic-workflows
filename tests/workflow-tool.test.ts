@@ -8,6 +8,7 @@ import { workflowProjectPaths } from "../src/workflow-paths.js";
 import {
   backgroundStartedText,
   createWorkflowPauseTool,
+  createWorkflowResumeTool,
   createWorkflowRetryTool,
   createWorkflowStatusTool,
   createWorkflowStopTool,
@@ -197,6 +198,67 @@ test("workflow retry tool invokes manager.retry", async () => {
 
   assert.deepEqual(result.details, { runId: "run-123", retried: true });
   assert.match(result.content[0].text, /retried/);
+});
+
+test("workflow resume tool invokes manager.resume", async () => {
+  const resumed: string[] = [];
+  const manager = {
+    isRunInCurrentSession: () => true,
+    resume: async (runId: string) => {
+      resumed.push(runId);
+      return true;
+    },
+  } as unknown as WorkflowManager;
+  const resume = createWorkflowResumeTool(manager);
+
+  assert.equal(resume.name, "workflow_resume");
+  const result = await (resume.execute as (...args: any[]) => Promise<any>)(
+    "resume-call",
+    { runId: "run-123" },
+    new AbortController().signal,
+    () => {},
+    { hasUI: false },
+  );
+
+  assert.deepEqual(resumed, ["run-123"]);
+  assert.deepEqual(result.details, { runId: "run-123", resumed: true });
+  assert.match(result.content[0].text, /resumed/);
+});
+
+test("workflow resume tool explains unsuitable states and points to retry/checkpoint paths", async () => {
+  const manager = {
+    isRunInCurrentSession: () => true,
+    resume: async () => false,
+  } as unknown as WorkflowManager;
+  const execute = createWorkflowResumeTool(manager).execute as (...args: any[]) => Promise<any>;
+
+  await assert.rejects(
+    execute("resume-call", { runId: "failed-run" }, new AbortController().signal, () => {}, { hasUI: false }),
+    (error: Error) => {
+      assert.match(error.message, /cannot be resumed in its current state/i);
+      assert.match(error.message, /workflow_retry/);
+      assert.match(error.message, /resumeRunId/);
+      return true;
+    },
+  );
+});
+
+test("workflow resume tool rejects runs outside the current session without calling resume", async () => {
+  let resumeCalled = false;
+  const manager = {
+    isRunInCurrentSession: () => false,
+    resume: async () => {
+      resumeCalled = true;
+      return true;
+    },
+  } as unknown as WorkflowManager;
+  const execute = createWorkflowResumeTool(manager).execute as (...args: any[]) => Promise<any>;
+
+  await assert.rejects(
+    execute("resume-call", { runId: "other-run" }, new AbortController().signal, () => {}, { hasUI: false }),
+    /unavailable in this session/i,
+  );
+  assert.equal(resumeCalled, false);
 });
 
 test("workflow status tool returns compact live progress", async () => {

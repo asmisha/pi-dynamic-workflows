@@ -312,6 +312,33 @@ export function createWorkflowRetryTool(
   return createWorkflowControlTool(manager, "retry");
 }
 
+export function createWorkflowResumeTool(
+  manager: WorkflowManager,
+): ToolDefinition<typeof workflowControlToolSchema, any> {
+  return defineTool({
+    name: "workflow_resume",
+    label: "Resume Workflow",
+    description: "Resume a manually paused or interrupted workflow in the same run, replaying completed work.",
+    promptSnippet: "Resume an interrupted or manually paused workflow without creating a replacement run.",
+    promptGuidelines: ["Pass the exact runId returned by the workflow tool. Use only for runs in this parent session."],
+    parameters: workflowControlToolSchema,
+    async execute(_toolCallId, params) {
+      if (!manager.isRunInCurrentSession(params.runId)) {
+        throw new Error(`Workflow ${params.runId} is unavailable in this session`);
+      }
+      if (!(await manager.resume(params.runId))) {
+        throw new Error(
+          `Workflow ${params.runId} cannot be resumed in its current state. Use workflow_retry for agent-failure pauses or workflow({ resumeRunId, reply }) for checkpoints`,
+        );
+      }
+      return {
+        content: [{ type: "text", text: `Workflow ${params.runId} resumed.` }],
+        details: { runId: params.runId, resumed: true },
+      };
+    },
+  });
+}
+
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
   const cwd = options.cwd ?? process.cwd();
   const defaults = resolveWorkflowToolDefaults(options, cwd);

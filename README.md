@@ -119,7 +119,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows-models           map the small / medium / big tiers to real models
 ```
 
-Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, `workflow_retry`, and `workflow_stop` tools; the slash commands remain available for manual control.
+Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, `workflow_resume`, `workflow_retry`, and `workflow_stop` tools; the slash commands remain available for manual control.
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `d` remove · `r` restart · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
@@ -154,7 +154,7 @@ The essentials:
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Explicit retry attempts after a recoverable failure for this agent. Overrides all defaults; use `0` to disable automatic retry. |
 | `retryable` | Whether automatic retries or `/workflows retry` may rerun this agent. Default `true`; set `false` for any agent that can duplicate side effects. |
-| `readOnly` | Set `true` for reviewers/searchers. It excludes code-writing tools (`bash`, `edit`, `write`, and AST replacement) and defaults to one automatic retry unless `retries` overrides it. |
+| `readOnly` | Set `true` for reviewers/searchers. It keeps repository read/search tools and, on macOS, a sandboxed `bash` for read-only Git inspection. Repository/host writes and shell network access are blocked; writes are limited to isolated `$HOME`/`$TMPDIR`. Unsupported platforms omit `bash` rather than falling back to unrestricted execution. It defaults to one automatic retry unless `retries` overrides it. |
 
 A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. The host `workflow({ resumeRunId: "...", reply: ... })` tool call validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. Workflows may pause at multiple sequential checkpoints; each reply continues the same run until the next checkpoint or completion. `/workflows resume` is for paused/interrupted runs; `/workflows retry` is for runs paused by retryable agent failures. Ordinary failed runs remain terminal.
 
