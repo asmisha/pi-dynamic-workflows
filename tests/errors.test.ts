@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   classifyProviderLimit,
   isProviderAuthFailure,
+  isProviderUnavailable,
   isProviderUsageLimit,
   WorkflowError,
   WorkflowErrorCode,
@@ -65,6 +66,33 @@ describe("wrapError provider-limit classification", () => {
   it("passes an existing WorkflowError through unchanged", () => {
     const orig = new WorkflowError("nope", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, { recoverable: false });
     assert.equal(wrapError(orig), orig);
+  });
+});
+
+describe("isProviderUnavailable", () => {
+  it("matches gateway and overload responses, not request problems", () => {
+    for (const message of [
+      "Service Unavailable",
+      "503 Service Unavailable",
+      "Bad Gateway",
+      "Gateway Timeout",
+      "Gateway Time-out",
+      "502 upstream error",
+      "504 from provider",
+      "529 overloaded_error",
+      "The model is temporarily unavailable",
+      '{"type":"error","error":{"type":"overloaded_error"}}',
+    ]) {
+      assert.equal(isProviderUnavailable(new Error(message)), true, message);
+    }
+    for (const message of [
+      "schema validation failed",
+      "invalid api key",
+      "Codex usage limit reached (plus plan). Resets in ~3h.",
+      'Fallback model "openai/gpt" is unavailable or unauthenticated',
+    ]) {
+      assert.equal(isProviderUnavailable(new Error(message)), false, message);
+    }
   });
 });
 

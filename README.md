@@ -144,7 +144,7 @@ The essentials:
 | --- | --- |
 | `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`). |
 | `model` | Exact `provider/modelId` (always wins over `tier`). |
-| `fallbackModel` | Exact backup model. If the primary is unavailable, unauthenticated, or hits a provider usage limit, the same subagent session continues on this model with its transcript and completed tool work intact. |
+| `fallbackModel` | Exact backup model. If the primary is unauthenticated, hits a provider usage limit, or stops answering (gateway/overload errors after the SDK's own retries), the same subagent session continues on this model with its transcript and completed tool work intact. |
 | `agentType` | A named definition (`.pi/agents/<name>.md`) binding tools + model + role prompt. |
 | `cwd` | Run this agent in a different working directory (tools + session bind to it). |
 | `forkFrom` | Fork an existing Pi session file (JSONL) as starting context. The source file is never mutated; without `sessionPath`, the fork is temporary. |

@@ -456,3 +456,48 @@ return { a, b }`;
     assert.equal((done?.result?.result as { a?: string })?.a, "first-result-text", "agent 1 replayed from journal");
     assert.equal((done?.result?.result as { b?: string })?.b, "second-result-text", "agent 2 ran live after refill");
   }));
+
+test("an unavailable primary provider hands the same session to fallbackModel", () =>
+  withFauxSession(async ({ cwd, setResponses, fauxAssistantMessage }) => {
+    const requests: string[] = [];
+    // The SDK retries a transient provider error a few times on its own, so the
+    // primary keeps failing here until those retries are exhausted; only then does
+    // the handoff decision run. The fallback answers on its first request.
+    const respond = (_context: unknown, _options: unknown, _state: unknown, requestModel: { id: string }) => {
+      requests.push(requestModel.id);
+      if (requestModel.id === "faux-deepseek") throw new Error("503 Service Unavailable");
+      return fauxAssistantMessage("fallback answered", { stopReason: "stop" });
+    };
+    setResponses(Array.from({ length: 12 }, () => respond));
+    const agent = new WorkflowAgent({ cwd });
+    const handoffs: Array<{ requested: string; fallback?: string; reason?: string }> = [];
+
+    const result = await agent.run("do the task", {
+      label: "unavailable-fallback-probe",
+      model: "deepseek/faux-deepseek",
+      fallbackModel: "deepseek/faux-deepseek-fallback",
+      onModelFallback: (requested, fallback, reason) => handoffs.push({ requested, fallback, reason }),
+    });
+
+    assert.equal(result, "fallback answered");
+    assert.equal(requests.at(-1), "faux-deepseek-fallback", `requests: ${requests.join(", ")}`);
+    assert.deepEqual(handoffs, [
+      {
+        requested: "deepseek/faux-deepseek",
+        fallback: "deepseek/faux-deepseek-fallback",
+        reason: "primary provider is not answering",
+      },
+    ]);
+  }));
+
+test("an unavailable primary without a fallbackModel still fails the stage", () =>
+  withFauxSession(async ({ cwd, model, setResponses }) => {
+    setResponses(
+      Array.from({ length: 12 }, () => () => {
+        throw new Error("503 Service Unavailable");
+      }),
+    );
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+
+    await assert.rejects(() => agent.run("do the task", { label: "no-fallback-probe" }), /Service Unavailable/);
+  }));

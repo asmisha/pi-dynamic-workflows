@@ -20,6 +20,7 @@ import { applyToolPolicy } from "./agent-registry.js";
 import {
   classifyProviderLimit,
   isProviderAuthFailure,
+  isProviderUnavailable,
   isProviderUsageLimit,
   WorkflowError,
   WorkflowErrorCode,
@@ -794,14 +795,16 @@ export class WorkflowAgent {
           !modelSpec ||
           !fallbackModel ||
           !canHandoff ||
-          (!isProviderUsageLimit(error) && !isProviderAuthFailure(error))
+          (!isProviderUsageLimit(error) && !isProviderAuthFailure(error) && !isProviderUnavailable(error))
         ) {
           throw error;
         }
 
         const reason = isProviderUsageLimit(error)
           ? "primary provider usage limit"
-          : "primary provider authentication failed";
+          : isProviderAuthFailure(error)
+            ? "primary provider authentication failed"
+            : "primary provider is not answering";
         resolvedModel = fallbackModel;
         // Keep the same transcript and tool state so a writer that already edited
         // files remains one logical agent. Avoid AgentSession.setModel(), which

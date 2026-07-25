@@ -76,6 +76,18 @@ export function isProviderAuthFailure(error: unknown): boolean {
 }
 
 /**
+ * Whether a provider failure means the selected model is not answering right now:
+ * a gateway or overload response rather than a problem with the request. Same
+ * practical consequence as missing auth — this model cannot serve the call — so a
+ * configured fallbackModel should take over instead of failing the stage.
+ */
+export function isProviderUnavailable(error: unknown): boolean {
+  return /service unavailable|bad gateway|gateway time-?out|temporarily unavailable|overloaded|\b50[234]\b|\b529\b/i.test(
+    errorMessage(error),
+  );
+}
+
+/**
  * Detect a provider subscription/usage/quota/rate-limit exhaustion from free-form
  * error text, and extract the provider's human reset hint when present.
  *
