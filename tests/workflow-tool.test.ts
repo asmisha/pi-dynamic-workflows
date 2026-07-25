@@ -14,6 +14,7 @@ import {
   createWorkflowStopTool,
   createWorkflowTool,
   modelRoutingGuideline,
+  WORKFLOW_CONTRACT,
 } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -88,11 +89,12 @@ test("createWorkflowTool promptGuidelines mention model routing", () => {
   assert.ok(all.includes("small") || all.includes("medium") || all.includes("big"), "should mention tier names");
 });
 
-test("createWorkflowTool promptGuidelines keep budget and timeout unbounded by default", () => {
+test("createWorkflowTool promptGuidelines keep timeout unbounded by default", () => {
   const tool = createWorkflowTool();
   const all = tool.promptGuidelines.join(" ");
-  assert.match(all, /don't set tokenBudget\/agentTimeoutMs/i);
+  assert.match(all, /don't set agentTimeoutMs/i);
   assert.match(all, /unless the user asks/i);
+  assert.doesNotMatch(all, /tokenBudget|budget\.remaining|phase budget/i);
 });
 
 test("createWorkflowTool schema describes unbounded default timeout", () => {
@@ -110,6 +112,8 @@ test("createWorkflowTool schema exposes concurrency and agentRetries", () => {
   assert.match(parameters.properties?.concurrency?.description ?? "", /Maximum concurrent agents/i);
   assert.match(parameters.properties?.agentRetries?.description ?? "", /retry attempts/i);
   assert.match(parameters.properties?.agentRetries?.description ?? "", /read-only agents default to at least 1/i);
+  assert.equal(parameters.properties?.maxAgents, undefined);
+  assert.equal(parameters.properties?.tokenBudget, undefined);
 });
 
 test("createWorkflowTool promptGuidelines mention retry and concurrency controls", () => {
@@ -812,26 +816,50 @@ return { before, reply, after }`;
   }
 });
 
+test("createWorkflowTool parses stringified JSON args into the value scripts expect", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as ((args: unknown) => { args?: unknown }) | undefined;
+  assert.ok(prepare);
+  const script = "export const meta = { name: 't', description: 't' }";
+
+  assert.deepEqual(prepare({ script, args: '{"task":"review","n":1}' }).args, { task: "review", n: 1 });
+  assert.deepEqual(prepare({ script, args: "[1, 2]" }).args, [1, 2]);
+  // A plain string stays a string, and so does unparseable JSON.
+  assert.equal(prepare({ script, args: "hello" }).args, "hello");
+  assert.equal(prepare({ script, args: "{oops" }).args, "{oops");
+  assert.deepEqual(prepare({ script, args: { task: "review" } }).args, { task: "review" });
+  assert.equal(Object.hasOwn(prepare({ script }), "args"), false);
+
+  const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
+  assert.match(parameters.properties?.args?.description ?? "", /not stringified JSON/);
+});
+
+test("createWorkflowTool rejects removed run limits and budgets", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as ((args: unknown) => unknown) | undefined;
+  assert.ok(prepare);
+  const script = "export const meta = { name: 't', description: 't' }";
+  assert.throws(() => prepare({ script, maxAgents: 5 }), /maxAgents.*not supported/);
+  assert.throws(() => prepare({ script, tokenBudget: 1000 }), /tokenBudget.*not supported/);
+});
+
 test("createWorkflowTool prepareArguments passes through args", () => {
   const tool = createWorkflowTool();
   if (tool.prepareArguments) {
     const prepare = tool.prepareArguments as (args: unknown) => {
       script: string;
       args?: unknown;
-      maxAgents?: number;
       concurrency?: number;
       agentRetries?: number;
     };
     const result = prepare({
       script: "export const meta = { name: 't', description: 't' }",
       args: { question: "test" },
-      maxAgents: 5,
       concurrency: 2,
       agentRetries: 1,
     });
     assert.equal(result.script, "export const meta = { name: 't', description: 't' }");
     assert.deepEqual(result.args, { question: "test" });
-    assert.equal(result.maxAgents, 5);
     assert.equal(result.concurrency, 2);
     assert.equal(result.agentRetries, 1);
   }

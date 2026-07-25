@@ -7,14 +7,9 @@ export enum WorkflowErrorCode {
   AGENT_TIMEOUT = "AGENT_TIMEOUT",
   /** Workflow was aborted by user. */
   WORKFLOW_ABORTED = "WORKFLOW_ABORTED",
-  /** Agent limit exceeded. */
-  AGENT_LIMIT_EXCEEDED = "AGENT_LIMIT_EXCEEDED",
-  /** Token budget exhausted. */
-  TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED",
   /**
-   * The provider's subscription/usage/quota/rate limit was hit. Distinct from the
-   * user's self-imposed TOKEN_BUDGET_EXHAUSTED: a provider limit refills on its own,
-   * so the run is checkpointed (paused) and replayed by resume() rather than failed.
+   * The provider's subscription/usage/quota/rate limit was hit. The run is
+   * checkpointed (paused) and replayed by resume() rather than failed.
    */
   PROVIDER_USAGE_LIMIT = "PROVIDER_USAGE_LIMIT",
   /** A workflow checkpoint is waiting for a reply from the parent conversation. */

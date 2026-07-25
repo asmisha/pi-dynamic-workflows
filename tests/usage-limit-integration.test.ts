@@ -442,7 +442,7 @@ return { a, b }`;
     assert.ok((persisted?.journal?.length ?? 0) >= 1, "agent 1's result is journaled");
     assert.ok(pausedReasons.includes("usage_limit"), "a usage_limit 'paused' event fired");
 
-    // Budget refills: agent 2 now succeeds. Resume replays agent 1 from the journal.
+    // The provider limit resets: agent 2 now succeeds. Resume replays agent 1 from the journal.
     setResponses([fauxAssistantMessage("second-result-text", { stopReason: "stop" })]);
     assert.equal(await manager.resume(runId), true, "the paused run is resumable");
     const deadline = Date.now() + 1000;

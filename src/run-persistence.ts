@@ -40,9 +40,7 @@ export interface PersistedRunError {
 }
 
 export interface PersistedExecutionOptions {
-  maxAgents?: number;
   agentTimeoutMs?: number | null;
-  tokenBudget?: number | null;
   concurrency?: number;
   agentRetries?: number;
 }
@@ -70,7 +68,7 @@ export interface PersistedRunState {
   args?: unknown;
   /** Effective cwd used by this run; absent only on legacy persisted runs. */
   cwd?: string;
-  /** Effective execution limits preserved across pause/resume. */
+  /** Effective execution options preserved across pause/resume. */
   executionOptions?: PersistedExecutionOptions;
   /** The pi session this run belongs to. Runs persist on disk across sessions but
    * the navigator shows only the current session's runs (undefined = legacy/global). */

@@ -420,26 +420,20 @@ test("provisional SDK-retry usage does not block a concurrent pipeline stage", a
       return prompt;
     },
   };
-  const script = `export const meta = { name: 'provisional_budget', description: 'provisional usage' }
-const results = await pipeline(
+  const script = `export const meta = { name: 'provisional_usage', description: 'provisional usage' }
+return await pipeline(
   ['retrying', 'fast'],
   item => agent(item, { label: 'first:' + item }),
   (_first, item) => agent('next:' + item, { label: 'second:' + item }),
-)
-return { results, spent: budget.spent(), remaining: budget.remaining() }`;
+)`;
 
-  const result = await runWorkflow<{ results: string[]; spent: number; remaining: number }>(script, {
+  const result = await runWorkflow<string[]>(script, {
     agent: runner,
     concurrency: 2,
-    tokenBudget: 50,
     persistLogs: false,
   });
 
-  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
-    results: ["next:retrying", "next:fast"],
-    spent: 40,
-    remaining: 10,
-  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), ["next:retrying", "next:fast"]);
   assert.equal(result.tokenUsage.total, 40, "the rolled-back response stays out of final aggregate usage");
 });
 
@@ -842,51 +836,26 @@ test("callSeq is deterministic under parallel()", async () => {
   );
 });
 
-test("removed nested and quality globals are unavailable in the workflow VM", async () => {
+test("removed nested, quality, and budget globals are unavailable in the workflow VM", async () => {
   const script = `export const meta = { name: 'removed_globals', description: 'removed globals' }
-return [typeof workflow, typeof verify, typeof judgePanel, typeof loopUntilDry, typeof completenessCheck, typeof retry, typeof gate]`;
+return [typeof workflow, typeof verify, typeof judgePanel, typeof loopUntilDry, typeof completenessCheck, typeof retry, typeof gate, typeof budget]`;
 
   const result = await runWorkflow<string[]>(script, { agent: countingAgent().runner, persistLogs: false });
 
   assert.deepEqual(
     [...result.result],
-    ["undefined", "undefined", "undefined", "undefined", "undefined", "undefined", "undefined"],
+    ["undefined", "undefined", "undefined", "undefined", "undefined", "undefined", "undefined", "undefined"],
   );
 });
 
-test("runWorkflow budget gates on accumulated tokens", async () => {
-  const script = `export const meta = { name: 'budget_demo', description: 'budget' }
-const a = await agent('first', { label: 'a' })
-let second = null
-try { second = await agent('second', { label: 'b' }) } catch (e) { second = 'blocked' }
-return { a, second }`;
+test("phase rejects removed budget options", async () => {
+  const script = `export const meta = { name: 'phase_options', description: 'removed phase options' }
+phase('work', { budget: 100 })
+return 'unreachable'`;
 
-  const result = await runWorkflow<{ a: unknown; second: unknown }>(script, {
-    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
-    tokenBudget: 100,
-    persistLogs: false,
-  });
-
-  assert.equal(result.result.second, "blocked");
-});
-
-test("token budget exhaustion inside parallel() halts (non-recoverable, not swallowed)", async () => {
-  // A warm-up agent spends the whole budget (soft gate: spent accrues after it
-  // finishes); the agent() inside parallel() then hits the gate and must
-  // propagate the non-recoverable error, not become a null in the result array.
-  const script = `export const meta = { name: 'pb', description: 'budget in parallel' }
-await agent('warmup', { label: 'w' })
-const xs = await parallel([() => agent('x', { label: '1' })])
-return xs`;
   await assert.rejects(
-    () =>
-      runWorkflow(script, {
-        agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
-        tokenBudget: 100,
-        persistLogs: false,
-      }),
-    /budget/i,
-    "exhausted budget must reject the run, not become a null in the result array",
+    () => runWorkflow(script, { agent: countingAgent().runner, persistLogs: false }),
+    /phase\(\) accepts only a title/,
   );
 });
 
@@ -1012,57 +981,6 @@ return await pipeline([0], () => agent('lane', { label: 'lane' }))`;
     () => runWorkflow(script, { agent: { run: async () => "" }, persistLogs: false }),
     (error: unknown) =>
       error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_EMPTY_OUTPUT && error.recoverable,
-  );
-});
-
-test("non-recoverable agent-limit propagates out of pipeline() too", async () => {
-  const script = `export const meta = { name: 'mp', description: 'agent limit pipeline' }
-const xs = await pipeline([0, 1, 2, 3], (n) => agent('x' + n, { label: 'p' + n }))
-return xs`;
-  await assert.rejects(
-    () =>
-      runWorkflow(script, {
-        agent: fakeAgent({ input: 1, output: 0, total: 1, cost: 0 }),
-        maxAgents: 2,
-        persistLogs: false,
-      }),
-    /limit/i,
-  );
-});
-
-test("phase sub-budget throws when a phase exceeds its ceiling (run total untouched)", async () => {
-  const script = `export const meta = { name: 'pb', description: 'phase budget' }
-phase('noisy', { budget: 100 })
-let blocked = false
-try {
-  await agent('a', { label: '1' })
-  await agent('b', { label: '2' })
-} catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
-phase('calm')
-const after = await agent('c', { label: '3' })
-return { blocked, after }`;
-  const res = await runWorkflow<{ blocked: boolean; after: unknown }>(script, {
-    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
-    persistLogs: false,
-  });
-  assert.equal(res.result.blocked, true, "the 2nd agent in the phase hit the sub-budget");
-  assert.ok(res.result.after !== null, "a later phase still proceeds");
-});
-
-test("maxAgents is enforced under a parallel() fan-out (atomic slot reservation)", async () => {
-  // Four agents fan out with maxAgents=2. With the synchronous slot reservation,
-  // the 3rd agent() throws AGENT_LIMIT instead of all four passing the gate.
-  const script = `export const meta = { name: 'ma', description: 'agent limit' }
-const xs = await parallel([0, 1, 2, 3].map((i) => () => agent('x' + i, { label: 'a' + i })))
-return xs`;
-  await assert.rejects(
-    () =>
-      runWorkflow(script, {
-        agent: fakeAgent({ input: 1, output: 0, total: 1, cost: 0 }),
-        maxAgents: 2,
-        persistLogs: false,
-      }),
-    /limit/i,
   );
 });
 
@@ -1224,6 +1142,37 @@ return true`;
   );
 });
 
+test("runWorkflow exposes the run's own runId to inline scripts and native modules", async () => {
+  const script = `export const meta = { name: 'run_id', description: 'runId' }
+return { runId, viaAgent: await agent('probe ' + runId, { label: 'probe' }) }`;
+
+  const inline = await runWorkflow<{ runId: string }>(script, {
+    agent: fakeAgent({ total: 10 }),
+    persistLogs: false,
+    runId: "run-abc123",
+  });
+  assert.equal(inline.result.runId, "run-abc123");
+
+  const nativeModule = {
+    meta: { name: "run_id_module", description: "runId" },
+    run: async (context: { runId: string }) => context.runId,
+  };
+  const native = await runWorkflow<string>("", {
+    agent: fakeAgent({ total: 10 }),
+    persistLogs: false,
+    runId: "run-abc123",
+    workflowModule: nativeModule,
+  });
+  assert.equal(native.result, "run-abc123");
+
+  // A run without an explicit id still gets one, so scripts can always rely on it.
+  const generated = await runWorkflow<{ runId: string }>(script, {
+    agent: fakeAgent({ total: 10 }),
+    persistLogs: false,
+  });
+  assert.match(generated.result.runId, /^run-[a-z0-9]+$/);
+});
+
 test("runWorkflow process.cwd() works inside script", async () => {
   const script = `export const meta = { name: 'cwd_test', description: 'cwd' }
 return { cwd: process.cwd() }`;
@@ -1235,20 +1184,6 @@ return { cwd: process.cwd() }`;
 
   assert.equal(typeof result.result.cwd, "string");
   assert.ok(result.result.cwd.length > 0, "result.cwd should not be empty");
-});
-
-test("runWorkflow budget object exposes spent() and remaining()", async () => {
-  const script = `export const meta = { name: 'budget_api', description: 'budget API' }
-try { const s = budget.spent(); const r = budget.remaining(); return { spent: s, remaining: typeof r } }
-catch(e) { return { error: String(e) } }`;
-
-  const result = await runWorkflow<{ spent: number; remaining: string }>(script, {
-    agent: fakeAgent({ total: 100 }),
-    persistLogs: false,
-  });
-
-  assert.equal(result.result.spent, 0); // before first agent
-  assert.equal(result.result.remaining, "number");
 });
 
 test("runWorkflow returns empty logs array when nothing logged", async () => {

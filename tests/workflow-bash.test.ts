@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
+import { workflowProjectPaths } from "../src/workflow-paths.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 function fakeAgent() {
   return {
@@ -237,5 +239,40 @@ test(
 await bash(42)
 return 'unreachable'`;
     await assert.rejects(runWorkflow(script, { cwd: dir, agent: fakeAgent(), persistLogs: false }), /command string/);
+  }),
+);
+
+test(
+  "persisted log and bash output follow the run's artifactCwd, not its working cwd",
+  withTempDir(async (dir) => {
+    const home = mkdtempSync(join(tmpdir(), "pi-workflow-home-"));
+    const runCwd = mkdtempSync(join(tmpdir(), "pi-workflow-runcwd-"));
+    try {
+      await withFakeHomeAsync(home, async () => {
+        const script = `export const meta = { name: 'artifact_home', description: 'artifacts' }
+log('marker line')
+const out = await bash('echo hello')
+return out.stdoutFile`;
+
+        const result = await runWorkflow<string>(script, {
+          agent: fakeAgent(),
+          cwd: runCwd,
+          artifactCwd: dir,
+          runId: "run-artifacts1",
+          persistLogs: true,
+        });
+
+        // One project directory owns the run: its bash output and its log.
+        const runsDir = workflowProjectPaths(dir).runsDir;
+        assert.equal(result.result.startsWith(join(runsDir, "run-artifacts1-bash")), true, result.result);
+        assert.equal(readFileSync(result.result, "utf8").trim(), "hello");
+        assert.match(readFileSync(join(runsDir, "run-artifacts1.log"), "utf8"), /marker line/);
+        // Nothing lands in the project directory of the cwd the agents work in.
+        assert.equal(existsSync(workflowProjectPaths(runCwd).runsDir), false);
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(runCwd, { recursive: true, force: true });
+    }
   }),
 );

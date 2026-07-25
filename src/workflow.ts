@@ -19,7 +19,7 @@ import {
   loadAgentRegistry,
   resolveAgentType,
 } from "./agent-registry.js";
-import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
+import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_CONCURRENCY } from "./config.js";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
@@ -76,7 +76,6 @@ export interface JournalEntry {
 export interface SharedRuntime {
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
   agentCount: number;
-  spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   /** Live/queued agent/bash calls and combinator branches; checkpoints require this to be zero. */
   activeCalls: number;
@@ -96,16 +95,20 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   concurrency?: number;
   /** Run-level retry attempts after a recoverable agent failure. Read-only calls default to at least one. */
   agentRetries?: number;
-  tokenBudget?: number | null;
   /** Trusted native ESM workflow loaded from scriptPath. Inline workflows omit this. */
   workflowModule?: WorkflowModuleDefinition;
   signal?: AbortSignal;
-  /** Maximum number of agents allowed in this run. Default: 1000 */
-  maxAgents?: number;
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
+  /**
+   * Cwd whose project directory owns this run's persisted artifacts (log and bash
+   * output). The manager passes its own cwd, the one that also owns the run's state
+   * file and lease, so a run started in another worktree keeps state, log, and bash
+   * output in one project directory. Defaults to the run cwd.
+   */
+  artifactCwd?: string;
   /** Run ID for persistence. Auto-generated if not provided. */
   runId?: string;
   /** Resume: cached call results keyed by deterministic call index. */
@@ -244,14 +247,16 @@ export interface WorkflowRuntimeContext {
   ) => Promise<unknown[]>;
   checkpoint: (question: string) => unknown;
   log: (message: string) => void;
-  phase: (title: string, options?: { budget?: number }) => void;
+  phase: (title: string) => void;
   args: unknown;
   cwd: string;
-  budget: {
-    total: number | null;
-    spent: () => number;
-    remaining: () => number;
-  };
+  /**
+   * This run's id, the same one that names its persisted state, log, and bash
+   * artifacts. It is assigned once and survives resume/retry unchanged, so it is
+   * the only safe way to give a run its own artifact or session paths: a value
+   * invented inside the script would change on replay and break journal identity.
+   */
+  runId: string;
 }
 
 export interface WorkflowModuleDefinition {
@@ -276,14 +281,6 @@ interface RuntimeExecutionContext {
 
 interface RuntimeState {
   currentPhase?: string;
-  /**
-   * Per-phase soft sub-budgets carved from the run total: phase title -> the
-   * ceiling and the run-wide spent at the moment the budget was declared. A phase
-   * exceeding its ceiling throws TOKEN_BUDGET_EXHAUSTED while the run's overall
-   * budget is untouched. Soft gate (like the global one): spent accrues after each
-   * agent, so an in-flight wave may overshoot slightly.
-   */
-  phaseBudgets: Map<string, { budget: number; startSpent: number; warned: boolean }>;
   logs: string[];
   phases: string[];
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
@@ -343,7 +340,6 @@ export async function runWorkflow<T = unknown>(
     : parseWorkflowScript(script);
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
-  const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
@@ -352,9 +348,10 @@ export async function runWorkflow<T = unknown>(
   const agentRegistry = options.agentRegistry ?? loadAgentRegistry(baseCwd);
 
   // Initialize logger
+  const artifactCwd = options.artifactCwd ?? options.cwd ?? process.cwd();
   const logger = createWorkflowLogger({
     runId,
-    cwd: options.cwd ?? process.cwd(),
+    cwd: artifactCwd,
     persist: options.persistLogs ?? true,
     onLog: options.onLog,
   });
@@ -367,7 +364,6 @@ export async function runWorkflow<T = unknown>(
     // explicit phase() (or agent({ phase })) overrides this.
     phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
     currentPhase: meta.phases?.[0]?.title,
-    phaseBudgets: new Map(),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
   };
@@ -380,7 +376,6 @@ export async function runWorkflow<T = unknown>(
   const shared: SharedRuntime = {
     limiter: createLimiter(concurrency),
     agentCount: 0,
-    spent: initialUsage?.total ?? 0,
     tokenUsage: {
       input: initialUsage?.input ?? 0,
       output: initialUsage?.output ?? 0,
@@ -438,23 +433,12 @@ export async function runWorkflow<T = unknown>(
     logger.log(text);
   };
 
-  const phase = (title: string, phaseOptions?: { budget?: number }) => {
+  const phase = (title: string, legacyOptions?: unknown) => {
+    if (legacyOptions !== undefined) throw new TypeError("phase() accepts only a title");
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
-    // Carve a soft sub-budget from the run total for work done under this phase.
-    // Re-declaring re-bases from the current spent (idempotent across resume: the
-    // script re-runs phase() and the ceiling is recomputed from live spent).
-    if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
-      state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
-    }
     options.onPhase?.(title);
   };
-
-  const budget = Object.freeze({
-    total: options.tokenBudget ?? null,
-    spent: () => shared.spent,
-    remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.spent)),
-  });
 
   let abandonedAgentError: WorkflowError | undefined;
   const throwIfAborted = () => {
@@ -487,15 +471,6 @@ export async function runWorkflow<T = unknown>(
   const agentImpl = async (prompt: string, agentOptions: AgentOptions = {}) => {
     throwIfAborted();
 
-    // Check agent limit
-    if (shared.agentCount >= maxAgents) {
-      throw new WorkflowError(
-        `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,
-        WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
-        { recoverable: false },
-      );
-    }
-
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
     const requestedLabel = agentOptions.label?.trim();
 
@@ -522,11 +497,7 @@ export async function runWorkflow<T = unknown>(
     const { index: callIndex, callId } = nextCallIdentity();
     const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
 
-    // Reserve the agent slot synchronously — atomic with the limit/budget gate
-    // above (no await in between) — so a parallel() fan-out can't all observe the
-    // same agentCount and overshoot maxAgents. (Token budget stays a soft gate:
-    // spent accrues after each agent, matching Claude Code; in-flight agents may
-    // push slightly past total, then further agent() calls throw.)
+    // Count the logical agent synchronously before any asynchronous work begins.
     shared.agentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
 
@@ -564,28 +535,6 @@ export async function runWorkflow<T = unknown>(
       }
     }
 
-    if (budget.total !== null && budget.remaining() <= 0) {
-      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
-        recoverable: false,
-      });
-    }
-    if (assignedPhase) {
-      const pb = state.phaseBudgets.get(assignedPhase);
-      if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
-        if (phaseSpent >= pb.budget) {
-          throw new WorkflowError(
-            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
-            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
-            { recoverable: false },
-          );
-        }
-        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
-          pb.warned = true;
-          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
-        }
-      }
-    }
     // A genuine miss (no journal entry, failed entry, or hash change) marks where
     // the unchanged prefix ends; this call and every later one then run live.
     if (!retryMode && (!hashMatches || !cachedSucceeded || cachedEmptyOutput)) {
@@ -634,13 +583,11 @@ export async function runWorkflow<T = unknown>(
         const commitUsage = (result: unknown) => {
           let tokens = usage?.total ?? 0;
           if (tokens > 0) {
-            shared.spent += tokens;
             committedTokens += tokens;
             return;
           }
           tokens = estimateTokens(result) + estimateTokens(prompt);
           shared.tokenUsage.total += tokens;
-          shared.spent += tokens;
           committedTokens += tokens;
           options.onAgentUsage?.({ callId, label, phase: assignedPhase, tokens: committedTokens });
           options.onTokenUsage?.(shared.tokenUsage);
@@ -834,7 +781,7 @@ export async function runWorkflow<T = unknown>(
     shared.activeCalls++;
     const work = (async () => {
       try {
-        const output = bashOutputFiles(baseCwd, runId, callIndex, options.persistLogs ?? true);
+        const output = bashOutputFiles(artifactCwd, runId, callIndex, options.persistLogs ?? true);
         const result = await runBashCommand(command, {
           cwd: bashOptions.cwd ?? baseCwd,
           timeoutMs: bashOptions.timeoutMs ?? null,
@@ -939,24 +886,10 @@ export async function runWorkflow<T = unknown>(
         { recoverable: false },
       );
     }
-    if (state.phaseBudgets.size > 0) {
-      throw new WorkflowError(
-        "checkpoint() is not supported in workflows with phase token sub-budgets",
-        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-        { recoverable: false },
-      );
-    }
     if (shared.activeCalls > 0) {
       throw new WorkflowError(
         "checkpoint() requires all prior runtime work to be awaited",
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-        { recoverable: false },
-      );
-    }
-    if (shared.agentCount >= maxAgents) {
-      throw new WorkflowError(
-        `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,
-        WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
         { recoverable: false },
       );
     }
@@ -970,13 +903,11 @@ export async function runWorkflow<T = unknown>(
       isJournalSuccess(cached) &&
       (retryMode || callIndex < state.firstMiss)
     ) {
-      shared.agentCount++;
       return cached.result;
     }
     if (!retryMode && (cached == null || cached.hash !== callHash || !isJournalSuccess(cached))) {
       state.firstMiss = Math.min(state.firstMiss, callIndex);
     }
-    shared.agentCount++;
 
     const pending: PendingCheckpoint = { callIndex, callId, hash: callHash, prompt: promptText };
     throw new WorkflowError(promptText, WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED, {
@@ -995,7 +926,7 @@ export async function runWorkflow<T = unknown>(
     phase,
     args: options.args,
     cwd: options.cwd ?? process.cwd(),
-    budget,
+    runId,
   });
 
   let result: unknown;

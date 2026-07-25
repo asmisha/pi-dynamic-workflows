@@ -273,17 +273,13 @@ test(
       persistedOptions = running[0]?.executionOptions;
     });
     await manager.runSync(oneAgentScript, undefined, {
-      maxAgents: 5,
-      tokenBudget: 1000,
       concurrency: 2,
       agentRetries: 1,
       agentTimeoutMs: 500,
     });
     assert.equal(listedWhileRunning, 1, "the run shows as running in listRuns mid-flight");
     assert.deepEqual(persistedOptions, {
-      maxAgents: 5,
       agentTimeoutMs: 500,
-      tokenBudget: 1000,
       concurrency: 2,
       agentRetries: 1,
     });
@@ -2017,7 +2013,7 @@ return { a, b }`;
     assert.equal(pausedEvents[0].reason, "usage_limit");
     assert.equal(pausedEvents[0].resetHint, "Resets in ~3h");
 
-    // After the budget refills, resume replays agent 1 and runs agent 2 live to completion.
+    // After the provider limit resets, resume replays agent 1 and runs agent 2 live to completion.
     limitActive = false;
     const resumed = await manager.resume(runId);
     assert.equal(resumed, true);
@@ -3180,8 +3176,6 @@ return { before, reply, after }`;
         });
       });
       const { runId } = manager.startInBackground(script, undefined, {
-        maxAgents: 5,
-        tokenBudget: 10_000,
         concurrency: 2,
         agentRetries: 1,
         agentTimeoutMs: 1234,
@@ -3193,9 +3187,7 @@ return { before, reply, after }`;
       assert.equal(persisted?.pauseReason, "human_input");
       assert.equal(persisted?.pendingCheckpoint?.prompt, "Accept risk?");
       assert.deepEqual(persisted?.executionOptions, {
-        maxAgents: 5,
         agentTimeoutMs: 1234,
-        tokenBudget: 10_000,
         concurrency: 2,
         agentRetries: 1,
       });

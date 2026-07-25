@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createReadOnlyBashSession } from "../src/read-only-bash.js";
@@ -118,6 +118,59 @@ test("read-only bash blocks repository writes from shells, Python, Node, and sym
       ]) {
         assert.equal(existsSync(join(repo, path)), false, `${path} must remain absent`);
       }
+    } finally {
+      sandbox.cleanup();
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("read-only bash cannot read user data outside the review target", macOnly, async () => {
+  const repo = mkdtempSync(join(tmpdir(), "readonly-bash-scope-"));
+  const outside = mkdtempSync(join(homedir(), "readonly-bash-outside-"));
+  try {
+    writeFileSync(join(repo, "inside.txt"), "inside\n");
+    writeFileSync(join(outside, "secret.txt"), "outside-secret\n");
+
+    const sandbox = createReadOnlyBashSession(repo);
+    assert.ok(sandbox.tool);
+    try {
+      assert.match(await runBash(sandbox.tool, "cat inside.txt"), /inside/);
+
+      const denied = await runBash(sandbox.tool, `cat ${JSON.stringify(join(outside, "secret.txt"))} 2>&1 || true`);
+      assert.doesNotMatch(denied, /outside-secret/);
+
+      // A home-wide search finds nothing instead of wandering into a tree that blocks.
+      const scan = await runBash(
+        sandbox.tool,
+        `find ${JSON.stringify(homedir())} -maxdepth 2 -name "secret.txt" 2>/dev/null | head -3; echo done`,
+      );
+      assert.doesNotMatch(scan, /secret\.txt/);
+      assert.match(scan, /done/);
+    } finally {
+      sandbox.cleanup();
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("read-only bash kills a command that outlives the default timeout", macOnly, async () => {
+  const repo = mkdtempSync(join(tmpdir(), "readonly-bash-timeout-"));
+  try {
+    const sandbox = createReadOnlyBashSession(repo, { defaultTimeoutSeconds: 1 });
+    assert.ok(sandbox.tool);
+    try {
+      const startedAt = Date.now();
+      // The shell would never handle a signal while `sleep` holds the foreground,
+      // so the bound must kill the whole process tree from outside. The agent sees
+      // an explicit timeout error instead of waiting forever.
+      await assert.rejects(() => runBash(sandbox.tool, "sleep 30; echo finished"), /timed out after 1 seconds/);
+      const elapsedMs = Date.now() - startedAt;
+      assert.ok(elapsedMs < 15_000, `expected an early kill, took ${elapsedMs}ms`);
+      assert.equal(execFileSync("/bin/sh", ["-c", "pgrep -f 'sleep 30' | wc -l"]).toString().trim(), "0");
     } finally {
       sandbox.cleanup();
     }

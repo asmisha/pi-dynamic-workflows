@@ -135,18 +135,14 @@ export interface ExecOptions {
   resumeJournal?: Map<number, JournalEntry>;
   /** Retry these failed structural agent calls while replaying successful siblings. */
   retryFailedCallIds?: Set<string>;
-  /** Cumulative usage already spent by the replayed prefix. */
+  /** Cumulative token usage already recorded for the replayed prefix. */
   initialTokenUsage?: PersistedRunState["tokenUsage"];
-  /** Cap on total agents for this run. */
-  maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
   /** Called with the live snapshot on every progress event. */
   onProgress?: (snapshot: WorkflowSnapshot) => void;
-  /** Hard token budget for this run; once spent reaches it, agent() throws. */
-  tokenBudget?: number | null;
   /** Max concurrent agents for this execution. */
   concurrency?: number;
   /** Retry attempts after recoverable agent failures for this execution. */
@@ -402,9 +398,7 @@ export class WorkflowManager extends EventEmitter {
 
   private resolveExecutionOptions(exec: ExecOptions): PersistedExecutionOptions {
     return {
-      maxAgents: exec.maxAgents,
       agentTimeoutMs: exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs,
-      tokenBudget: exec.tokenBudget,
       concurrency: exec.concurrency ?? this.concurrency,
       agentRetries: exec.agentRetries ?? this.defaultAgentRetries,
     };
@@ -419,11 +413,9 @@ export class WorkflowManager extends EventEmitter {
     const {
       resumeJournal,
       retryFailedCallIds,
-      maxAgents,
       agentTimeoutMs,
       externalSignal,
       onProgress,
-      tokenBudget,
       concurrency,
       agentRetries,
       initialTokenUsage,
@@ -432,9 +424,7 @@ export class WorkflowManager extends EventEmitter {
     const resolvedConcurrency = concurrency ?? this.concurrency;
     const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
     managed.executionOptions ??= {
-      maxAgents,
       agentTimeoutMs: resolvedAgentTimeoutMs,
-      tokenBudget,
       concurrency: resolvedConcurrency,
       agentRetries: resolvedAgentRetries,
     };
@@ -481,6 +471,10 @@ export class WorkflowManager extends EventEmitter {
       const result = await runWorkflow(script, {
         runId: managed.runId,
         cwd: managed.cwd,
+        // State, lease, log, and bash output belong to one project directory: this
+        // manager's. Without it a run in another worktree split its artifacts across
+        // two project dirs, so its log could not be found from its state path.
+        artifactCwd: this.cwd,
         args,
         agent: this.agent,
         mainModel: this.mainModel,
@@ -488,9 +482,7 @@ export class WorkflowManager extends EventEmitter {
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
-        maxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
-        tokenBudget,
         workflowModule,
         initialTokenUsage,
         onRuntimeOwnedWorkStart: observeRuntimeOwnedWork,
@@ -693,7 +685,7 @@ export class WorkflowManager extends EventEmitter {
         managed.pauseReason = "usage_limit";
         // Provider quota/usage limit: NOT a failure. Checkpoint the run as paused so
         // the persisted journal (completed agent results) is replayed by resume()
-        // once the budget refills — instead of the user starting from scratch.
+        // once the provider limit resets — instead of the user starting from scratch.
         managed.status = "paused";
       } else {
         managed.status = "failed";

@@ -65,7 +65,7 @@ return { reply, continued: true }`;
   assert.equal(resumed.result.continued, true);
 });
 
-test("checkpoint(): cached prefix and reply replay even when cumulative token budget is exhausted", async () => {
+test("checkpoint(): cached prefix and reply replay preserve cumulative token usage", async () => {
   const script = `export const meta = { name: 'c', description: 'checkpoint' }
 const before = await agent('before')
 const reply = await checkpoint('Approve?')
@@ -91,11 +91,11 @@ return { before, reply }`;
     },
     persistLogs: false,
     resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
-    tokenBudget: 100,
     initialTokenUsage: { total: 100 },
   });
   assert.equal(resumed.result.before, "ok");
   assert.equal(resumed.result.reply, "approved");
+  assert.equal(resumed.tokenUsage.total, 100);
 });
 
 test("checkpoint(): rejects concurrent parallel placement", async () => {
@@ -170,18 +170,4 @@ return { first, second }`;
     first: "first answer",
     second: "second answer",
   });
-});
-
-test("checkpoint(): rejects workflows with phase token sub-budgets", async () => {
-  const script = `export const meta = { name: 'c', description: 'checkpoint', phases: [{ title: 'P' }] }
-phase('P', { budget: 100 })
-return await checkpoint('unsupported budget combination')`;
-  await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false }), /phase token sub-budgets/i);
-});
-
-test("checkpoint(): counts against maxAgents", async () => {
-  const script = `export const meta = { name: 'c', description: 'checkpoint' }
-await checkpoint('a')
-return 1`;
-  await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false, maxAgents: 0 }), /limit/i);
 });

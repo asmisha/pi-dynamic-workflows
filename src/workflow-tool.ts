@@ -24,12 +24,26 @@ import { WorkflowManager } from "./workflow-manager.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
 
 /**
+ * The authoring rules a caller must follow or the run fails. They live in the
+ * tool's `description`, which is part of the tool schema and therefore always
+ * reaches the model — unlike `promptGuidelines`, which the host drops whenever
+ * the user supplies a custom system prompt (see core/system-prompt: the
+ * customPrompt branch returns before guidelines are read). `promptGuidelines`
+ * reuses this same array so the two can never drift.
+ */
+export const WORKFLOW_CONTRACT = [
+  "Use it for decomposable work — repo inspection, independent checks, multi-perspective review, fan-out/fan-in synthesis — or when the user or a skill asks for it; not for a single quick read/edit.",
+  "An inline script is plain deterministic sandboxed JavaScript: no Markdown fences, prose, TypeScript, import/require, filesystem or network APIs, Date.now(), new Date(), or Math.random(). `export const meta = { name, description, phases? }` must be its first statement, and it must call agent() at least once.",
+  "Inline globals, also available as fields of a native run(context): agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), bash(cmd, opts), checkpoint(question), log, args, cwd, runId. Use runId, never an invented id, when a run needs its own artifact or session paths.",
+  "Subagents inherit no parent context: every prompt must carry its own task, paths, and expected output. Set opts.readOnly = true for reviewers and searchers, and opts.retryable = false for any agent that can duplicate side effects.",
+  "parallel() and pipeline() reject on branch failure: for best effort catch inside the branch, never on the aggregate. bash() returns {pid, exitCode, stdoutFile, stderrFile}; pass those paths to agents instead of pasting output through results.",
+  "Runs are background by default — the call returns a run ID and the result is delivered back later; pass background: false only when the result is required inline this turn.",
+];
+
+/**
  * Model routing guideline for workflow authors.
  * Tells the LLM about opts.tier (small/medium/big) for runtime-enforced
  * model selection, and opts.model for an exact provider/id override.
- *
- * This string is injected into the workflow tool's promptGuidelines and
- * therefore appears in the LLM's system prompt for every workflow execution.
  *
  * `registry` is a live host-session ModelRegistry (or a getter reaching one),
  * e.g. from WorkflowManager.getModelRegistry(). A getter lets each call see
@@ -87,7 +101,13 @@ const workflowToolSchema = Type.Object({
   ),
   script: Type.Optional(
     Type.String({
-      description: "Raw JavaScript workflow script (no Markdown fences). Pass exactly one of script or scriptPath.",
+      description: [
+        "Raw deterministic JavaScript workflow script (no Markdown fences). Pass exactly one of script or scriptPath. Skeleton:",
+        "export const meta = { name: 'short_snake_case', description: 'non-empty', phases: [{ title: 'Phase' }] }",
+        "phase('Phase')",
+        "const results = await parallel(items.map(item => () => agent('task + context + paths', { label: 'unique 2-4 words', readOnly: true })))",
+        "return { verdict: '...', results }",
+      ].join("\n"),
     }),
   ),
   scriptPath: Type.Optional(
@@ -103,17 +123,15 @@ const workflowToolSchema = Type.Object({
     }),
   ),
   args: Type.Optional(
-    Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
+    Type.Any({
+      description:
+        "Optional JSON object exposed to the workflow script as global `args`. Pass an object, not stringified JSON.",
+    }),
   ),
   background: Type.Optional(
     Type.Boolean({
       description:
         "Default true: return immediately with a run ID; the result is delivered back when the run finishes. false blocks for the result inline.",
-    }),
-  ),
-  maxAgents: Type.Optional(
-    Type.Number({
-      description: "Maximum number of agents allowed in this run. Default: 1000.",
     }),
   ),
   concurrency: Type.Optional(
@@ -134,12 +152,6 @@ const workflowToolSchema = Type.Object({
         "Timeout per agent in milliseconds. Omit for no hard timeout by default. Set only when the user asks to bound time.",
     }),
   ),
-  tokenBudget: Type.Optional(
-    Type.Number({
-      description:
-        "Hard total-token budget for the whole run. Once spent reaches it, further agent() calls fail and the run stops. Omit for no limit. Set it when the user asks to cap spend.",
-    }),
-  ),
 });
 
 export type WorkflowToolInput = {
@@ -150,11 +162,9 @@ export type WorkflowToolInput = {
   cwd?: string;
   args?: unknown;
   background?: boolean;
-  maxAgents?: number;
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number;
-  tokenBudget?: number;
 };
 
 export interface WorkflowToolOptions {
@@ -357,6 +367,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     description: [
       "Execute or continue a deterministic JavaScript workflow that orchestrates subagents and shell steps.",
       "To start, pass exactly one source: inline script or absolute scriptPath. To answer a paused checkpoint, pass only resumeRunId and reply.",
+      ...WORKFLOW_CONTRACT,
     ].join(" "),
     promptSnippet:
       "Run a workflow from one source: an inline deterministic script, or a trusted native ESM scriptPath exporting `meta` and `run(context)`.",
@@ -367,22 +378,15 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     // until the next one.
     get promptGuidelines() {
       return [
-        "Use workflow only when the user explicitly asks for a workflow, fan-out, or multi-agent orchestration — for decomposable work (repo inspection, independent checks, multi-perspective review, fan-out/fan-in synthesis), not a single quick read/edit.",
-        [
-          "Use exactly one source. For generated inline JavaScript, use no fences, prose, TypeScript/imports/require/fs/Date.now()/Math.random()/new Date(). Inline skeleton:",
-          "export const meta = { name: 'short_snake_case', description: 'non-empty', phases: [{ title: 'Phase' }] }",
-          "phase('Phase')",
-          "const results = await parallel(items.map(item => () => agent('task + context + paths', { label: 'unique 2-4 words', tier: 'small' })))",
-          "return { ok: true, verdict: '...', results }",
-          "For a trusted reusable scriptPath, use native ESM: export literal `meta` and `async function run(context)`, use normal Node.js imports, and destructure workflow APIs from context. Keep its source files unchanged while a run is resumable.",
-        ].join("\n"),
-        "Inline globals and native run(context) fields: agent(prompt, opts), parallel(thunks: Array<() => Promise<unknown>>), pipeline(items, ...stages), phase(title), bash(cmd, {cwd?, timeoutMs?}), log(msg), args, cwd, budget, checkpoint(question). checkpoint always pauses and transfers its question to the parent conversation; continue the same run with the host workflow({resumeRunId, reply}) tool call.",
-        "parallel() and pipeline() reject on branch failure. For best effort, catch inside each branch or pipeline stage (for example, () => agent(...).catch(() => fallback)); never attach .catch to parallel(...) or pipeline(...), because the aggregate can reject while sibling branches are still running. Results keep input order on success.",
-        "bash(cmd) runs a shell command and returns {pid, exitCode, stdoutFile, stderrFile}. Full stdout/stderr go to those files; do not paste output directly through the workflow result. Use it for mechanical steps (grep/build/test), check exitCode, then pass the file paths to agent() so subagents can read/grep the files. Results are journaled so resume replays them without re-running.",
-        "Subagents have NO parent context unless you give it to them: each prompt must carry the task, relevant paths, and expected output. For machine-readable output pass a plain JSON Schema via opts.schema (not TypeScript/TypeBox). opts.cwd runs an agent in another directory. Set opts.readOnly = true for every reviewer/searcher; the flag removes code-writing tools and gives one automatic recoverable retry by default, so ordinary read-only calls do not need retries configuration. Set opts.retryable = false for every agent that may edit files, post comments, submit forms, or otherwise duplicate side effects. For a required cross-provider backup, set opts.fallbackModel to an exact provider/modelId alongside opts.model; only missing authentication/availability or a provider usage limit triggers the handoff, and the same subagent session continues with prior tool work intact. Session args: opts.forkFrom forks an existing Pi session file as read-only starting context; opts.sessionPath persists/continues this subagent's working session (relative paths resolve under ~/.pi/workflows/sessions/); using both forks into a new persistent session and is invalid if the target already exists. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle still applies. With multiple phases, call phase('Exact Title') before each phase's work so agents group correctly. End with a synthesis agent when combining results; return a compact JSON-serializable value.",
+        // Hard contract first, shared verbatim with `description` so a host that
+        // drops guidelines still delivers it.
+        ...WORKFLOW_CONTRACT,
+        "For a trusted reusable scriptPath, use native ESM: export literal `meta` and `async function run(context)`, use normal Node.js imports, and destructure workflow APIs from context. Keep its source files unchanged while a run is resumable.",
+        "checkpoint(question) always pauses and transfers its question to the parent conversation; continue the same run with the host workflow({resumeRunId, reply}) tool call.",
+        "For machine-readable agent output pass a plain JSON Schema via opts.schema (not TypeScript/TypeBox). opts.cwd runs an agent in another directory. opts.readOnly also removes code-writing tools and grants one automatic recoverable retry by default, so ordinary read-only calls need no retries configuration. For a required cross-provider backup, set opts.fallbackModel to an exact provider/modelId alongside opts.model; only missing authentication/availability or a provider usage limit triggers the handoff, and the same subagent session continues with prior tool work intact. Session args: opts.forkFrom forks an existing Pi session file as read-only starting context; opts.sessionPath persists/continues this subagent's working session (relative paths resolve under ~/.pi/workflows/sessions/); using both forks into a new persistent session and is invalid if the target already exists. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle still applies. With multiple phases, call phase('Exact Title') before each phase's work so agents group correctly. End with a synthesis agent when combining results; return a compact JSON-serializable value.",
         modelRoutingGuideline(() => manager.getModelRegistry()),
         agentTypeGuideline(),
-        "Runs are background by default (run ID now, result delivered when finished); background: false only when the result is needed inline this turn. Don't set tokenBudget/agentTimeoutMs unless the user asks to cap spend/time; to bound spend use tokenBudget, phase('Name', {budget: N}) (wrap in try/catch), or branch on budget.remaining(). Use low concurrency + agentRetries for flaky provider fan-outs.",
+        "Don't set agentTimeoutMs unless the user asks to bound time. Use low concurrency + agentRetries for flaky provider fan-outs.",
       ].filter((g): g is string => typeof g === "string" && g.length > 0);
     },
     parameters: workflowToolSchema,
@@ -420,11 +424,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         const { runId } = manager.startInBackground(source.script, params.args, {
           workflowModulePath: source.workflowModulePath,
           workflowModule: source.workflowModule,
-          maxAgents: params.maxAgents,
           concurrency: params.concurrency,
           agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
-          tokenBudget: params.tokenBudget,
           cwd: runCwd,
         });
         return {
@@ -450,11 +452,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         result = await manager.runSync(source.script, params.args, {
           workflowModulePath: source.workflowModulePath,
           workflowModule: source.workflowModule,
-          maxAgents: params.maxAgents,
           concurrency: params.concurrency,
           agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
-          tokenBudget: params.tokenBudget,
           cwd: runCwd,
           externalSignal: signal,
           onProgress(live) {
@@ -641,6 +641,18 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
   if (Object.hasOwn(value, "reply")) {
     throw new Error("workflow `reply` requires `resumeRunId`");
   }
+  const startFields = new Set([
+    "script",
+    "scriptPath",
+    "cwd",
+    "args",
+    "background",
+    "concurrency",
+    "agentRetries",
+    "agentTimeoutMs",
+  ]);
+  const unsupportedField = Object.keys(value).find((field) => !startFields.has(field));
+  if (unsupportedField) throw new Error(`workflow \`${unsupportedField}\` is not supported`);
   if (hasScript && typeof value.script !== "string") {
     throw new Error("workflow requires `script` to be a string");
   }
@@ -648,8 +660,25 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
   if (value.cwd !== undefined) validateAbsolutePath(value.cwd, "cwd");
   return {
     ...value,
+    ...(Object.hasOwn(value, "args") ? { args: parseJsonArgs(value.args) } : {}),
     ...(typeof value.script === "string" ? { script: normalizeWorkflowScript(value.script) } : {}),
   } as WorkflowToolInput;
+}
+
+/**
+ * `args` is intentionally untyped, so callers routinely hand it stringified JSON.
+ * Parse that back into the object/array the script expects; anything else stays
+ * verbatim, because a workflow may legitimately want a plain string.
+ */
+function parseJsonArgs(args: unknown): unknown {
+  if (typeof args !== "string") return args;
+  const trimmed = args.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return args;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return args;
+  }
 }
 
 function validateAbsolutePath(value: unknown, field: string): asserts value is string {
