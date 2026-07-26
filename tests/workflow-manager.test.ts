@@ -3232,3 +3232,28 @@ return { before, reply, after }`;
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test(
+  "bash steps land in the snapshot as bash nodes without inflating agent counts",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const script = `export const meta = { name: 'bash_nodes', description: 'shell step' }
+phase('Calibrate')
+await bash('echo calibrating')
+return 'ok'`;
+    const events: string[] = [];
+    for (const ev of ["bashStart", "bashEnd"]) manager.on(ev, () => events.push(ev));
+
+    await manager.runSync(script);
+
+    assert.deepEqual(events, ["bashStart", "bashEnd"]);
+    const persisted = manager.listRuns()[0];
+    assert.equal(persisted.agents.length, 1);
+    const step = persisted.agents[0];
+    assert.equal(step.kind, "bash");
+    assert.equal(step.label, "$ echo calibrating");
+    assert.equal(step.phase, "Calibrate");
+    assert.equal(step.status, "done");
+    assert.match(String(step.resultPreview), /^exit 0/);
+  }),
+);

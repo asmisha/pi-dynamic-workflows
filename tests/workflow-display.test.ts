@@ -181,12 +181,12 @@ describe("renderWorkflowText", () => {
     assert.ok(text.length < 200, "should not include the full 100-char label");
   });
 
-  it("shows 'earlier agents' when more agents than maxAgents", async () => {
+  it("shows 'earlier steps' when more agents than maxAgents", async () => {
     const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
     const snap = createWorkflowSnapshot(fakeMeta("t", "d", ["Phase"]));
     snap.agents = Array.from({ length: 20 }, (_, i) => agent(i + 1, `agent-${i + 1}`, "done", "Phase")) as never[];
     const text = renderWorkflowLines(snap, { maxAgents: 5 }).join("\n");
-    assert.ok(text.includes("earlier agents"), "should mention earlier agents");
+    assert.ok(text.includes("earlier steps"), "should mention earlier steps");
     assert.ok(text.includes("agent-20"), "should show last agent");
     // Use word boundary to avoid matching "agent-1" inside "agent-11", "agent-12", etc.
     assert.ok(!/\bagent-1\b/.test(text), "first agents should be clipped");
@@ -837,5 +837,25 @@ describe("TUI rendering has no markdown syntax", () => {
     assert.doesNotThrow(() => {
       tool.renderResult(resultWithMarkdown as never, { isPartial: false }, theme as never);
     });
+  });
+});
+
+describe("bash steps in the workflow display", () => {
+  it("renders a running bash step and keeps agent counters agent-only", async () => {
+    const { createWorkflowSnapshot, recomputeWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta("t", "d", ["Calibrate"]));
+    snap.agents = [
+      { ...agent(1, "$ make test", "running", "Calibrate"), kind: "bash" },
+      agent(2, "report", "done", "Calibrate"),
+    ] as never[];
+
+    const counted = recomputeWorkflowSnapshot(snap);
+    assert.equal(counted.agentCount, 1, "bash steps are not agents");
+    assert.equal(counted.doneCount, 1);
+    assert.equal(counted.runningCount, 0, "the running node is a bash step");
+
+    const text = renderWorkflowLines(counted, {}).join("\n");
+    assert.ok(text.includes("$ make test"), "bash step is visible");
+    assert.ok(text.includes("1 bash running"), "header reports live shell work");
   });
 });

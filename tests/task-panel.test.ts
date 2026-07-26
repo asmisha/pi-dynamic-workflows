@@ -594,16 +594,16 @@ describe("renderPanelDetailed", () => {
     const text = lines.join("\n");
 
     assert.ok(/auth_audit/.test(text), "shows the run name");
-    assert.ok(/1\/4 agents/.test(text), "shows done/total agents");
+    assert.ok(/1\/4 steps/.test(text), "shows done/total steps");
     assert.ok(/3\.9K tok/.test(text), "shows aggregate tokens summed from per-agent tokens");
     assert.ok(/\$0\.02/.test(text), "shows cost");
     // Phase headers
     assert.ok(
-      lines.some((l) => l.includes("▶ Scan") && /1\/3 agents/.test(l) && /3\.9K tok/.test(l)),
+      lines.some((l) => l.includes("▶ Scan") && /1\/3 steps/.test(l) && /3\.9K tok/.test(l)),
       "Scan phase header with subtotal",
     );
     assert.ok(
-      lines.some((l) => l.includes("Review") && /0\/1 agents/.test(l)),
+      lines.some((l) => l.includes("Review") && /0\/1 steps/.test(l)),
       "Review phase header",
     );
     // Agent rows: status icons + label + tokens + model
@@ -638,8 +638,8 @@ describe("renderPanelDetailed", () => {
     clearTokenSamples("r1");
     const lines = renderPanelDetailed(detailedManager(12400) as never, theme as never, undefined, 2, 1000);
     const text = lines.join("\n");
-    // Scan has 3 agents, cap 2 → most recent 2 shown + "… 1 earlier agents"
-    assert.ok(/… 1 earlier agents/.test(text), "overflow line present");
+    // Scan has 3 agents, cap 2 → most recent 2 shown + "… 1 earlier steps"
+    assert.ok(/… 1 earlier steps/.test(text), "overflow line present");
     assert.ok(!/discover_routes/.test(text), "oldest agent hidden when capped");
     assert.ok(/audit_auth/.test(text) && /scan_middleware/.test(text), "most recent agents shown");
   });
@@ -698,7 +698,7 @@ describe("installTaskPanel mode selection", () => {
   it("uses compact rendering when no loadSettings is provided", () => {
     const lines = captureRender();
     assert.ok(
-      lines.some((l) => /1 agents/.test(l)),
+      lines.some((l) => /1 steps/.test(l)),
       "compact one-liner",
     );
     assert.ok(!lines.some((l) => /▶ P1/.test(l)), "no per-phase detail in compact");

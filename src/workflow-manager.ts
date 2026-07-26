@@ -5,7 +5,7 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
-import { preview, resolveWorkflowFailureLocation, type WorkflowSnapshot } from "./display.js";
+import { preview, resolveWorkflowFailureLocation, shorten, type WorkflowSnapshot } from "./display.js";
 import { errorStack, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import {
   type AgentFailureRetryState,
@@ -545,6 +545,35 @@ export class WorkflowManager extends EventEmitter {
             if (event.model) agent.model = event.model;
           }
           this.emit("agentEnd", { runId: managed.runId, ...event });
+          progress();
+        },
+        onBashStart: (event) => {
+          managed.snapshot.agents.push({
+            id: managed.snapshot.agents.length + 1,
+            kind: "bash",
+            callId: event.callId,
+            label: `$ ${shorten(event.command, 60)}`,
+            phase: event.phase,
+            prompt: event.command,
+            status: "running",
+            startedAt: new Date().toISOString(),
+          });
+          this.emit("bashStart", { runId: managed.runId, ...event });
+          progress();
+        },
+        onBashEnd: (event) => {
+          const step = managed.snapshot.agents.find((candidate) => candidate.callId === event.callId);
+          if (step) {
+            // A non-zero exit is data for the script, not a workflow failure, so the
+            // step reads as done and the exit code goes to the preview.
+            step.status = event.error ? "error" : "done";
+            step.error = event.error;
+            step.resultPreview = event.error
+              ? undefined
+              : `exit ${event.exitCode ?? "signal"}${event.pid == null ? "" : ` · pid ${event.pid}`}`;
+            step.endedAt = new Date().toISOString();
+          }
+          this.emit("bashEnd", { runId: managed.runId, ...event });
           progress();
         },
         onAgentHistory: (event) => {

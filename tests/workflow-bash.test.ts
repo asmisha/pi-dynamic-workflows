@@ -276,3 +276,28 @@ return out.stdoutFile`;
     }
   }),
 );
+
+test(
+  "bash() reports step start and end so displays can show shell work",
+  withTempDir(async (dir) => {
+    const script = `export const meta = { name: 'bash_events', description: 'bash lifecycle' }
+phase('Calibrate')
+await bash('exit 3')
+return 'done'`;
+    const started: Array<{ command: string; phase?: string; cwd: string }> = [];
+    const ended: Array<{ command: string; exitCode?: number | null; error?: string }> = [];
+    await runWorkflow(script, {
+      cwd: dir,
+      agent: fakeAgent(),
+      persistLogs: false,
+      onBashStart: (event) => started.push({ command: event.command, phase: event.phase, cwd: event.cwd }),
+      onBashEnd: (event) => ended.push({ command: event.command, exitCode: event.exitCode, error: event.error }),
+    });
+
+    assert.deepEqual(started, [{ command: "exit 3", phase: "Calibrate", cwd: dir }]);
+    assert.equal(ended.length, 1);
+    assert.equal(ended[0].command, "exit 3");
+    assert.equal(ended[0].exitCode, 3);
+    assert.equal(ended[0].error, undefined);
+  }),
+);

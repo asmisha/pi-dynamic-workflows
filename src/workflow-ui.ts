@@ -14,7 +14,7 @@
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { parseKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
+import { isAgentStep, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 
@@ -164,6 +164,7 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
     logs: p.logs,
     agents: p.agents.map((a) => ({
       id: a.id,
+      kind: a.kind,
       label: a.label,
       phase: a.phase,
       prompt: a.prompt,
@@ -176,10 +177,10 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       history: a.history,
       model: a.model,
     })),
-    agentCount: p.agents.length,
-    runningCount: p.agents.filter((a) => a.status === "running").length,
-    doneCount: p.agents.filter((a) => a.status === "done").length,
-    errorCount: p.agents.filter((a) => a.status === "error").length,
+    agentCount: p.agents.filter(isAgentStep).length,
+    runningCount: p.agents.filter((a) => isAgentStep(a) && a.status === "running").length,
+    doneCount: p.agents.filter((a) => isAgentStep(a) && a.status === "done").length,
+    errorCount: p.agents.filter((a) => isAgentStep(a) && a.status === "error").length,
     tokenUsage: p.tokenUsage ? { ...p.tokenUsage } : undefined,
     runId: p.runId,
   };
@@ -328,7 +329,7 @@ export function renderNavigator(
     state.clamp(phases.length);
     lines.push(theme.bold(model.runName(state.runId)) + dim(`  (${model.runStatus(state.runId)})`));
     phases.forEach((p, i) => {
-      const meta = [`${p.done}/${p.total} agents`, fmtTokens(p.tokens)].filter(Boolean).join(" · ");
+      const meta = [`${p.done}/${p.total} steps`, fmtTokens(p.tokens)].filter(Boolean).join(" · ");
       lines.push(sel(i, `${p.title}  ${dim(meta)}`));
     });
   } else if (state.kind === "agents" && state.runId && state.phase) {

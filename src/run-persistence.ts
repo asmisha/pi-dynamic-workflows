@@ -13,12 +13,16 @@ export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed
 
 export interface PersistedAgentState {
   id: number;
+  /** "bash" for workflow shell steps; absent/"agent" for subagent calls. */
+  kind?: "agent" | "bash";
   callId?: string;
   label: string;
   phase?: string;
   prompt: string;
   status: "queued" | "running" | "done" | "error" | "skipped";
   result?: unknown;
+  /** Short outcome text (agent result preview, or a bash step's exit code). */
+  resultPreview?: string;
   error?: string;
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;

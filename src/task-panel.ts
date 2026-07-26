@@ -9,6 +9,7 @@
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
+  isAgentStep,
   resolveWorkflowFailureLocation,
   shorten,
   statusIcon,
@@ -26,6 +27,8 @@ import { shortModel } from "./workflow-ui.js";
 const RUN_EVENTS = [
   "agentStart",
   "agentEnd",
+  "bashStart",
+  "bashEnd",
   "phase",
   "log",
   "tokenUsage",
@@ -76,7 +79,7 @@ function fitLine(line: string, width?: number): string {
 export function deliverText(run: ManagedRun): string {
   const summary = summarizeResult(run.result?.result);
   const tokens = run.result?.tokenUsage ? ` · ${run.result.tokenUsage.total.toLocaleString()} tokens` : "";
-  const agents = run.result?.agentCount ?? run.snapshot.agentCount;
+  const agents = run.result?.agentCount ?? run.snapshot.agents.filter(isAgentStep).length;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
   return [
     `✓ Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}).`,
@@ -210,11 +213,14 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
   if (!active.length) return [];
   const rows = active.map((r) => {
     const live = manager.getRun(r.runId);
-    const agents = live?.snapshot.agents ?? r.agents;
-    const done = agents.filter((a) => a.status === "done").length;
+    const steps = live?.snapshot.agents ?? r.agents;
+    const done = steps.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
+    // Running bash steps are the only visible work in script-heavy workflows.
+    const bashRunning = steps.filter((a) => !isAgentStep(a) && a.status === "running").length;
+    const bash = bashRunning ? ` · ${bashRunning} bash running` : "";
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
-    return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+    return `  ${icon} ${r.workflowName}  ${done}/${steps.length} steps${bash}${phase}`;
   });
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
@@ -308,8 +314,10 @@ function renderRunBody(
     const complete = done + errors + skipped === phaseAgents.length;
     const marker = running > 0 || (!complete && snap.currentPhase === title) ? "▶" : complete ? "✓" : " ";
     const phaseTokens = phaseAgents.reduce((n, a) => n + (a.tokens ?? 0), 0);
+    const bash = phaseAgents.filter((a) => !isAgentStep(a)).length;
     const phaseMeta = [
-      `${done}/${phaseAgents.length} agents`,
+      `${done}/${phaseAgents.length} steps`,
+      bash ? `${bash} bash` : "",
       running ? `${running} running` : "",
       errors ? `${errors} errors` : "",
       phaseTokens > 0 ? `${fmtTokensShort(phaseTokens)} tok` : "",
@@ -326,7 +334,7 @@ function renderRunBody(
       lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
     }
     if (phaseAgents.length > visible.length) {
-      lines.push(dim(`    … ${phaseAgents.length - visible.length} earlier agents`));
+      lines.push(dim(`    … ${phaseAgents.length - visible.length} earlier steps`));
     }
   }
   return lines;
@@ -364,8 +372,10 @@ export function renderPanelDetailed(
     // accrue tokens, so their rate is suppressed (a stalled rate would mislead).
     sampleTokens(r.runId, total, now);
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
+    const bashRunning = agents.filter((a) => !isAgentStep(a) && a.status === "running").length;
     const meta = [
-      `${done}/${agents.length} agents`,
+      `${done}/${agents.length} steps`,
+      bashRunning ? `${bashRunning} bash running` : "",
       snap?.currentPhase || "",
       total > 0 ? `${fmtTokensShort(total)} tok` : "",
       // 2 decimals for ≥1¢, 4 for sub-cent so a real cost never shows as "$0.00".

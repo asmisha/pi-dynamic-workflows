@@ -11,15 +11,18 @@ export type {
   WorkflowDisplay,
   WorkflowDisplayOptions,
   WorkflowSnapshot,
+  WorkflowStepKind,
 } from "./display.js";
 export {
   createToolUpdateWorkflowDisplay,
   createWidgetWorkflowDisplay,
   createWorkflowSnapshot,
+  isAgentStep,
   preview,
   recomputeWorkflowSnapshot,
   renderWorkflowLines,
   renderWorkflowText,
+  runningBashCount,
 } from "./display.js";
 export {
   isAbortError,

@@ -139,6 +139,17 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
   }) => void;
+  /** A bash() step started, so live displays can show shell work, not only agents. */
+  onBashStart?: (event: { callId: string; command: string; phase?: string; cwd: string }) => void;
+  /** A bash() step settled: exit code when it ran, error message when it could not. */
+  onBashEnd?: (event: {
+    callId: string;
+    command: string;
+    phase?: string;
+    pid?: number | null;
+    exitCode?: number | null;
+    error?: string;
+  }) => void;
   onAgentHistory?: (event: { callId: string; label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
   onAgentUsage?: (event: { callId: string; label: string; phase?: string; tokens: number }) => void;
   onTokenUsage?: (usage: {
@@ -766,24 +777,38 @@ export async function runWorkflow<T = unknown>(
     if (typeof command !== "string" || !command.trim()) {
       throw new TypeError("bash(command, options?) needs a non-empty command string");
     }
+    const assignedPhase = state.currentPhase;
+    const stepCwd = bashOptions.cwd ?? baseCwd;
     const { index: callIndex, callId } = nextCallIdentity();
     const callHash = hashBashCall(command, bashOptions.cwd, bashOptions.timeoutMs ?? null);
     const cached = cachedForCall(callId, callIndex);
     ensureRetryHash(cached, callHash, callId);
     const hashMatches = cached != null && cached.hash === callHash;
     if (hashMatches && isJournalSuccess(cached) && (retryMode || callIndex < state.firstMiss)) {
-      return cached.result as WorkflowBashResult;
+      // Replayed from the journal: still surface the step so a resumed run's
+      // display matches the original one instead of hiding replayed shell work.
+      const replayed = cached.result as WorkflowBashResult;
+      options.onBashStart?.({ callId, command, phase: assignedPhase, cwd: stepCwd });
+      options.onBashEnd?.({
+        callId,
+        command,
+        phase: assignedPhase,
+        pid: replayed?.pid ?? null,
+        exitCode: replayed?.exitCode ?? null,
+      });
+      return replayed;
     }
     if (!retryMode && (cached == null || cached.hash !== callHash || !isJournalSuccess(cached))) {
       state.firstMiss = Math.min(state.firstMiss, callIndex);
     }
 
     shared.activeCalls++;
+    options.onBashStart?.({ callId, command, phase: assignedPhase, cwd: stepCwd });
     const work = (async () => {
       try {
         const output = bashOutputFiles(artifactCwd, runId, callIndex, options.persistLogs ?? true);
         const result = await runBashCommand(command, {
-          cwd: bashOptions.cwd ?? baseCwd,
+          cwd: stepCwd,
           timeoutMs: bashOptions.timeoutMs ?? null,
           signal: options.signal,
           stdoutFile: output.stdoutFile,
@@ -802,7 +827,22 @@ export async function runWorkflow<T = unknown>(
           hash: callHash,
           result,
         });
+        options.onBashEnd?.({
+          callId,
+          command,
+          phase: assignedPhase,
+          pid: result.pid,
+          exitCode: result.exitCode,
+        });
         return result;
+      } catch (error) {
+        options.onBashEnd?.({
+          callId,
+          command,
+          phase: assignedPhase,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
       } finally {
         shared.activeCalls--;
       }

@@ -5,8 +5,13 @@ import type { WorkflowMeta } from "./workflow.js";
 
 export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
 
+/** What a snapshot node represents: a subagent call or a workflow bash() step. */
+export type WorkflowStepKind = "agent" | "bash";
+
 export interface WorkflowAgentSnapshot {
   id: number;
+  /** Node kind; absent means "agent" so persisted pre-bash runs still read correctly. */
+  kind?: WorkflowStepKind;
   /** Stable structural identity for this invocation; label is display-only. */
   callId?: string;
   label: string;
@@ -33,15 +38,20 @@ export interface WorkflowFailureLocation {
   agentLabel?: string;
 }
 
+/** True for subagent nodes; bash steps share the array but are not agents. */
+export function isAgentStep(step: Pick<WorkflowAgentSnapshot, "kind">): boolean {
+  return (step.kind ?? "agent") === "agent";
+}
+
 export function resolveWorkflowFailureLocation(
   snapshot: WorkflowSnapshot,
   explicitAgentLabel?: string,
 ): WorkflowFailureLocation {
+  // A failure is attributed to an agent, so bash steps never supply the label.
+  const agents = snapshot.agents.filter(isAgentStep);
   const agent = explicitAgentLabel
-    ? [...snapshot.agents].reverse().find((candidate) => candidate.label === explicitAgentLabel)
-    : [...snapshot.agents]
-        .reverse()
-        .find((candidate) => candidate.status === "running" || candidate.status === "skipped");
+    ? [...agents].reverse().find((candidate) => candidate.label === explicitAgentLabel)
+    : [...agents].reverse().find((candidate) => candidate.status === "running" || candidate.status === "skipped");
   return {
     phase: agent?.phase ?? snapshot.currentPhase,
     agentLabel: explicitAgentLabel ?? agent?.label,
@@ -101,10 +111,18 @@ export function createWorkflowSnapshot(meta: WorkflowMeta): WorkflowSnapshot {
 }
 
 export function recomputeWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
-  const runningCount = snapshot.agents.filter((agent) => agent.status === "running").length;
-  const doneCount = snapshot.agents.filter((agent) => agent.status === "done").length;
-  const errorCount = snapshot.agents.filter((agent) => agent.status === "error").length;
-  return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount };
+  // Bash steps live in the same array for display, but the agent counters keep
+  // counting agents so "N agents" never reports shell work.
+  const agents = snapshot.agents.filter(isAgentStep);
+  const runningCount = agents.filter((agent) => agent.status === "running").length;
+  const doneCount = agents.filter((agent) => agent.status === "done").length;
+  const errorCount = agents.filter((agent) => agent.status === "error").length;
+  return { ...snapshot, agentCount: agents.length, runningCount, doneCount, errorCount };
+}
+
+/** Bash steps currently running, for displays that show live shell work. */
+export function runningBashCount(snapshot: Pick<WorkflowSnapshot, "agents">): number {
+  return snapshot.agents.filter((step) => !isAgentStep(step) && step.status === "running").length;
 }
 
 export function createWidgetWorkflowDisplay(
@@ -210,8 +228,10 @@ export function renderWorkflowLines(
   const usage = snapshot.tokenUsage;
   const costInfo = usage?.cost ? ` · $${usage.cost.toFixed(4)}` : "";
   const tokenInfo = usage ? ` · ${usage.total.toLocaleString()} tokens${costInfo}` : "";
+  const bashRunning = runningBashCount(snapshot);
+  const bashInfo = bashRunning > 0 ? `, ${bashRunning} bash running` : "";
   const lines = [
-    `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
+    `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} agents done${state}${bashInfo}${tokenInfo})`,
   ];
 
   const phaseNames = snapshot.phases.length
@@ -244,7 +264,7 @@ export function renderWorkflowLines(
       lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
     }
     if (agents.length > visibleAgents.length)
-      lines.push(theme.fg("dim", `    … ${agents.length - visibleAgents.length} earlier agents`));
+      lines.push(theme.fg("dim", `    … ${agents.length - visibleAgents.length} earlier steps`));
   }
 
   const unphased = snapshot.agents.filter((agent) => !rendered.has(agent));
@@ -267,9 +287,11 @@ export function renderWorkflowText(snapshot: WorkflowSnapshot, completed = false
 
 function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
   if (completed) return `workflow ✓ ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount}`;
+  const bashRunning = runningBashCount(snapshot);
+  const bash = bashRunning > 0 ? `, ${bashRunning} bash running` : "";
   if (snapshot.runningCount > 0)
-    return `workflow ${snapshot.name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done`;
-  return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done`;
+    return `workflow ${snapshot.name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done${bash}`;
+  return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done${bash}`;
 }
 
 export function statusIcon(status: WorkflowAgentStatus): string {
