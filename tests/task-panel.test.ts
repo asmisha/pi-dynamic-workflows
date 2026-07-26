@@ -32,13 +32,14 @@ describe("installResultDelivery", () => {
     return manager;
   }
 
-  function createMockPi(): ExtensionAPI & { _calls: { content: string; customType?: string }[] } {
-    const calls: { content: string; customType?: string }[] = [];
+  function createMockPi(): ExtensionAPI & { _calls: { content: string; customType?: string; display?: boolean }[] } {
+    const calls: { content: string; customType?: string; display?: boolean }[] = [];
     const obj = {
       sendMessage(msg: unknown, _opts?: unknown) {
         calls.push({
           content: (msg as { content?: string }).content ?? "",
           customType: (msg as { customType?: string }).customType,
+          display: (msg as { display?: boolean }).display,
         });
       },
       registerTool: () => {},
@@ -87,9 +88,13 @@ describe("installResultDelivery", () => {
     mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = (pi as unknown as { _calls: { content: string; customType?: string; display?: boolean }[] })._calls;
     assert.equal(calls.length, 1);
     assert.equal(calls[0].customType, "workflow-result");
+    assert.equal(calls[0].display, false);
+    assert.ok(calls[0].content.includes("The user has not seen its result yet"));
+    assert.ok(calls[0].content.includes("Resume the original task"));
+    assert.ok(calls[0].content.includes("always reply to the user"));
     assert.ok(calls[0].content.includes("All tests passed"), "should contain All tests passed");
     assert.ok(calls[0].content.includes("test-workflow"), "should contain test-workflow");
     assert.ok(calls[0].content.includes("3 agents"), "should contain 3 agents");
@@ -220,8 +225,9 @@ describe("installResultDelivery", () => {
     mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
     manager.emit("error", { runId: "test-run-1", error: { message: "Something went wrong" } });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = (pi as unknown as { _calls: { content: string; display?: boolean }[] })._calls;
     assert.equal(calls.length, 1);
+    assert.equal(calls[0].display, true);
     assert.ok(calls[0].content.includes("failed"), "should contain failed");
     assert.ok(calls[0].content.includes("Something went wrong"), "should contain Something went wrong");
   });

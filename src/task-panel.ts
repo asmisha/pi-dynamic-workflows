@@ -92,6 +92,8 @@ export function deliverText(run: ManagedRun): string {
  *
  *  - `triggerTurn: true` starts a fresh turn when the agent is idle, feeding the
  *    result to the model so the paused conversation continues.
+ *  - Completed results are hidden from the UI and explicitly tell the assistant
+ *    to resume the original task, so the user receives the assistant's response.
  *  - `deliverAs: "followUp"` means that if the user is busy in another turn, the
  *    result is queued and picked up after that turn finishes — never interrupting.
  *
@@ -110,18 +112,18 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
   m.__deliveryInstalled = true;
   m.__holder = { pi };
 
-  const deliver = (runId: string, content: string, attempt = 0) => {
+  const deliver = (runId: string, content: string, display = true, attempt = 0) => {
     // A retry may fire after session_start swapped the mutable Pi holder. Recheck
     // ownership on every attempt so diagnostics never cross session boundaries.
     if (!manager.isRunInCurrentSession(runId)) return;
     const retry = () => {
       if (attempt >= 2) return;
-      const timer = setTimeout(() => deliver(runId, content, attempt + 1), 250 * (attempt + 1));
+      const timer = setTimeout(() => deliver(runId, content, display, attempt + 1), 250 * (attempt + 1));
       (timer as { unref?: () => void }).unref?.();
     };
     try {
       const ret = m.__holder?.pi.sendMessage(
-        { customType: "workflow-result", content, display: true },
+        { customType: "workflow-result", content, display },
         { triggerTurn: true, deliverAs: "followUp" },
       );
       void Promise.resolve(ret).catch(retry);
@@ -140,7 +142,14 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     const run = manager.getRun(runId);
     // Only background/resumed runs are delivered: a foreground (sync) run already
     // returns its result inline as the tool result, so re-delivering would dup it.
-    if (run?.background) deliver(runId, deliverText(run));
+    if (run?.background) {
+      deliver(
+        runId,
+        `This workflow has finished. The user has not seen its result yet. Resume the original task, ` +
+          `use the result below, and always reply to the user.\n\n${deliverText(run)}`,
+        false,
+      );
+    }
   });
   manager.on("error", ({ runId, error }: { runId: string; error?: unknown }) => {
     const run = manager.getRun(runId);
