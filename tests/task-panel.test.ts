@@ -91,8 +91,7 @@ describe("installResultDelivery", () => {
     const calls = (pi as unknown as { _calls: { content: string; customType?: string; display?: boolean }[] })._calls;
     assert.equal(calls.length, 1);
     assert.equal(calls[0].customType, "workflow-result");
-    assert.equal(calls[0].display, false);
-    assert.ok(calls[0].content.includes("The user has not seen its result yet"));
+    assert.equal(calls[0].display, true);
     assert.ok(calls[0].content.includes("Resume the original task"));
     assert.ok(calls[0].content.includes("always reply to the user"));
     assert.ok(calls[0].content.includes("All tests passed"), "should contain All tests passed");
