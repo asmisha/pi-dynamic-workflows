@@ -37,7 +37,7 @@ export const WORKFLOW_CONTRACT = [
   "Inline globals, also available as fields of a native run(context): agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), bash(cmd, opts), checkpoint(question), log, args, cwd, runId. Use runId, never an invented id, when a run needs its own artifact or session paths.",
   "Subagents inherit no parent context: every prompt must carry its own task, paths, and expected output. Set opts.readOnly = true for reviewers and searchers, and opts.retryable = false for any agent that can duplicate side effects.",
   "parallel() and pipeline() reject on branch failure: for best effort catch inside the branch, never on the aggregate. bash() returns {pid, exitCode, stdoutFile, stderrFile}; pass those paths to agents instead of pasting output through results.",
-  "Runs are background by default — the call returns a run ID and the result is delivered back later; pass background: false only when the result is required inline this turn.",
+  "Runs are background by default — the call returns a run ID, and every completion, failure, and checkpoint is delivered back into this conversation and wakes you automatically. Never wait for a run: no workflow_status polling, no sleep, no idle turns. Do other useful work or end the turn. Pass background: false only when the result is required inline this turn.",
 ];
 
 /**
@@ -193,9 +193,15 @@ export function createWorkflowStatusTool(
   return defineTool({
     name: "workflow_status",
     label: "Workflow Status",
-    description: "Get the current status and compact progress of a workflow run in the current session.",
+    description:
+      "Get the current status and compact progress of a workflow run in the current session. " +
+      "Use it for a one-off state check, e.g. when the user asks how a run is doing — not to wait for a run: " +
+      "completion, failure, and checkpoint pauses all wake this conversation on their own.",
     promptSnippet: "Inspect a workflow run's current status, phase, agent counts, token usage, and terminal error.",
-    promptGuidelines: ["Pass the exact runId returned by the workflow tool."],
+    promptGuidelines: [
+      "Pass the exact runId returned by the workflow tool.",
+      "Never poll it in a loop and never pair it with sleep to await a background run: the run's completion, failure, or checkpoint is delivered back to this conversation automatically.",
+    ],
     parameters: workflowControlToolSchema,
     async execute(_toolCallId, params) {
       if (!manager.isRunInCurrentSession(params.runId)) {
@@ -597,16 +603,25 @@ function resolveWorkflowToolDefaults(
  * informs the model and tells it to reassure the user: the run continues on its
  * own and the conversation will resume automatically when it finishes, so the
  * user can just wait here (or go do something else).
+ *
+ * It also has to stop the model from waiting on the run itself: without an
+ * explicit ban, models fall into a workflow_status + `sleep` poll loop that
+ * burns tokens and wall clock for a notification that arrives on its own
+ * (installResultDelivery delivers completion, failure, and pause with
+ * triggerTurn, so the model is always woken).
  */
 export function backgroundStartedText(name: string, runId: string): string {
   return [
     `Workflow "${name}" started in the background.`,
     `Run ID: ${runId}`,
-    "It keeps running on its own. When it finishes, the result is delivered back",
-    "here and the conversation continues automatically — the user does not need to",
-    "do anything. Tell the user they can simply wait here for it to finish (it will",
-    "resume the conversation by itself), or keep chatting / working on other things",
-    "in the meantime; either way the result will come back to this conversation.",
+    "It keeps running on its own. When it finishes, fails, or needs input, the result",
+    "is delivered back here and the conversation continues automatically — nobody has",
+    "to do anything.",
+    "So do not wait for it: no workflow_status polling, no sleep, no idle turns. Spend",
+    "the meantime on unrelated useful work, or end the turn now.",
+    "Tell the user they can simply wait here for it to finish (it will resume the",
+    "conversation by itself), or keep chatting / working on other things in the",
+    "meantime; either way the result will come back to this conversation.",
     `They can also track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
   ].join("\n");
 }

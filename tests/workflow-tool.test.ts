@@ -39,6 +39,23 @@ test("backgroundStartedText tells the user it auto-continues and they can wait",
   assert.match(text, /\/workflows status abc-123/);
 });
 
+test("backgroundStartedText forbids polling or sleeping to await the run", () => {
+  const text = backgroundStartedText("audit", "abc-123");
+  assert.match(text, /do not wait for it/i);
+  assert.match(text, /no workflow_status polling/i);
+  assert.match(text, /no sleep/i);
+});
+
+// ─── WORKFLOW_CONTRACT ─────────────────────────────────────────────────────────
+
+test("WORKFLOW_CONTRACT forbids polling or sleeping to await a background run", () => {
+  const contract = WORKFLOW_CONTRACT.join(" ");
+  assert.match(contract, /wakes you automatically/i);
+  assert.match(contract, /never wait for a run/i);
+  assert.match(contract, /no workflow_status polling/i);
+  assert.match(contract, /no sleep/i);
+});
+
 // ─── createWorkflowTool ────────────────────────────────────────────────────────
 
 test("createWorkflowTool has correct name and label", () => {
@@ -291,6 +308,9 @@ test("workflow status tool returns compact live progress", async () => {
   const status = createWorkflowStatusTool(manager);
 
   assert.equal(status.name, "workflow_status");
+  // Waiting on a background run is the failure mode this wording prevents.
+  assert.match(status.description, /not to wait for a run/i);
+  assert.match((status.promptGuidelines ?? []).join(" "), /never poll it in a loop/i);
   const result = await (status.execute as (...args: any[]) => Promise<any>)(
     "status-call",
     { runId: "run-123" },
