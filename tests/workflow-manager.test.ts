@@ -313,6 +313,38 @@ test(
 );
 
 test(
+  "runSync persists the resolved model while a tier-routed agent is still running",
+  withTempCwd(async (cwd) => {
+    const gate = createDeferred<unknown>();
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options?: { onModelResolved?: (id: string) => void }) {
+          options?.onModelResolved?.("openai-codex/gpt-5.6-sol");
+          return gate.promise;
+        },
+      },
+    });
+    const promise = manager.runSync(oneAgentScript);
+
+    try {
+      // Before the fix the snapshot kept the session-default model until agent
+      // end, so a long tier-routed agent displayed the wrong (expensive) model.
+      const resolved = await waitFor(() => {
+        const run = manager.listRuns().find((entry) => entry.workflowName === "tracked_demo");
+        return run?.agents[0]?.status === "running" && run.agents[0].model === "openai-codex/gpt-5.6-sol"
+          ? run
+          : undefined;
+      }, "the resolved model should be persisted while the agent is still running");
+      assert.equal(resolved.status, "running");
+    } finally {
+      gate.resolve("done");
+      await promise;
+    }
+  }),
+);
+
+test(
   "runSync persists live agent history and heartbeats while the agent is blocked",
   withTempCwd(async (cwd) => {
     const gate = createDeferred<unknown>();

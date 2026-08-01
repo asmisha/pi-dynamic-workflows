@@ -152,6 +152,12 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   }) => void;
   onAgentHistory?: (event: { callId: string; label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
   onAgentUsage?: (event: { callId: string; label: string; phase?: string; tokens: number }) => void;
+  /**
+   * The subagent's real model was resolved (tier/explicit spec) at session
+   * creation. Without this, live displays show the session default for
+   * tier-routed agents until the agent ends.
+   */
+  onAgentModel?: (event: { callId: string; label: string; phase?: string; model: string }) => void;
   onTokenUsage?: (usage: {
     input: number;
     output: number;
@@ -632,6 +638,7 @@ export async function runWorkflow<T = unknown>(
               sessionPath: agentOptions.sessionPath,
               onModelResolved: (id: string) => {
                 displayModel = id;
+                options.onAgentModel?.({ callId, label, phase: assignedPhase, model: id });
               },
               onModelFallback: (spec: string, fallbackSpec?: string, reason?: string) => {
                 // Make model handoffs and the legacy session-default degrade visible.

@@ -610,6 +610,29 @@ test("agent() passes onModelResolved callback for display model updates", async 
   assert.ok(rec.calls.length > 0, "rec.calls should not be empty");
 });
 
+test("agent() reports the resolved model through onAgentModel as soon as it is known", async () => {
+  const rec = new CallRecordingAgent();
+  const modelEvents: Array<{ callId: string; label: string; model: string }> = [];
+  const startModels: Array<string | undefined> = [];
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 'tiered' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      onAgentStart: (e) => startModels.push(e.model),
+      onAgentModel: (e) => modelEvents.push({ callId: e.callId, label: e.label, model: e.model }),
+    },
+  );
+  // Before resolution the display model is the session default; the resolved
+  // model must arrive as its own event, not only at agent end.
+  assert.equal(modelEvents.length, 1, "one resolution reports once");
+  assert.equal(modelEvents[0].label, "tiered");
+  assert.equal(modelEvents[0].model, "openai/gpt-4.1-mini");
+  assert.equal(startModels.length, 1);
+});
+
 test("agent() accumulates usage across multiple agents", async () => {
   const rec = new CallRecordingAgent();
   const usageEvents: Array<{ total: number }> = [];
