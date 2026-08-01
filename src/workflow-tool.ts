@@ -56,7 +56,7 @@ export function modelRoutingGuideline(registry?: ModelRegistry | (() => ModelReg
   const list = available.length ? ` Available models: ${available.join(", ")}.` : "";
   return (
     "Tag EVERY agent with opts.tier — 'small' (exploration/search), 'medium' (analysis), 'big' (synthesis/judgment); " +
-    "the user maps tiers to models via /workflows-models and untagged agents fall back to medium. " +
+    "the user maps tiers to models via /workflows-models and untagged agents use the session model. " +
     `If the user names a model, pass opts.model with that exact provider/id (overrides tier).${list}`
   );
 }

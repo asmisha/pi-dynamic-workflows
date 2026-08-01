@@ -250,11 +250,9 @@ export async function resolveStructuredOutput<T>(
  *      phase model, which the workflow layer folds into options.model).
  *   2. options.tier  — resolved via the model-tiers config, falling back to the
  *      session's main model when the tier has no configured entry.
- *   3. DEFAULT TIER — when neither is set but the user has a model-tiers config,
- *      untagged agents default to the "medium" tier so a configured tier set
- *      actually affects the whole workflow (not just agents the script tagged).
- *      Fresh-install medium == the session model, so this is a no-op until the
- *      user customizes tiers via /workflows-models.
+ *   3. mainModel — untagged agents stay on the session's model.
+ *   4. DEFAULT TIER — the configured "medium" tier is only a last fallback when
+ *      the host did not supply its session model.
  * Returns undefined when nothing applies, so the session default is used.
  *
  * `loadConfig` is injectable for testing; it defaults to reading from disk.
@@ -269,12 +267,10 @@ export function resolveAgentModelSpec(
   if (options.tier) {
     return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
   }
-  // Untagged agent: default to the configured medium tier when one exists.
-  if (config) {
-    const medium = resolveTierModel("medium", config);
-    if (medium) return medium;
-  }
-  return undefined;
+  // An untagged agent stays on the host session model. The configured medium
+  // tier is only useful as a fallback when the host could not supply that model.
+  if (mainModel) return mainModel;
+  return config ? resolveTierModel("medium", config) || undefined : undefined;
 }
 
 export interface WorkflowAgentOptions {

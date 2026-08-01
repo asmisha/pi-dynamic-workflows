@@ -164,6 +164,7 @@ test("modelRoutingGuideline explains tier vs model priority", () => {
   const text = modelRoutingGuideline();
   assert.ok(text.includes("opts.tier"), "should mention opts.tier");
   assert.ok(text.includes("opts.model"), "should mention opts.model");
+  assert.ok(text.includes("untagged agents use the session model"), "should state the untagged default");
   assert.ok(
     /opts\.(tier|model).+opts\.(model|tier)/.test(text),
     "should explain ordering / relationship between tier and model",
