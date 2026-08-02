@@ -10,6 +10,7 @@ import {
   listAvailableModelSpecs,
   resolveAgentModelSpec,
   resolveSubagentSession,
+  resolveTaskAnswer,
   WorkflowAgent,
 } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -19,7 +20,6 @@ import { runWorkflow } from "../src/workflow.js";
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
-  lastAssistantText(messages: unknown[]): string;
 };
 
 test("listAvailableModelSpecs returns an array (empty when no auth configured)", () => {
@@ -278,21 +278,35 @@ test("buildPrompt preserves a leading slash template for native Pi prompt expans
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// lastAssistantText — verifies text extraction from session messages
+// resolveTaskAnswer — the agent's answer to the task, not merely its last words
 // ═══════════════════════════════════════════════════════════════════════════
 
-test("lastAssistantText extracts last assistant text content", () => {
-  const agent = new WorkflowAgent({ cwd: "/tmp" });
-  const messages = [
-    { role: "user", content: [{ type: "text", text: "hello" }] },
-    { role: "assistant", content: [{ type: "text", text: "hi there" }] },
-  ];
-  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
-  assert.equal(text, "hi there");
+const userMsg = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
+const note = (text = "compaction recall note") => ({
+  role: "custom",
+  customType: "session-history-recall-note",
+  content: text,
+  display: true,
+});
+const answer = (text: string, stopReason = "stop") => ({
+  role: "assistant",
+  stopReason,
+  content: [{ type: "text", text }],
+});
+const toolTurn = (name: string) => ({
+  role: "assistant",
+  stopReason: "toolUse",
+  content: [{ type: "toolCall", name, id: "t1", arguments: {} }],
+});
+const toolResult = (text: string) => ({ role: "toolResult", toolName: "read", content: [{ type: "text", text }] });
+
+test("resolveTaskAnswer extracts last assistant text content", () => {
+  const result = resolveTaskAnswer([userMsg("hello"), answer("hi there")]);
+  assert.equal(result.text, "hi there");
+  assert.equal(result.droppedTurns, 0);
 });
 
-test("lastAssistantText joins multiple text parts", () => {
-  const agent = new WorkflowAgent({ cwd: "/tmp" });
+test("resolveTaskAnswer joins multiple text parts", () => {
   const messages = [
     {
       role: "assistant",
@@ -302,12 +316,10 @@ test("lastAssistantText joins multiple text parts", () => {
       ],
     },
   ];
-  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
-  assert.equal(text, "part1part2");
+  assert.equal(resolveTaskAnswer(messages).text, "part1part2");
 });
 
-test("lastAssistantText skips non-text content parts", () => {
-  const agent = new WorkflowAgent({ cwd: "/tmp" });
+test("resolveTaskAnswer skips non-text content parts", () => {
   const messages = [
     {
       role: "assistant",
@@ -317,32 +329,102 @@ test("lastAssistantText skips non-text content parts", () => {
       ],
     },
   ];
-  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
-  assert.equal(text, "result");
+  assert.equal(resolveTaskAnswer(messages).text, "result");
 });
 
-test("lastAssistantText returns empty string when no assistant text", () => {
-  const agent = new WorkflowAgent({ cwd: "/tmp" });
-  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText([]);
-  assert.equal(text, "");
+test("resolveTaskAnswer returns empty string when no assistant text", () => {
+  assert.equal(resolveTaskAnswer([]).text, "");
+  assert.equal(resolveTaskAnswer([userMsg("hello")]).text, "");
 });
 
-test("lastAssistantText returns empty for non-assistant messages", () => {
-  const agent = new WorkflowAgent({ cwd: "/tmp" });
-  const messages = [{ role: "user", content: [{ type: "text", text: "hello" }] }];
-  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
-  assert.equal(text, "");
+test("resolveTaskAnswer picks the last assistant message, not first", () => {
+  const messages = [answer("first"), userMsg("more"), answer("final")];
+  assert.equal(resolveTaskAnswer(messages).text, "final");
 });
 
-test("lastAssistantText picks the last assistant message, not first", () => {
-  const agent = new WorkflowAgent({ cwd: "/tmp" });
+test("resolveTaskAnswer returns the report, not the reply to a post-compaction note", () => {
+  const messages = [userMsg("audit this"), toolTurn("read"), toolResult("data"), answer("## Report\n\nfindings")];
+  const withNote = [...messages, note(), answer("Understood.")];
+
+  const result = resolveTaskAnswer(withNote);
+  assert.equal(result.text, "## Report\n\nfindings");
+  assert.equal(result.droppedTurns, 1);
+  // Parity: without the injected note the same transcript resolves identically.
+  assert.equal(resolveTaskAnswer(messages).text, result.text);
+});
+
+test("resolveTaskAnswer sees past a compaction summary preceding the note", () => {
   const messages = [
-    { role: "assistant", content: [{ type: "text", text: "first" }] },
-    { role: "user", content: [{ type: "text", text: "more" }] },
-    { role: "assistant", content: [{ type: "text", text: "final" }] },
+    { role: "compactionSummary", summary: "earlier work", tokensBefore: 100 },
+    userMsg("audit this"),
+    answer("## Report"),
+    note(),
+    answer("Understood."),
   ];
-  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
-  assert.equal(text, "final");
+  assert.equal(resolveTaskAnswer(messages).text, "## Report");
+});
+
+test("resolveTaskAnswer unwinds a stack of notes and acknowledgements", () => {
+  const messages = [
+    userMsg("audit this"),
+    answer("## Report"),
+    note("first note"),
+    answer("Understood."),
+    note("second note"),
+    answer("Understood again."),
+  ];
+  const result = resolveTaskAnswer(messages);
+  assert.equal(result.text, "## Report");
+  assert.equal(result.droppedTurns, 2);
+});
+
+test("resolveTaskAnswer keeps the continuation when a note lands mid-task", () => {
+  // Compaction can fire between tool calls; there is no finished answer yet, so
+  // the turn that follows the note carries the real result.
+  const messages = [
+    userMsg("audit this"),
+    toolTurn("read"),
+    toolResult("data"),
+    note(),
+    answer("## Report written after the note"),
+  ];
+  const result = resolveTaskAnswer(messages);
+  assert.equal(result.text, "## Report written after the note");
+  assert.equal(result.droppedTurns, 0);
+});
+
+test("resolveTaskAnswer keeps a note-driven turn when the answer was truncated", () => {
+  // stopReason "length" means the answer never finished, so what follows continues it.
+  const messages = [userMsg("audit this"), answer("## Report (cut off", "length"), note(), answer("...rest")];
+  assert.equal(resolveTaskAnswer(messages).text, "...rest");
+});
+
+test("resolveTaskAnswer keeps a user-initiated continuation, so autocontinue still works", () => {
+  const messages = [userMsg("audit this"), answer("partial"), userMsg("continue"), answer("the real ending")];
+  const result = resolveTaskAnswer(messages);
+  assert.equal(result.text, "the real ending");
+  assert.equal(result.droppedTurns, 0);
+});
+
+test("resolveTaskAnswer answers the note when the task itself never produced one", () => {
+  const messages = [userMsg("audit this"), toolTurn("read"), toolResult("data"), note(), answer("Understood.")];
+  const result = resolveTaskAnswer(messages);
+  assert.equal(result.text, "Understood.");
+  assert.equal(result.droppedTurns, 0);
+});
+
+test("resolveTaskAnswer recovers the answer when the note turn failed outright", () => {
+  // A provider error in the acknowledgement turn must not discard a finished
+  // 4M-token report: droppedTurns tells the caller to skip the error throw.
+  const messages = [
+    userMsg("audit this"),
+    answer("## Report"),
+    note(),
+    { role: "assistant", stopReason: "error", errorMessage: "rate limit", content: [] },
+  ];
+  const result = resolveTaskAnswer(messages);
+  assert.equal(result.text, "## Report");
+  assert.equal(result.droppedTurns, 1);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

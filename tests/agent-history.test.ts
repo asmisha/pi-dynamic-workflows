@@ -72,3 +72,24 @@ test("compactAgentHistory truncates text and keeps the latest entries", () => {
   assert.match(history[1].text, /truncated/);
   assert.ok(history[1].text.length <= 30);
 });
+
+test("compactAgentHistory keeps extension-injected messages visible", () => {
+  // Subagent sessions are in-memory by default, so this preview is the only
+  // place an injected note and the turn it caused stay visible after a run.
+  const history = compactAgentHistory([
+    { role: "user", content: "audit this" },
+    { role: "assistant", content: [{ type: "text", text: "## Report" }] },
+    {
+      role: "custom",
+      customType: "session-history-recall-note",
+      content: "Earlier turns were just compacted.",
+      display: true,
+    },
+    { role: "assistant", content: [{ type: "text", text: "Understood." }] },
+  ]);
+
+  assert.equal(history.length, 4);
+  assert.equal(history[2].role, "custom");
+  assert.equal(history[2].customType, "session-history-recall-note");
+  assert.match(history[2].text, /compacted/);
+});

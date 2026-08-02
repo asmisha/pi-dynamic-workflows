@@ -5,6 +5,7 @@ import {
   extractValidated,
   lastAssistantError,
   resolveStructuredOutput,
+  resolveTaskAnswer,
   type StructuredSession,
   throwIfAssistantExecutionError,
   throwIfProviderLimit,
@@ -97,6 +98,20 @@ describe("resolveStructuredOutput", () => {
   it("falls back to strict prose extraction when repair fails", async () => {
     const { session, capture } = makeSession();
     const r = await resolveStructuredOutput(session, capture, Schema, opts, () => '{"word":"fromProse"}');
+    assert.deepEqual(r, { word: "fromProse" });
+  });
+
+  it("extracts prose JSON from the answer, not from a reply to an injected note", async () => {
+    // The prose fallback runs through the same resolver as the text path, so a
+    // post-compaction acknowledgement must not hide a JSON answer behind it.
+    const { session, capture } = makeSession();
+    session.messages = [
+      { role: "user", content: [{ type: "text", text: "do it" }] },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: '{"word":"fromProse"}' }] },
+      { role: "custom", customType: "session-history-recall-note", content: "note", display: true },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Understood." }] },
+    ];
+    const r = await resolveStructuredOutput(session, capture, Schema, opts, (m) => resolveTaskAnswer(m).text);
     assert.deepEqual(r, { word: "fromProse" });
   });
 

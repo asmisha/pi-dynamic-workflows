@@ -134,6 +134,109 @@ export function throwIfAssistantExecutionError(messages: unknown[], label?: stri
   );
 }
 
+/**
+ * Roles that start a new segment of the transcript. `user` covers the workflow's
+ * own prompt and any continuation nudge; `custom` is an extension-injected
+ * out-of-band message (pi.sendMessage), which the SDK also turns into a turn when
+ * it lands while the agent is streaming — as compaction hooks do, since agent_end
+ * handlers are awaited before the agent goes idle.
+ */
+const SEGMENT_INITIATOR_ROLES = new Set(["user", "bashExecution", "custom"]);
+
+interface TranscriptSegment {
+  /** Role of the message that started this segment; absent for the pre-prompt head. */
+  initiator?: string;
+  /** First message index after the initiator. */
+  start: number;
+  /** Exclusive end index. */
+  end: number;
+}
+
+export interface TaskAnswer {
+  text: string;
+  /** Trailing extension-initiated segments skipped to reach the real answer. */
+  droppedTurns: number;
+}
+
+function messageRole(message: unknown): string | undefined {
+  const role = (message as { role?: unknown } | undefined)?.role;
+  return typeof role === "string" ? role : undefined;
+}
+
+function assistantText(message: unknown): string {
+  const candidate = message as Partial<AssistantMessage> | undefined;
+  if (candidate?.role !== "assistant" || !Array.isArray(candidate.content)) return "";
+  return candidate.content
+    .filter((part): part is TextContent => (part as { type?: unknown })?.type === "text")
+    .map((part) => part.text)
+    .join("");
+}
+
+function splitSegments(messages: unknown[]): TranscriptSegment[] {
+  const segments: TranscriptSegment[] = [];
+  let current: TranscriptSegment = { start: 0, end: messages.length };
+  for (let i = 0; i < messages.length; i++) {
+    const role = messageRole(messages[i]);
+    if (!role || !SEGMENT_INITIATOR_ROLES.has(role)) continue;
+    segments.push({ ...current, end: i });
+    current = { initiator: role, start: i + 1, end: messages.length };
+  }
+  segments.push(current);
+  return segments;
+}
+
+/**
+ * True when the segment's last assistant message is a finished answer: real text,
+ * a clean "stop", and no pending tool calls. "length"/"toolUse"/"error" all mean
+ * the task was still in flight, so whatever follows is a continuation rather than
+ * an interruption.
+ */
+function endsWithCompletedAnswer(messages: unknown[], segment: TranscriptSegment): boolean {
+  for (let i = segment.end - 1; i >= segment.start; i--) {
+    const message = messages[i] as Partial<AssistantMessage> | undefined;
+    if (message?.role !== "assistant") continue;
+    const hasToolCalls =
+      Array.isArray(message.content) &&
+      message.content.some((part) => (part as { type?: unknown })?.type === "toolCall");
+    return message.stopReason === "stop" && !hasToolCalls && assistantText(message).trim().length > 0;
+  }
+  return false;
+}
+
+/**
+ * The subagent's answer to the task, not merely the last thing it said.
+ *
+ * Compaction fires from an agent_end hook while the session still counts as
+ * streaming, so an extension's post-compaction note is steered into the same run
+ * and the SDK drains it into an extra turn. The model answers that note with an
+ * acknowledgement, which would otherwise be captured as the agent's result and
+ * silently replace a finished report.
+ *
+ * The rule: a trailing segment started by an extension-injected `custom` message
+ * is not the answer if the task had already been answered before it. Segments
+ * started by a real `user` message (the workflow prompt, a continuation nudge, a
+ * fallback or schema re-prompt) always are — that is the SDK's own line between
+ * task input and out-of-band injection.
+ */
+export function resolveTaskAnswer(messages: unknown[]): TaskAnswer {
+  const segments = splitSegments(messages);
+  let index = segments.length - 1;
+  while (
+    index > 0 &&
+    segments[index].initiator === "custom" &&
+    endsWithCompletedAnswer(messages, segments[index - 1])
+  ) {
+    index--;
+  }
+
+  const segment = segments[index];
+  for (let i = segment.end - 1; i >= segment.start; i--) {
+    const text = assistantText(messages[i]);
+    if (text.trim()) return { text, droppedTurns: segments.length - 1 - index };
+  }
+  return { text: "", droppedTurns: 0 };
+}
+
 /** Minimal session surface resolveStructuredOutput needs (real session or a test double). */
 export interface StructuredSession {
   prompt(text: string): Promise<void>;
@@ -752,9 +855,18 @@ export class WorkflowAgent {
       const completeTurn = async (): Promise<AgentRunResult<TSchemaDef>> => {
         if (options.signal?.aborted) throw abortError();
 
-        // The SDK can bury provider/runtime errors in assistant metadata instead of
-        // throwing; detect them before schema/empty-text handling.
-        throwIfAssistantExecutionError(session.messages, options.label);
+        const answer = resolveTaskAnswer(session.messages);
+        if (answer.droppedTurns > 0) {
+          // The task was already answered, so a failure in the extension-note turn
+          // that followed must not discard that answer and retry the whole agent.
+          console.warn(
+            `[workflow] agent ${options.label ?? "(unlabeled)"}: ignored ${answer.droppedTurns} trailing extension-injected turn(s) after the answer`,
+          );
+        } else {
+          // The SDK can bury provider/runtime errors in assistant metadata instead of
+          // throwing; detect them before schema/empty-text handling.
+          throwIfAssistantExecutionError(session.messages, options.label);
+        }
 
         if (options.schema) {
           return (await resolveStructuredOutput(
@@ -762,12 +874,12 @@ export class WorkflowAgent {
             capture,
             options.schema,
             options,
-            (m) => this.lastAssistantText(m),
+            (m) => resolveTaskAnswer(m).text,
             () => waitForSubagentIdle(session, options.signal),
           )) as AgentRunResult<TSchemaDef>;
         }
 
-        const text = this.lastAssistantText(session.messages);
+        const text = answer.text;
         if (!text.trim()) {
           throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
             recoverable: true,
@@ -854,18 +966,5 @@ export class WorkflowAgent {
     }
 
     return parts.join("\n\n");
-  }
-
-  private lastAssistantText(messages: unknown[]): string {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i] as Partial<AssistantMessage> | undefined;
-      if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
-      const text = message.content
-        .filter((part): part is TextContent => part.type === "text")
-        .map((part) => part.text)
-        .join("");
-      if (text.trim()) return text;
-    }
-    return "";
   }
 }

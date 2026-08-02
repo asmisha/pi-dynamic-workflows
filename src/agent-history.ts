@@ -1,4 +1,4 @@
-export type AgentHistoryRole = "user" | "assistant" | "tool";
+export type AgentHistoryRole = "user" | "assistant" | "tool" | "custom";
 
 export type AgentHistoryKind = "text" | "toolCall" | "toolResult" | "error";
 
@@ -7,6 +7,8 @@ export interface AgentHistoryEntry {
   kind: AgentHistoryKind;
   text: string;
   toolName?: string;
+  /** customType of an extension-injected message; only set for role "custom". */
+  customType?: string;
   isError?: boolean;
   timestamp?: number;
 }
@@ -57,6 +59,23 @@ export function compactAgentHistory(messages: unknown[], options: AgentHistoryOp
       }
       if (typeof message.errorMessage === "string" && message.errorMessage.trim()) {
         entries.push({ role: "assistant", kind: "error", text: message.errorMessage, isError: true, timestamp });
+      }
+      continue;
+    }
+
+    // Extension-injected messages (pi.sendMessage) can start an extra turn whose
+    // reply is not the agent's answer. Subagent sessions are in-memory by default,
+    // so this preview is the only place that turn stays visible after the run.
+    if (role === "custom") {
+      const text = textFromContent(message.content);
+      if (text.trim()) {
+        entries.push({
+          role: "custom",
+          kind: "text",
+          text,
+          customType: typeof message.customType === "string" ? message.customType : undefined,
+          timestamp,
+        });
       }
       continue;
     }
