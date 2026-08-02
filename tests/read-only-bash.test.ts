@@ -58,11 +58,12 @@ test("read-only bash supports Git reads and isolated temporary writes", macOnly,
   }
 });
 
-test("read-only bash blocks shell network access", macOnly, async () => {
+test("read-only bash allows shell network access", macOnly, async () => {
   const repo = mkdtempSync(join(tmpdir(), "readonly-bash-network-"));
-  let connections = 0;
+  const sockets = new Set<import("node:net").Socket>();
   const server = createServer((socket) => {
-    connections++;
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
     socket.end("reachable");
   });
   await new Promise<void>((resolve, reject) => {
@@ -77,12 +78,14 @@ test("read-only bash blocks shell network access", macOnly, async () => {
     assert.ok(address && typeof address === "object");
     const output = await runBash(
       sandbox.tool,
-      `/usr/bin/curl --max-time 1 --silent --show-error http://127.0.0.1:${address.port} 2>&1 || true`,
+      `/usr/bin/curl --http0.9 --max-time 5 --silent --show-error http://127.0.0.1:${address.port} 2>&1 || true`,
     );
-    assert.doesNotMatch(output, /reachable/);
-    assert.equal(connections, 0);
+    assert.match(output, /reachable/);
   } finally {
     sandbox.cleanup();
+    // Destroy lingering connection sockets: server.close() alone waits for them
+    // and can hang the test runner even after the client has exited.
+    for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(repo, { recursive: true, force: true });
   }
@@ -126,28 +129,29 @@ test("read-only bash blocks repository writes from shells, Python, Node, and sym
   }
 });
 
-test("read-only bash cannot read user data outside the review target", macOnly, async () => {
+test("read-only bash reads the real home but cannot write to it", macOnly, async () => {
   const repo = mkdtempSync(join(tmpdir(), "readonly-bash-scope-"));
   const outside = mkdtempSync(join(homedir(), "readonly-bash-outside-"));
   try {
     writeFileSync(join(repo, "inside.txt"), "inside\n");
-    writeFileSync(join(outside, "secret.txt"), "outside-secret\n");
+    writeFileSync(join(outside, "config.txt"), "home-config\n");
 
     const sandbox = createReadOnlyBashSession(repo);
     assert.ok(sandbox.tool);
     try {
       assert.match(await runBash(sandbox.tool, "cat inside.txt"), /inside/);
 
-      const denied = await runBash(sandbox.tool, `cat ${JSON.stringify(join(outside, "secret.txt"))} 2>&1 || true`);
-      assert.doesNotMatch(denied, /outside-secret/);
-
-      // A home-wide search finds nothing instead of wandering into a tree that blocks.
-      const scan = await runBash(
+      // HOME is not overridden: real dotfiles/configs (e.g. ~/.ssh) stay readable.
+      const homeRead = await runBash(
         sandbox.tool,
-        `find ${JSON.stringify(homedir())} -maxdepth 2 -name "secret.txt" 2>/dev/null | head -3; echo done`,
+        `printf "%s\\n" "$HOME"; cat ${JSON.stringify(join(outside, "config.txt"))}`,
       );
-      assert.doesNotMatch(scan, /secret\.txt/);
-      assert.match(scan, /done/);
+      assert.match(homeRead, new RegExp(`^${homedir().replaceAll(".", "\\.")}$`, "m"));
+      assert.match(homeRead, /home-config/);
+
+      // But writes to the real home are still blocked.
+      await runBash(sandbox.tool, `touch ${JSON.stringify(join(outside, "home-write"))} 2>/dev/null || true`);
+      assert.equal(existsSync(join(outside, "home-write")), false);
     } finally {
       sandbox.cleanup();
     }

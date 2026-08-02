@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import {
   type BashOperations,
@@ -19,17 +19,6 @@ const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
  */
 export const DEFAULT_READ_ONLY_BASH_TIMEOUT_SECONDS = 120;
 
-/**
- * User-home trees that hold executables the shell legitimately needs (nvm's node,
- * user-installed CLIs). Everything else under the home directory stays unreadable.
- */
-function toolReadRoots(): string[] {
-  const home = homedir();
-  return [join(home, ".nvm"), join(home, ".local"), join(home, ".bun"), "/opt/homebrew"].filter((path) =>
-    existsSync(path),
-  );
-}
-
 export interface ReadOnlyBashSession {
   tool?: ToolDefinition;
   cleanup(): void;
@@ -37,7 +26,6 @@ export interface ReadOnlyBashSession {
 
 type SandboxPaths = {
   root: string;
-  home: string;
   temp: string;
   profile: string;
 };
@@ -46,12 +34,10 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function createSandboxPaths(readRoots: string[]): SandboxPaths {
+function createSandboxPaths(): SandboxPaths {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-readonly-bash-")));
-  const home = join(root, "home");
   const temp = join(root, "tmp");
   const profile = join(root, "sandbox.sb");
-  mkdirSync(home);
   mkdirSync(temp);
   writeFileSync(
     profile,
@@ -62,30 +48,25 @@ function createSandboxPaths(readRoots: string[]): SandboxPaths {
       "(allow process-fork)",
       "(allow sysctl-read)",
       "(allow mach-lookup)",
-      // Reads: system trees for the toolchain, then nothing under user data except
-      // the review target and the sandbox itself. Later rules win, so the denies
-      // carve the user's home and mounted volumes out of the broad allow, and the
-      // explicit allows carve the target back in. A denied read fails immediately;
-      // a filesystem-wide scan can no longer wander into a tree that blocks.
+      // The guarantee is "no writes", not isolation: reads and network stay open
+      // so remote-log commands (ssh, curl, kubectl) and the toolchain work with
+      // the user's real HOME. Writes are confined to /dev/null and the per-agent
+      // sandbox directory (which backs $TMPDIR).
+      "(allow network*)",
       "(allow file-read*)",
-      '(deny file-read* (subpath "/Users"))',
-      '(deny file-read* (subpath "/Volumes"))',
-      '(deny file-read* (subpath "/System/Volumes/Data"))',
-      `(allow file-read* (subpath ${JSON.stringify(root)}))`,
-      ...readRoots.map((path) => `(allow file-read* (subpath ${JSON.stringify(path)}))`),
       '(allow file-write* (literal "/dev/null"))',
       `(allow file-write* (subpath ${JSON.stringify(root)}))`,
       "",
     ].join("\n"),
   );
-  return { root, home, temp, profile };
+  return { root, temp, profile };
 }
 
 /**
- * Build a bash tool whose child process can read the review target and the
- * toolchain but nothing else under the user's home, can write only to its
- * per-agent HOME/TMPDIR, and is always time-bounded. Unsupported platforms fail
- * closed by returning no tool instead of exposing Pi's unrestricted built-in bash.
+ * Build a bash tool whose child process can read the filesystem and reach the
+ * network, but can write only to /dev/null and its per-agent scratch directory,
+ * and is always time-bounded. Unsupported platforms fail closed by returning no
+ * tool instead of exposing Pi's unrestricted built-in bash.
  */
 export function createReadOnlyBashSession(
   cwd: string,
@@ -98,8 +79,7 @@ export function createReadOnlyBashSession(
   const localOperations = createLocalBashOperations();
   const shell = getShellConfig();
   let paths: SandboxPaths | undefined;
-  const readRoots = [...new Set([realpathSync(cwd), ...toolReadRoots()])];
-  const ensurePaths = () => (paths ??= createSandboxPaths(readRoots));
+  const ensurePaths = () => (paths ??= createSandboxPaths());
   const operations: BashOperations = {
     async exec(command, commandCwd, options) {
       const sandbox = ensurePaths();
@@ -111,18 +91,19 @@ export function createReadOnlyBashSession(
         timeout: options.timeout ?? defaultTimeoutSeconds,
         env: {
           ...options.env,
-          HOME: sandbox.home,
+          // HOME stays real so ssh config/keys, CLI credentials, and dotfiles
+          // resolve normally; the sandbox profile still blocks writing them.
           TMPDIR: `${sandbox.temp}${sep}`,
           TMP: sandbox.temp,
           TEMP: sandbox.temp,
-          XDG_CACHE_HOME: join(sandbox.home, ".cache"),
+          XDG_CACHE_HOME: join(sandbox.root, "cache"),
           GIT_OPTIONAL_LOCKS: "0",
         },
       });
     },
   };
   const tool = createBashToolDefinition(cwd, { operations });
-  tool.description = `${tool.description} Reads are limited to this repository and the toolchain: paths elsewhere under the user's home, and mounted volumes, are unreadable, so a filesystem-wide search returns nothing. Repository and host writes are blocked; temporary writes are allowed only under $HOME and $TMPDIR. A command without its own timeout is killed after ${defaultTimeoutSeconds} seconds.`;
+  tool.description = `${tool.description} Reads and network access work normally (ssh, curl, remote logs), but all writes outside $TMPDIR are blocked: the repository, $HOME, and the rest of the host are not writable, so commands that must persist files will fail. A command without its own timeout is killed after ${defaultTimeoutSeconds} seconds.`;
 
   return {
     tool: tool as unknown as ToolDefinition,
