@@ -185,6 +185,12 @@ npm run build && pi install .
 
 Then restart/reload Pi so the next session loads the rebuilt extension. `pi list` should show this repo path for the installed package.
 
+The Pi SDK is a peer dependency: at runtime the extension uses the SDK of the Pi that loads it, and Pi installs git packages with `--omit=dev` precisely so no second copy exists. A plain `npm install` in an installed package directory does create one, and it wins over the host's — the extension then silently runs whatever SDK that copy pins. After building in place, drop it again:
+
+```bash
+npm install && npm run build && npm prune --omit=dev
+```
+
 Every feature is also verified end-to-end against a real Pi subagent session before release.
 
 ## Credits
