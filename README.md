@@ -185,11 +185,7 @@ npm run build && pi install .
 
 Then restart/reload Pi so the next session loads the rebuilt extension. `pi list` should show this repo path for the installed package.
 
-The Pi SDK is a peer dependency: at runtime the extension uses the SDK of the Pi that loads it, and Pi installs git packages with `--omit=dev` precisely so no second copy exists. A plain `npm install` in an installed package directory does create one, and it wins over the host's — the extension then silently runs whatever SDK that copy pins. After building in place, drop it again:
-
-```bash
-npm install && npm run build && npm prune --omit=dev
-```
+Never run `npm install` or `npm run build` inside an *installed* package directory. Pi loads `extensions/workflow.ts` and its `src/` imports directly, so `dist/` is only for consumers importing this package as a library, and the Pi SDK is a peer dependency supplied by the host at load time. A plain `npm install` there adds a second SDK copy that wins over the host's, and the extension then silently runs whatever version that copy pins. Update an installed copy with `pi update --extensions`, which resets the checkout, cleans it, and installs runtime dependencies only.
 
 Every feature is also verified end-to-end against a real Pi subagent session before release.
 
