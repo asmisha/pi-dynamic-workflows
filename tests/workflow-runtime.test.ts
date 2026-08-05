@@ -681,6 +681,53 @@ test("runWorkflow plumbs opts.tier through to the agent with correct precedence"
   assert.deepEqual(seen[1], { model: "explicit-model", tier: "small" });
 });
 
+test("runWorkflow plumbs opts.thinking through to the agent and reports it for display", async () => {
+  const seen: Array<string | undefined> = [];
+  const started: Array<{ label: string; thinking?: string }> = [];
+  const capturingAgent = {
+    async run(_prompt: string, options: { thinking?: string }) {
+      seen.push(options.thinking);
+      return "ok";
+    },
+  };
+
+  const script = `export const meta = { name: 'thinking_routing', description: 'per-agent reasoning effort' }
+  await agent('cheap scan', { label: 'scan', thinking: 'low' })
+  await agent('hard call', { label: 'synthesis', tier: 'big', thinking: 'max' })
+  await agent('unset keeps the session default', { label: 'default' })
+  return {}`;
+
+  await runWorkflow(script, {
+    agent: capturingAgent,
+    persistLogs: false,
+    onAgentStart: (e) => started.push({ label: e.label, thinking: e.thinking }),
+  });
+
+  assert.deepEqual(seen, ["low", "max", undefined], "the level reaches run() and stays unset when omitted");
+  assert.deepEqual(started, [
+    { label: "scan", thinking: "low" },
+    { label: "synthesis", thinking: "max" },
+    { label: "default", thinking: undefined },
+  ]);
+});
+
+test("an unknown opts.thinking level fails the script instead of silently downgrading", async () => {
+  // A bad level would otherwise fall back to the session default, which looks
+  // exactly like the option working.
+  const script = `export const meta = { name: 'bad_thinking', description: 'invalid level' }
+  return await agent('task', { label: 'a', thinking: 'ultra' })`;
+
+  await assert.rejects(
+    () => runWorkflow(script, { agent: countingAgent().runner, persistLogs: false }),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+      assert.match(error.message, /opts\.thinking must be one of: low, medium, high, xhigh, max/);
+      return true;
+    },
+  );
+});
+
 const resumeScript = `export const meta = { name: 'resume_demo', description: 'resume' }
 const a = await agent('first', { label: 'a' })
 const b = await agent('second', { label: 'b' })
@@ -1320,6 +1367,7 @@ return r`;
     [", forkFrom: '/tmp/source.jsonl'", "forkFrom"],
     [", sessionPath: 'persistent-reviewer'", "sessionPath"],
     [", fallbackModel: 'openai/gpt'", "fallbackModel"],
+    [", thinking: 'max'", "thinking"],
   ] as const) {
     const rerun = countingAgent();
     await runWorkflow(script(extra), {

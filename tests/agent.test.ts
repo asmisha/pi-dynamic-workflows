@@ -11,6 +11,7 @@ import {
   resolveAgentModelSpec,
   resolveSubagentSession,
   resolveTaskAnswer,
+  sdkThinkingLevel,
   WorkflowAgent,
 } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -1028,4 +1029,16 @@ test("resolveSubagentSession rejects forkFrom + existing sessionPath", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("sdkThinkingLevel keeps max meaningful on an SDK that predates it", () => {
+  // An SDK treats a level it does not know as "not found" and clamps it to the
+  // LOWEST level the model supports, so passing "max" straight through to an
+  // older SDK would turn thinking off instead of maxing it out.
+  for (const level of ["low", "medium", "high", "xhigh"] as const) {
+    assert.equal(sdkThinkingLevel(level, true), level);
+    assert.equal(sdkThinkingLevel(level, false), level, "levels below max are understood by every SDK");
+  }
+  assert.equal(sdkThinkingLevel("max", true), "max");
+  assert.equal(sdkThinkingLevel("max", false), "xhigh", "degrade to the highest level the SDK can express");
 });

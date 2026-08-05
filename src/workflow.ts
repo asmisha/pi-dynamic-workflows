@@ -9,8 +9,8 @@ import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
-import type { AgentUsage } from "./agent.js";
-import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
+import type { AgentThinkingLevel, AgentUsage } from "./agent.js";
+import { AGENT_THINKING_LEVELS, isAgentThinkingLevel, WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import {
   type AgentDefinition,
@@ -127,7 +127,14 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onAgentFailureEscaped?: (callId: string) => void;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: { callId: string; label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentStart?: (event: {
+    callId: string;
+    label: string;
+    phase?: string;
+    prompt: string;
+    model?: string;
+    thinking?: AgentThinkingLevel;
+  }) => void;
   onAgentEnd?: (event: {
     callId: string;
     label: string;
@@ -210,6 +217,12 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * no configured entry it falls back to the session's main model.
    */
   tier?: string;
+  /**
+   * Reasoning effort for this agent: "low" | "medium" | "high" | "xhigh" | "max".
+   * Independent of `model`/`tier` — each model translates the level itself, so the
+   * same name works across providers. Omit it to keep the session default.
+   */
+  thinking?: AgentThinkingLevel;
   /**
    * Name of a registered subagent definition (`.pi/agents/<name>.md`, project >
    * user). Binds that definition's tool allow/denylist, model, and body prompt
@@ -488,6 +501,16 @@ export async function runWorkflow<T = unknown>(
   const agentImpl = async (prompt: string, agentOptions: AgentOptions = {}) => {
     throwIfAborted();
 
+    // Reject an unknown level instead of letting the SDK fall back to the session
+    // default: a silent fallback is indistinguishable from the option working.
+    if (agentOptions.thinking !== undefined && !isAgentThinkingLevel(agentOptions.thinking)) {
+      throw new WorkflowError(
+        `agent opts.thinking must be one of: ${AGENT_THINKING_LEVELS.join(", ")}`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: agentOptions.label },
+      );
+    }
+
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
     const requestedLabel = agentOptions.label?.trim();
 
@@ -529,7 +552,14 @@ export async function runWorkflow<T = unknown>(
     const cachedSucceeded = isJournalSuccess(cached);
     const cachedEmptyOutput = cachedSucceeded && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && cachedSucceeded && !cachedEmptyOutput && (retryMode || callIndex < state.firstMiss)) {
-      options.onAgentStart?.({ callId, label, phase: assignedPhase, prompt, model: displayModel });
+      options.onAgentStart?.({
+        callId,
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+        thinking: agentOptions.thinking,
+      });
       options.onAgentEnd?.({
         callId,
         label,
@@ -570,7 +600,14 @@ export async function runWorkflow<T = unknown>(
       const maxAttempts = retryAttempts + 1;
       const durableAttempt = (cached?.status === "failed" ? (cached.attempt ?? 1) : 0) + 1;
 
-      options.onAgentStart?.({ callId, label, phase: assignedPhase, prompt, model: displayModel });
+      options.onAgentStart?.({
+        callId,
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+        thinking: agentOptions.thinking,
+      });
 
       // Each retry attempt reports cumulative snapshots from zero. Keep its
       // baseline local while publishing the logical agent's cumulative total.
@@ -629,6 +666,7 @@ export async function runWorkflow<T = unknown>(
               model: modelSpec,
               fallbackModel: agentOptions.fallbackModel,
               tier: agentOptions.tier,
+              thinking: agentOptions.thinking,
               modelRegistry: options.modelRegistry,
               toolNames: agentDef?.tools,
               disallowedToolNames: agentDef?.disallowedTools,
@@ -1282,6 +1320,9 @@ function hashAgentCall(
     model: model ?? null,
     fallbackModel: options.fallbackModel ?? null,
     tier: options.tier ?? null,
+    // Reasoning effort changes the answer, so raising it must invalidate a cached
+    // result on resume instead of replaying the cheaper one.
+    thinking: options.thinking ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
     // Resolved definition (tools/model/prompt) so editing an agent .md invalidates

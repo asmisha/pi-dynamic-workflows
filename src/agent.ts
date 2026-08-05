@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
   AuthStorage,
   type CreateAgentSessionOptions,
@@ -529,6 +530,46 @@ export interface AgentUsage {
   cost: number;
 }
 
+/**
+ * Reasoning effort for one subagent, as a provider-independent name.
+ *
+ * These are the host SDK's thinking levels minus `off`/`minimal`: each model
+ * translates the name through its own `thinkingLevelMap`, so `max` means "the
+ * most this model will think" whether it is served by Anthropic or OpenAI.
+ * Omitting the level keeps the session default, which is what every subagent
+ * used before this option existed.
+ */
+export const AGENT_THINKING_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+
+export type AgentThinkingLevel = (typeof AGENT_THINKING_LEVELS)[number];
+
+export function isAgentThinkingLevel(value: unknown): value is AgentThinkingLevel {
+  return typeof value === "string" && (AGENT_THINKING_LEVELS as readonly string[]).includes(value);
+}
+
+/**
+ * Whether the SDK actually loaded at runtime knows the "max" level.
+ *
+ * The extension resolves whichever SDK sits next to it, which can predate "max".
+ * That matters because an SDK treats a level it does not know as "not found" and
+ * clamps it to the LOWEST level the model supports — so sending "max" to an older
+ * SDK turns thinking off instead of maxing it out. Probed against a synthetic
+ * model that declares every capped level, so the answer is about the SDK only.
+ */
+const SDK_SUPPORTS_MAX: boolean = getSupportedThinkingLevels({
+  reasoning: true,
+  thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+} as unknown as Model<any>).includes("max" as unknown as ReturnType<typeof getSupportedThinkingLevels>[number]);
+
+/**
+ * Translate a workflow thinking level into one the loaded SDK understands.
+ * Everything below "max" has existed for as long as the option has, and each
+ * model maps it further through its own thinking-level map.
+ */
+export function sdkThinkingLevel(thinking: AgentThinkingLevel, sdkSupportsMax: boolean = SDK_SUPPORTS_MAX): string {
+  return thinking === "max" && !sdkSupportsMax ? "xhigh" : thinking;
+}
+
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
   label?: string;
   schema?: TSchemaDef;
@@ -560,6 +601,12 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * caring which concrete model backs that tier.
    */
   tier?: string;
+  /**
+   * Reasoning effort for this subagent. Set at session creation rather than via
+   * `AgentSession.setThinkingLevel()`, which would also overwrite the user's
+   * global default thinking level. When omitted, the session default applies.
+   */
+  thinking?: AgentThinkingLevel;
   /** Called with the resolved model id once known (for display/telemetry). */
   onModelResolved?: (modelId: string) => void;
   /** Called when the primary model falls back to another model or the session default. */
@@ -773,6 +820,16 @@ export class WorkflowAgent {
           ...this.sessionOptions,
           // Per-call model wins over any sessionOptions.model.
           ...(resolvedModel ? { model: resolvedModel } : {}),
+          // The SDK maps this level per model and clamps it to what that model
+          // supports. Cast because the pinned dev SDK types predate "max", which
+          // newer SDKs and every model we route to already accept.
+          ...(options.thinking
+            ? {
+                thinkingLevel: sdkThinkingLevel(
+                  options.thinking,
+                ) as unknown as CreateAgentSessionOptions["thinkingLevel"],
+              }
+            : {}),
           ...(options.readOnly ? { tools: readOnlyToolNames } : {}),
         });
         // createAgentSession loads configured extensions, but hooks (including

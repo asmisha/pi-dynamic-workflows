@@ -144,6 +144,7 @@ The essentials:
 | --- | --- |
 | `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`). |
 | `model` | Exact `provider/modelId` (always wins over `tier`). |
+| `thinking` | Reasoning effort for one agent: `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"`. Independent of `model`/`tier` — each model translates the level through its own thinking-level map, so the same name works across providers. Omit it to keep the session default. Changing it invalidates that call's cached result on resume. |
 | `fallbackModel` | Exact backup model. If the primary is unauthenticated, hits a provider usage limit, or stops answering (gateway/overload errors after the SDK's own retries), the same subagent session continues on this model with its transcript and completed tool work intact. |
 | `agentType` | A named definition (`.pi/agents/<name>.md`) binding tools + model + role prompt. |
 | `cwd` | Run this agent in a different working directory (tools + session bind to it). |

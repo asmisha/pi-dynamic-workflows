@@ -31,6 +31,8 @@ export interface WorkflowAgentSnapshot {
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Reasoning effort requested for this agent, when the script set one. */
+  thinking?: string;
 }
 
 export interface WorkflowFailureLocation {

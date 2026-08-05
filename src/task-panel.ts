@@ -330,7 +330,7 @@ function renderRunBody(
     for (const a of visible) {
       const tok = a.tokens ? dim(` ${fmtTokensShort(a.tokens)} tok`) : "";
       const mdl = shortModel(a.model);
-      const model = mdl ? dim(` · ${mdl}`) : "";
+      const model = mdl ? dim(` · ${mdl}${a.thinking ? ` · ${a.thinking}` : ""}`) : "";
       lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
     }
     if (phaseAgents.length > visible.length) {

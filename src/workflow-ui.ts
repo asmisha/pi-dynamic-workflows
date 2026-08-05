@@ -68,6 +68,7 @@ interface AgentRow {
   phase?: string;
   tokens?: number;
   model?: string;
+  thinking?: string;
 }
 
 /** Short, human-friendly model label: drop the provider prefix for display. */
@@ -140,7 +141,15 @@ export class NavigatorModel {
     if (!snap) return [];
     return snap.agents
       .filter((a) => (a.phase ?? "(no phase)") === phase)
-      .map((a) => ({ id: a.id, label: a.label, status: a.status, phase: a.phase, tokens: a.tokens, model: a.model }));
+      .map((a) => ({
+        id: a.id,
+        label: a.label,
+        status: a.status,
+        phase: a.phase,
+        tokens: a.tokens,
+        model: a.model,
+        thinking: a.thinking,
+      }));
   }
 
   agentDetail(runId: string, agentId: number): WorkflowAgentSnapshot | undefined {
@@ -176,6 +185,7 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       recoverable: a.recoverable,
       history: a.history,
       model: a.model,
+      thinking: a.thinking,
     })),
     agentCount: p.agents.filter(isAgentStep).length,
     runningCount: p.agents.filter((a) => isAgentStep(a) && a.status === "running").length,
@@ -339,7 +349,7 @@ export function renderNavigator(
     agents.forEach((a, i) => {
       const icon = STATUS_ICON[a.status] ?? "?";
       const mdl = shortModel(a.model);
-      const meta = [mdl, a.tokens ? fmtTokens(a.tokens) : undefined].filter(Boolean).join(" · ");
+      const meta = [mdl, a.thinking, a.tokens ? fmtTokens(a.tokens) : undefined].filter(Boolean).join(" · ");
       lines.push(sel(i, `${icon} ${a.label}${meta ? dim(`  ${meta}`) : ""}`));
     });
   } else if (state.kind === "detail" && state.runId && state.agentId != null) {
@@ -349,6 +359,7 @@ export function renderNavigator(
       const body: string[] = [];
       body.push(dim("Status: ") + (a.status ?? ""));
       if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
+      if (a.thinking) body.push(dim("Thinking: ") + a.thinking);
       if (a.error) body.push(dim("Error: ") + a.error);
       if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
       body.push("", dim("Prompt:"));
