@@ -18,7 +18,9 @@ async function runBash(
     { command },
     new AbortController().signal,
     () => {},
-    { hasUI: false },
+    // The bash tool reads session identity for PI_SESSION_* env vars; a real run
+    // always has a session manager, so stub the two accessors it touches.
+    { hasUI: false, sessionManager: { getSessionId: () => "test-session", getSessionFile: () => undefined } },
   );
   return result.content.map((item: { text?: string }) => item.text ?? "").join("\n");
 }

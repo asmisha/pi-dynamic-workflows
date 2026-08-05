@@ -31,15 +31,19 @@ const USAGE_LIMIT_MSG = "Codex usage limit reached (plus plan). Resets in ~3h.";
  * else fall back to the bare specifier — which, when npm has deduped to a single
  * copy, resolves to that same shared instance. Robust to both layouts.
  */
-async function loadFaux(): Promise<typeof import("@earendil-works/pi-ai")> {
+async function loadFaux(): Promise<typeof import("@earendil-works/pi-ai/compat")> {
+  // The faux-provider helpers live in the compat entrypoint, which is also what
+  // Pi's extension loader resolves the bare specifier to.
   const nested = fileURLToPath(
     new URL(
-      "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.js",
+      "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/compat.js",
       import.meta.url,
     ),
   );
-  const entry = existsSync(nested) ? nested : "@earendil-works/pi-ai";
-  return import(entry) as Promise<typeof import("@earendil-works/pi-ai")>;
+  const entry = existsSync(nested)
+    ? nested
+    : fileURLToPath(new URL("../node_modules/@earendil-works/pi-ai/dist/compat.js", import.meta.url));
+  return import(entry) as Promise<typeof import("@earendil-works/pi-ai/compat")>;
 }
 
 /**
@@ -54,6 +58,7 @@ async function withFauxSession(
     model: unknown;
     fallbackModel: unknown;
     setResponses: (msgs: unknown[]) => void;
+    modelRegistry: import("@earendil-works/pi-coding-agent").ModelRegistry;
     anthropicCallCount: () => number;
     fauxAssistantMessage: typeof import("@earendil-works/pi-ai").fauxAssistantMessage;
     fauxToolCall: typeof import("@earendil-works/pi-ai").fauxToolCall;
@@ -94,10 +99,22 @@ async function withFauxSession(
       },
     }),
   );
+  // Production always injects the host's composed registry (ExtensionContext
+  // carries one and session_start hands it to the manager), so build the
+  // equivalent here from the isolated agent dir instead of leaving the agent
+  // with no catalog at all.
+  const { ModelRegistry, ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+  const modelRegistry = new ModelRegistry(
+    await ModelRuntime.create({
+      authPath: join(agentDir, "auth.json"),
+      modelsPath: join(agentDir, "models.json"),
+    }),
+  );
   try {
     await withFakeHomeAsync(home, () =>
       fn({
         cwd,
+        modelRegistry,
         model: faux.getModel("faux-deepseek"),
         fallbackModel: faux.getModel("faux-deepseek-fallback"),
         setResponses: (msgs) => faux.setResponses(msgs as never),
@@ -123,9 +140,9 @@ async function withFauxSession(
 }
 
 test("a real subagent session that hits a usage limit surfaces PROVIDER_USAGE_LIMIT (not SCHEMA_NONCOMPLIANCE/EMPTY)", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: USAGE_LIMIT_MSG })]);
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
     await assert.rejects(
       () => agent.run("do the task", { label: "probe" }),
       (err: unknown) => {
@@ -140,9 +157,9 @@ test("a real subagent session that hits a usage limit surfaces PROVIDER_USAGE_LI
   }));
 
 test("an unauthenticated primary model starts directly on fallbackModel", () =>
-  withFauxSession(async ({ cwd, setResponses, anthropicCallCount, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, modelRegistry, setResponses, anthropicCallCount, fauxAssistantMessage }) => {
     setResponses([fauxAssistantMessage("fallback ready", { stopReason: "stop" })]);
-    const agent = new WorkflowAgent({ cwd });
+    const agent = new WorkflowAgent({ cwd, modelRegistry });
     const handoffs: Array<{ requested: string; fallback?: string; reason?: string }> = [];
     const result = await agent.run("do the task", {
       label: "auth-fallback-probe",
@@ -163,7 +180,7 @@ test("an unauthenticated primary model starts directly on fallbackModel", () =>
   }));
 
 test("a provider usage limit continues the same structured-output session on fallbackModel", () =>
-  withFauxSession(async ({ cwd, setResponses, fauxAssistantMessage, fauxToolCall }) => {
+  withFauxSession(async ({ cwd, modelRegistry, setResponses, fauxAssistantMessage, fauxToolCall }) => {
     const fallbackRequests: Array<{ model: string; messages: number }> = [];
     setResponses([
       fauxAssistantMessage("", { stopReason: "error", errorMessage: USAGE_LIMIT_MSG }),
@@ -176,7 +193,7 @@ test("a provider usage limit continues the same structured-output session on fal
       },
       fauxAssistantMessage("done", { stopReason: "stop" }),
     ]);
-    const agent = new WorkflowAgent({ cwd });
+    const agent = new WorkflowAgent({ cwd, modelRegistry });
     const handoffs: Array<{ requested: string; fallback?: string; reason?: string }> = [];
     const result = await agent.run("do the task", {
       label: "fallback-probe",
@@ -204,18 +221,18 @@ test("a provider usage limit continues the same structured-output session on fal
   }));
 
 test("a successful real turn whose text merely mentions 'rate limit' is NOT misclassified", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     setResponses([fauxAssistantMessage("Done. I handled the rate limit gracefully.", { stopReason: "stop" })]);
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
     const text = await agent.run("do the task", { label: "ok" });
     assert.ok(typeof text === "string" && text.includes("Done."), `expected normal text, got ${String(text)}`);
   }));
 
 test("onUsage alone receives one nonzero final snapshot from a real subagent session", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     setResponses([fauxAssistantMessage("done", { stopReason: "stop" })]);
     const snapshots: AgentUsage[] = [];
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
 
     const text = await agent.run("do the task", {
       label: "final-usage-only",
@@ -237,7 +254,7 @@ test("onUsage alone receives one nonzero final snapshot from a real subagent ses
   }));
 
 test("a read-only real subagent excludes write-capable tools and preserves read-only tools", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     let activeTools: string[] = [];
     const agentDir = getAgentDir();
     const resourceLoader = new DefaultResourceLoader({
@@ -278,7 +295,7 @@ test("a read-only real subagent excludes write-capable tools and preserves read-
     await resourceLoader.reload();
 
     setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never, resourceLoader } });
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
     await agent.run("review the code", { label: "read-only", readOnly: true });
 
     assert.ok(activeTools.includes("read"), `expected read to remain active, got ${activeTools.join(", ")}`);
@@ -297,7 +314,7 @@ test("a read-only real subagent excludes write-capable tools and preserves read-
   }));
 
 test("live usage removes an assistant response discarded by SDK auto-retry", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     const agentDir = getAgentDir();
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(
@@ -311,7 +328,7 @@ test("live usage removes an assistant response discarded by SDK auto-retry", () 
 
     const snapshots: AgentUsage[] = [];
     const finalUsage: AgentUsage[] = [];
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
     const text = await agent.run("do the task", {
       label: "auto-retry",
       onUsageUpdate: (usage) => snapshots.push(usage),
@@ -331,7 +348,7 @@ test("live usage removes an assistant response discarded by SDK auto-retry", () 
   }));
 
 test("a real subagent session binds extensions so session_start-registered tools become active", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     let sessionStartRan = false;
     let activeAfterRegistration: string[] = [];
     const agentDir = getAgentDir();
@@ -361,7 +378,7 @@ test("a real subagent session binds extensions so session_start-registered tools
     await resourceLoader.reload();
 
     setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never, resourceLoader } });
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
     const text = await agent.run("do the task", { label: "extension-bind" });
 
     assert.equal(text, "ok");
@@ -373,7 +390,7 @@ test("a real subagent session binds extensions so session_start-registered tools
   }));
 
 test("a real subagent waits for deferred extension continuation before returning and disposing", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     let continuationScheduled = false;
     let agentEndCount = 0;
     const continuationErrors: string[] = [];
@@ -405,7 +422,7 @@ test("a real subagent waits for deferred extension continuation before returning
       fauxAssistantMessage("first response", { stopReason: "stop" }),
       fauxAssistantMessage("continued response", { stopReason: "stop" }),
     ]);
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never, resourceLoader } });
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
     const text = await agent.run("do the task", { label: "deferred-continuation" });
 
     assert.equal(text, "continued response");
@@ -415,8 +432,8 @@ test("a real subagent waits for deferred extension continuation before returning
   }));
 
 test("through the manager: a usage limit pauses the run (not fails) and resume replays the journal", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
-    const managerAgent = new WorkflowAgent({ cwd, session: { model: model as never } });
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
+    const managerAgent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
     const manager = new WorkflowManager({ cwd, agent: managerAgent });
     const pausedReasons: Array<string | undefined> = [];
     manager.on("paused", (e: { reason?: string }) => pausedReasons.push(e.reason));
@@ -458,7 +475,7 @@ return { a, b }`;
   }));
 
 test("an unavailable primary provider hands the same session to fallbackModel", () =>
-  withFauxSession(async ({ cwd, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, modelRegistry, setResponses, fauxAssistantMessage }) => {
     const requests: string[] = [];
     // The SDK retries a transient provider error a few times on its own, so the
     // primary keeps failing here until those retries are exhausted; only then does
@@ -469,7 +486,7 @@ test("an unavailable primary provider hands the same session to fallbackModel", 
       return fauxAssistantMessage("fallback answered", { stopReason: "stop" });
     };
     setResponses(Array.from({ length: 12 }, () => respond));
-    const agent = new WorkflowAgent({ cwd });
+    const agent = new WorkflowAgent({ cwd, modelRegistry });
     const handoffs: Array<{ requested: string; fallback?: string; reason?: string }> = [];
 
     const result = await agent.run("do the task", {
@@ -491,13 +508,13 @@ test("an unavailable primary provider hands the same session to fallbackModel", 
   }));
 
 test("an unavailable primary without a fallbackModel still fails the stage", () =>
-  withFauxSession(async ({ cwd, model, setResponses }) => {
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses }) => {
     setResponses(
       Array.from({ length: 12 }, () => () => {
         throw new Error("503 Service Unavailable");
       }),
     );
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
 
     await assert.rejects(() => agent.run("do the task", { label: "no-fallback-probe" }), /Service Unavailable/);
   }));

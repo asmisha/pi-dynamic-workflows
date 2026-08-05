@@ -2,9 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
-import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
-  AuthStorage,
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
@@ -405,17 +403,12 @@ export interface WorkflowAgentOptions {
 /**
  * List the user's currently available models (those with auth configured) as
  * `provider/modelId` specs. Used to tell the workflow author which models it may
- * route agents to. Best-effort: returns [] if the registry can't be built.
+ * route agents to. Best-effort: returns [] when the host gave us no registry,
+ * which only a model catalog can answer.
  */
 export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
   try {
-    if (registry) {
-      return registry.getAvailable().map((m) => `${m.provider}/${m.id}`);
-    }
-    const dir = getAgentDir();
-    const auth = AuthStorage.create(join(dir, "auth.json"));
-    const r = ModelRegistry.create(auth, join(dir, "models.json"));
-    return r.getAvailable().map((m) => `${m.provider}/${m.id}`);
+    return registry ? registry.getAvailable().map((m) => `${m.provider}/${m.id}`) : [];
   } catch {
     return [];
   }
@@ -547,29 +540,6 @@ export function isAgentThinkingLevel(value: unknown): value is AgentThinkingLeve
   return typeof value === "string" && (AGENT_THINKING_LEVELS as readonly string[]).includes(value);
 }
 
-/**
- * Whether the SDK actually loaded at runtime knows the "max" level.
- *
- * The extension resolves whichever SDK sits next to it, which can predate "max".
- * That matters because an SDK treats a level it does not know as "not found" and
- * clamps it to the LOWEST level the model supports — so sending "max" to an older
- * SDK turns thinking off instead of maxing it out. Probed against a synthetic
- * model that declares every capped level, so the answer is about the SDK only.
- */
-const SDK_SUPPORTS_MAX: boolean = getSupportedThinkingLevels({
-  reasoning: true,
-  thinkingLevelMap: { xhigh: "xhigh", max: "max" },
-} as unknown as Model<any>).includes("max" as unknown as ReturnType<typeof getSupportedThinkingLevels>[number]);
-
-/**
- * Translate a workflow thinking level into one the loaded SDK understands.
- * Everything below "max" has existed for as long as the option has, and each
- * model maps it further through its own thinking-level map.
- */
-export function sdkThinkingLevel(thinking: AgentThinkingLevel, sdkSupportsMax: boolean = SDK_SUPPORTS_MAX): string {
-  return thinking === "max" && !sdkSupportsMax ? "xhigh" : thinking;
-}
-
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
   label?: string;
   schema?: TSchemaDef;
@@ -669,7 +639,6 @@ export class WorkflowAgent {
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
-  private registry?: ModelRegistry;
   /** Lazily built once per agent instance (one per run) instead of per subagent. */
   private settingsManager?: SettingsManager;
 
@@ -687,21 +656,15 @@ export class WorkflowAgent {
    * constructor's shared registry, then a lazily-built disk registry (shared
    * across calls once built).
    */
-  private getRegistry(perRunRegistry?: ModelRegistry): ModelRegistry {
-    if (perRunRegistry) {
-      return perRunRegistry;
-    }
-    if (this.sharedRegistry) {
-      return this.sharedRegistry;
-    }
-    if (!this.registry) {
-      const dir = getAgentDir();
-      // Same agentDir/auth files createAgentSession uses by default, so a model
-      // resolved here carries valid credentials.
-      const auth = AuthStorage.create(join(dir, "auth.json"));
-      this.registry = ModelRegistry.create(auth, join(dir, "models.json"));
-    }
-    return this.registry;
+  /**
+   * The host's model catalog, or none. Building one from disk is not possible
+   * synchronously any more, and it was never needed: the run and the session
+   * both carry the registry the host already composed with valid credentials.
+   * Without one, model specs stay unresolved and the agent falls back to the
+   * session default, which `onModelFallback` reports.
+   */
+  private getRegistry(perRunRegistry?: ModelRegistry): ModelRegistry | undefined {
+    return perRunRegistry ?? this.sharedRegistry;
   }
 
   /**
@@ -711,6 +674,7 @@ export class WorkflowAgent {
    */
   private resolveModel(spec: string, perRunRegistry?: ModelRegistry): Model<any> | undefined {
     const registry = this.getRegistry(perRunRegistry);
+    if (!registry) return undefined;
     const slash = spec.indexOf("/");
     if (slash > 0) {
       return registry.find(spec.slice(0, slash), spec.slice(slash + 1));
@@ -719,9 +683,11 @@ export class WorkflowAgent {
   }
 
   private modelIsAvailable(model: Model<any>, perRunRegistry?: ModelRegistry): boolean {
-    return this.getRegistry(perRunRegistry)
-      .getAvailable()
-      .some((candidate) => candidate.provider === model.provider && candidate.id === model.id);
+    return (
+      this.getRegistry(perRunRegistry)
+        ?.getAvailable()
+        .some((candidate) => candidate.provider === model.provider && candidate.id === model.id) ?? false
+    );
   }
 
   async run<TSchemaDef extends TSchema | undefined = undefined>(
@@ -820,16 +786,9 @@ export class WorkflowAgent {
           ...this.sessionOptions,
           // Per-call model wins over any sessionOptions.model.
           ...(resolvedModel ? { model: resolvedModel } : {}),
-          // The SDK maps this level per model and clamps it to what that model
-          // supports. Cast because the pinned dev SDK types predate "max", which
-          // newer SDKs and every model we route to already accept.
-          ...(options.thinking
-            ? {
-                thinkingLevel: sdkThinkingLevel(
-                  options.thinking,
-                ) as unknown as CreateAgentSessionOptions["thinkingLevel"],
-              }
-            : {}),
+          // The SDK maps this level through the model's own thinking-level map
+          // and clamps it to what that model supports.
+          ...(options.thinking ? { thinkingLevel: options.thinking } : {}),
           ...(options.readOnly ? { tools: readOnlyToolNames } : {}),
         });
         // createAgentSession loads configured extensions, but hooks (including
