@@ -27,6 +27,19 @@ import {
   type WorkflowRunResult,
 } from "./workflow.js";
 
+/**
+ * Display name for a run: meta.name plus the launcher-supplied `args.name`
+ * label, so two runs of the same workflow script are distinguishable in run
+ * listings. Resumes inherit the persisted name and stay consistent.
+ */
+function runDisplayName(metaName: string, args: unknown): string {
+  const label =
+    args && typeof args === "object" && !Array.isArray(args) && typeof (args as { name?: unknown }).name === "string"
+      ? (args as { name: string }).name.trim().slice(0, 80)
+      : "";
+  return label ? `${metaName}: ${label}` : metaName;
+}
+
 function checkpointFromError(error: WorkflowError): PendingCheckpoint | undefined {
   if (error.code !== WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED) return undefined;
   const value = error.details;
@@ -288,7 +301,7 @@ export class WorkflowManager extends EventEmitter {
       runId,
       status: "running",
       snapshot: {
-        name: parsed.meta.name,
+        name: runDisplayName(parsed.meta.name, args),
         description: parsed.meta.description,
         phases: parsed.meta.phases?.map((p) => p.title) ?? [],
         logs: [],
@@ -317,7 +330,7 @@ export class WorkflowManager extends EventEmitter {
       // Persist initial state
       this.persistence.save({
         runId,
-        workflowName: parsed.meta.name,
+        workflowName: managed.snapshot.name,
         script,
         workflowModulePath: managed.workflowModulePath,
         args,
@@ -373,7 +386,7 @@ export class WorkflowManager extends EventEmitter {
       runId: generateRunId(),
       status: "running",
       snapshot: {
-        name: parsed.meta.name,
+        name: runDisplayName(parsed.meta.name, args),
         description: parsed.meta.description,
         phases: parsed.meta.phases?.map((p) => p.title) ?? [],
         logs: [],

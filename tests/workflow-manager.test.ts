@@ -145,6 +145,28 @@ test(
 );
 
 test(
+  "args.name labels the run so two launches of one script are distinguishable",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    await manager.runSync(oneAgentScript, { name: "  PR 14039 review  " });
+    await manager.runSync(oneAgentScript, { name: "PR 14040 review" });
+    await manager.runSync(oneAgentScript, undefined);
+    await manager.runSync(oneAgentScript, { name: 42 });
+
+    const names = manager
+      .listRuns()
+      .map((run) => run.workflowName)
+      .sort();
+    assert.deepEqual(names, [
+      "tracked_demo",
+      "tracked_demo",
+      "tracked_demo: PR 14039 review",
+      "tracked_demo: PR 14040 review",
+    ]);
+  }),
+);
+
+test(
   "runSync uses and persists a per-run cwd",
   withTempCwd(async (hostCwd) => {
     const runCwd = mkdtempSync(join(tmpdir(), "pi-dw-run-cwd-"));
