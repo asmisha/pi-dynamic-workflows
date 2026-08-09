@@ -3311,3 +3311,108 @@ return 'ok'`;
     assert.match(String(step.resultPreview), /^exit 0/);
   }),
 );
+
+const settledFailureScript = `export const meta = { name: 'settled_failure', description: 'handled failure before checkpoint' }
+const steady = await agent('steady', { label: 'steady' })
+let skipped = null
+try { await agent('flaky', { label: 'flaky' }) } catch (error) { skipped = 'skipped:' + error.code }
+const late = await agent('late', { label: 'late' })
+const reply = await checkpoint('Authority?')
+const after = await agent('after ' + reply, { label: 'after' })
+return { steady, skipped, late, reply, after }`;
+
+function countingFlakyAgent(calls: Record<string, number>) {
+  return {
+    async run(prompt: string) {
+      const key = prompt.split(" ")[0];
+      calls[key] = (calls[key] ?? 0) + 1;
+      if (key === "flaky") {
+        throw new WorkflowError("Codex usage limit reached (plus plan).", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+          recoverable: false,
+          resetHint: "Resets in ~3h",
+        });
+      }
+      return `ran:${prompt}`;
+    },
+  };
+}
+
+test("a handled agent failure before a checkpoint replays as settled history after the reply", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workflow-settled-failure-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const calls: Record<string, number> = {};
+      const manager = new WorkflowManager({ cwd: process.cwd(), agent: countingFlakyAgent(calls) });
+      manager.setSessionId("settled-failure-session");
+      let pauseCount = 0;
+      manager.on("paused", () => pauseCount++);
+
+      const paused = new Promise<void>((resolve) => manager.once("paused", () => resolve()));
+      const { runId } = manager.startInBackground(settledFailureScript);
+      await paused;
+
+      const persisted = manager.getPersistence().load(runId);
+      assert.equal(persisted?.pauseReason, "human_input");
+      assert.equal(persisted?.pendingCheckpoint?.prompt, "Authority?");
+      const failedEntry = persisted?.journal?.find((entry) => entry.label === "flaky");
+      assert.equal(failedEntry?.status, "failed");
+      assert.equal(failedEntry?.error?.code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+      assert.deepEqual(calls, { steady: 1, flaky: 1, late: 1 });
+
+      assert.equal(await manager.resumeWithReply(runId, "approve"), true);
+      const run = await waitFor(
+        () => (manager.getRun(runId)?.status === "completed" ? manager.getRun(runId) : undefined),
+        "the resumed run must complete without re-running settled history",
+      );
+
+      assert.deepEqual(JSON.parse(JSON.stringify(run?.result?.result)), {
+        steady: "ran:steady",
+        skipped: "skipped:PROVIDER_USAGE_LIMIT",
+        late: "ran:late",
+        reply: "approve",
+        after: "ran:after approve",
+      });
+      assert.deepEqual(
+        calls,
+        { steady: 1, flaky: 1, late: 1, after: 1 },
+        "settled pre-checkpoint calls, including the handled failure, replay instead of re-running",
+      );
+      assert.equal(pauseCount, 1, "the checkpoint is asked exactly once");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a settled pre-checkpoint failure replays after manager restart", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workflow-settled-failure-cold-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const calls: Record<string, number> = {};
+      const agent = countingFlakyAgent(calls);
+      const first = new WorkflowManager({ cwd: process.cwd(), agent });
+      first.setSessionId("settled-failure-cold-session");
+      const paused = new Promise<void>((resolve) => first.once("paused", () => resolve()));
+      const { runId } = first.startInBackground(settledFailureScript);
+      await paused;
+
+      const second = new WorkflowManager({ cwd: process.cwd(), agent });
+      second.setSessionId("settled-failure-cold-session");
+      const completed = new Promise<void>((resolve) => second.once("complete", () => resolve()));
+      assert.equal(await second.resumeWithReply(runId, "approve"), true);
+      await completed;
+
+      assert.equal(second.getRun(runId)?.status, "completed");
+      assert.deepEqual(JSON.parse(JSON.stringify(second.getRun(runId)?.result?.result)), {
+        steady: "ran:steady",
+        skipped: "skipped:PROVIDER_USAGE_LIMIT",
+        late: "ran:late",
+        reply: "approve",
+        after: "ran:after approve",
+      });
+      assert.deepEqual(calls, { steady: 1, flaky: 1, late: 1, after: 1 });
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

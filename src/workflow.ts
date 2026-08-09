@@ -486,6 +486,30 @@ export async function runWorkflow<T = unknown>(
   }
   const cachedForCall = (callId: string, index: number): JournalEntry | undefined =>
     resumeJournalByCallId.get(callId) ?? options.resumeJournal?.get(index);
+  // A succeeded checkpoint proves the workflow code consumed every earlier call's
+  // outcome before pausing (checkpoint() requires quiescence), so every call before
+  // it is settled history — including failures the script caught and handled. Those
+  // failures replay as history on resume; otherwise one handled pre-checkpoint
+  // failure pushes the whole suffix live and re-asks an already-answered checkpoint.
+  let settledCheckpointBoundary = -1;
+  for (const entry of options.resumeJournal?.values() ?? []) {
+    if (entry.kind === "checkpoint" && isJournalSuccess(entry)) {
+      settledCheckpointBoundary = Math.max(settledCheckpointBoundary, entry.index);
+    }
+  }
+  const settledFailureFor = (
+    cached: JournalEntry | undefined,
+    hash: string,
+    callId: string,
+    callIndex: number,
+  ): JournalEntryError | undefined =>
+    cached?.status === "failed" &&
+    cached.hash === hash &&
+    cached.error !== undefined &&
+    cached.index < settledCheckpointBoundary &&
+    (retryMode ? !retryFailedCallIds.has(callId) : callIndex < state.firstMiss)
+      ? cached.error
+      : undefined;
   const ensureRetryHash = (entry: JournalEntry | undefined, hash: string, callId: string) => {
     if (retryMode && entry && entry.hash !== hash) {
       throw new WorkflowError(
@@ -569,6 +593,37 @@ export async function runWorkflow<T = unknown>(
         model: displayModel,
       });
       return cached.result;
+    }
+    const settledError = settledFailureFor(cached, callHash, callId, callIndex);
+    if (settledError) {
+      options.onAgentStart?.({
+        callId,
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+        thinking: agentOptions.thinking,
+      });
+      const replayed = new WorkflowError(settledError.message, settledError.code, {
+        recoverable: settledError.recoverable,
+        agentLabel: settledError.agentLabel ?? label,
+        callId,
+      });
+      if (replayed.code === WorkflowErrorCode.AGENT_TIMEOUT && !replayed.recoverable) {
+        abandonedAgentError ??= replayed;
+      }
+      options.onAgentEnd?.({
+        callId,
+        label,
+        phase: assignedPhase,
+        result: null,
+        tokens: 0,
+        model: displayModel,
+        error: replayed.message,
+        errorCode: replayed.code,
+        recoverable: replayed.recoverable,
+      });
+      throw replayed;
     }
     if (retryMode && cached?.status === "failed") {
       if (!retryFailedCallIds.has(callId) || cached.retryable === false) {
