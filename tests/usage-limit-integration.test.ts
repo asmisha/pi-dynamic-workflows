@@ -347,6 +347,37 @@ test("live usage removes an assistant response discarded by SDK auto-retry", () 
     assert.deepEqual(finalUsage, [snapshots[snapshots.length - 1]], "legacy onUsage remains one-shot");
   }));
 
+test("a real subagent provider turn receives the configured system prompt", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
+    const marker = "WORKFLOW_SUBAGENT_SYSTEM_PROMPT_MARKER";
+    const agentDir = getAgentDir();
+    writeFileSync(join(agentDir, "SYSTEM.md"), marker);
+    let effectiveSystemPrompt = "";
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          pi.on("before_agent_start", (event) => {
+            effectiveSystemPrompt = event.systemPrompt;
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
+    await agent.run("do the task", { label: "system-prompt" });
+
+    assert.match(
+      effectiveSystemPrompt,
+      new RegExp(marker),
+      "the provider-facing system prompt must include the subagent's configured SYSTEM.md",
+    );
+  }));
+
 test("a real subagent session binds extensions so session_start-registered tools become active", () =>
   withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     let sessionStartRan = false;
