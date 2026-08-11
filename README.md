@@ -119,7 +119,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows-models           map the small / medium / big tiers to real models
 ```
 
-Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, `workflow_resume`, `workflow_retry`, and `workflow_stop` tools; the slash commands remain available for manual control. `workflow_status` is for one-off checks only — the tool contract tells the model never to poll it or `sleep` while waiting, because completion, failure, and checkpoint delivery wakes the conversation on its own.
+Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, `workflow_resume`, `workflow_retry`, and `workflow_stop` tools; the slash commands remain available for manual control. `workflow_status` is for one-off checks only — the tool contract tells the model never to poll it or `sleep` while waiting, because completion, failure, and checkpoint delivery wakes the conversation on its own. A background completion notification stays one line and points to `<runId>.stdout`, which contains the complete untruncated workflow return value.
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `d` remove · `r` restart · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 

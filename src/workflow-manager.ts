@@ -95,6 +95,8 @@ export interface ManagedRun {
   status: RunStatus;
   snapshot: WorkflowSnapshot;
   result?: WorkflowRunResult;
+  /** Plain-text/JSON file containing the complete workflow return value. */
+  outputFile?: string;
   error?: WorkflowError;
   controller: AbortController;
   startedAt: Date;
@@ -622,10 +624,18 @@ export class WorkflowManager extends EventEmitter {
 
       managed.status = "completed";
       managed.result = result;
-      this.emit("complete", { runId: managed.runId, result });
 
-      // Persist final state
+      // Background completion delivery points to this sidecar instead of
+      // injecting an arbitrarily large return value into the parent context.
+      if (managed.background) {
+        try {
+          managed.outputFile = this.persistence.writeOutput(managed.runId, result.result);
+        } catch (err) {
+          console.warn("[workflow-manager] Persist workflow output failed:", err);
+        }
+      }
       this.persistRun(managed);
+      this.emit("complete", { runId: managed.runId, result, outputFile: managed.outputFile });
       managed.finalized = true;
       this.releaseRunLease(managed);
 

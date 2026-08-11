@@ -116,6 +116,8 @@ export interface PersistedRunState {
 export interface RunPersistence {
   /** Save current run state. `backup: false` skips the .bak sidecar (hot-path saves). */
   save(state: PersistedRunState, opts?: { backup?: boolean }): void;
+  /** Write the workflow's complete return value to a plain-text sidecar. */
+  writeOutput(runId: string, output: unknown): string;
   /** Load a persisted run by ID. */
   load(runId: string): PersistedRunState | null;
   /** List all persisted runs. */
@@ -195,6 +197,8 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
   const primaryLockPath = (runId: string) => lockPath(runsDir, runId);
   const legacyLockPath = (runId: string) => lockPath(legacyRunsDir, runId);
   const candidateRunPaths = (runId: string) => [primaryRunPath(runId), legacyRunPath(runId)];
+  const outputPath = (dir: string, runId: string) => join(dir, `${runId}.stdout`);
+  const primaryOutputPath = (runId: string) => outputPath(runsDir, runId);
 
   const pidIsAlive = (pid: number): boolean => {
     if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -251,6 +255,15 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       }
     },
 
+    writeOutput(runId: string, output: unknown): string {
+      ensureDir();
+      const path = primaryOutputPath(runId);
+      const serialized = typeof output === "string" ? output : (JSON.stringify(output, null, 2) ?? String(output));
+      _writeFileSync(`${path}.tmp`, serialized);
+      _renameSync(`${path}.tmp`, path);
+      return path;
+    },
+
     load(runId: string): PersistedRunState | null {
       // Try the primary, then the .bak — so a corrupt primary doesn't lose the run.
       for (const path of candidateRunPaths(runId)) {
@@ -293,7 +306,13 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
         for (const path of candidateRunPaths(runId)) {
           const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
           // Best-effort cleanup of the sidecar files alongside the primary.
-          for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
+          for (const sidecar of [
+            `${path}.bak`,
+            `${path}.tmp`,
+            outputPath(dir, runId),
+            `${outputPath(dir, runId)}.tmp`,
+            lockPath(dir, runId),
+          ]) {
             try {
               if (_existsSync(sidecar)) _unlinkSync(sidecar);
             } catch {

@@ -69,6 +69,7 @@ describe("installResultDelivery", () => {
         startedAt: new Date(),
         completedAt: new Date(),
       },
+      outputFile: "/tmp/workflows/test-run-1.stdout",
       result: {
         agentCount: 3,
         durationMs: 1500,
@@ -79,9 +80,7 @@ describe("installResultDelivery", () => {
     };
   }
 
-  // ── deliverText: verdict path ──
-
-  it("delivers verdict when result.result has verdict", () => {
+  it("delivers only the compact completion line and full output path", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
 
@@ -89,82 +88,20 @@ describe("installResultDelivery", () => {
     manager.emit("complete", { runId: "test-run-1" });
 
     const calls = (pi as unknown as { _calls: { content: string; customType?: string; display?: boolean }[] })._calls;
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].customType, "workflow-result");
-    assert.equal(calls[0].display, true);
-    assert.ok(calls[0].content.includes("Resume the original task"));
-    assert.ok(calls[0].content.includes("always reply to the user"));
-    assert.ok(calls[0].content.includes("All tests passed"), "should contain All tests passed");
-    assert.ok(calls[0].content.includes("test-workflow"), "should contain test-workflow");
-    assert.ok(calls[0].content.includes("3 agents"), "should contain 3 agents");
-    // locale may format the group separator as ',' / '.' / ' ' / none
-    assert.ok(/50[\s,.]?000/.test(calls[0].content), "should contain 50000 tokens formatted");
-    assert.ok(calls[0].content.includes("1.5s"), "should contain 1.5s");
-  });
-
-  // ── deliverText: fallback chain ──
-
-  it("falls back to report when verdict is absent", () => {
-    const pi = createMockPi();
-    const run = makeRun({ result: { result: { report: "Report body", verdict: "" } } });
-    const manager = createMockManager(run);
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("complete", { runId: "test-run-1" });
-
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.ok(calls[0].content.includes("Report body"), "should contain Report body");
-  });
-
-  it("falls back to summary when verdict and report are absent", () => {
-    const pi = createMockPi();
-    const run = makeRun({ result: { result: { summary: "Short summary" } } });
-    const manager = createMockManager(run);
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("complete", { runId: "test-run-1" });
-
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.ok(calls[0].content.includes("Short summary"), "should contain Short summary");
-  });
-
-  it("falls back to string result when result is a plain string", () => {
-    const pi = createMockPi();
-    const run = makeRun({ result: { result: "Plain string result" } });
-    const manager = createMockManager(run);
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("complete", { runId: "test-run-1" });
-
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.ok(calls[0].content.includes("Plain string result"), "should contain Plain string result");
-  });
-
-  it("falls back to truncated JSON when result is an object with no known key", () => {
-    const pi = createMockPi();
-    const run = makeRun({ result: { result: { foo: "x".repeat(500), bar: "y".repeat(500) } } });
-    const manager = createMockManager(run);
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("complete", { runId: "test-run-1" });
-
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.ok(calls[0].content.includes("foo"), "should contain foo");
-    assert.ok(calls[0].content.includes("…(truncated)"), "should contain …(truncated)");
-  });
-
-  it("falls back gracefully when result is nullish", () => {
-    const pi = createMockPi();
-    const run = makeRun({ result: { result: undefined } });
-    const manager = createMockManager(run);
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("complete", { runId: "test-run-1" });
-
-    // Should not crash; should still deliver a message
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1);
-    assert.ok(calls[0].content.includes("null"), "should contain null for undefined result");
+    assert.deepEqual(calls, [
+      {
+        customType: "workflow-result",
+        display: true,
+        content:
+          `✓ Background workflow "test-workflow" finished (3 agents · ${Number(50000).toLocaleString()} tokens · 1.5s). ` +
+          "full output: /tmp/workflows/test-run-1.stdout",
+      },
+    ]);
+    assert.doesNotMatch(
+      calls[0].content,
+      /All tests passed/,
+      "the result belongs in the output file, not the notification",
+    );
   });
 
   // ── installResultDelivery: guard / stale ctx ──

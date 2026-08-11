@@ -50,25 +50,6 @@ export interface TaskPanelOptions {
   loadSettings?: () => WorkflowSettings;
 }
 
-/**
- * Pick a clean human-readable summary from a workflow result, in order of
- * preference: a `verdict`/`report`/`summary` string field, a bare string
- * result, else a truncated JSON dump.
- */
-function summarizeResult(result: unknown): string {
-  if (typeof result === "string") return result;
-  if (result == null) return "null";
-  if (typeof result === "object") {
-    const obj = result as Record<string, unknown>;
-    for (const key of ["verdict", "report", "summary"] as const) {
-      const val = obj[key];
-      if (typeof val === "string" && val.trim()) return val;
-    }
-  }
-  const json = JSON.stringify(result, null, 2);
-  return json.length > 400 ? `${json.slice(0, 400)}\n…(truncated)` : json;
-}
-
 function fitLine(line: string, width?: number): string {
   if (typeof width !== "number" || !Number.isFinite(width)) return line;
   const maxWidth = Math.max(0, Math.floor(width));
@@ -77,15 +58,13 @@ function fitLine(line: string, width?: number): string {
 }
 
 export function deliverText(run: ManagedRun): string {
-  const summary = summarizeResult(run.result?.result);
   const tokens = run.result?.tokenUsage ? ` · ${run.result.tokenUsage.total.toLocaleString()} tokens` : "";
   const agents = run.result?.agentCount ?? run.snapshot.agents.filter(isAgentStep).length;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
-  return [
-    `✓ Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}).`,
-    "",
-    summary,
-  ].join("\n");
+  return (
+    `✓ Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}). ` +
+    `full output: ${run.outputFile ?? "unavailable"}`
+  );
 }
 
 /**
@@ -95,8 +74,8 @@ export function deliverText(run: ManagedRun): string {
  *
  *  - `triggerTurn: true` starts a fresh turn when the agent is idle, feeding the
  *    result to the model so the paused conversation continues.
- *  - Completed results explicitly tell the assistant to resume the original
- *    task, so the user receives the assistant's response.
+ *  - Completed results point to an untruncated output file instead of injecting
+ *    arbitrarily large workflow results into the parent context.
  *  - `deliverAs: "followUp"` means that if the user is busy in another turn, the
  *    result is queued and picked up after that turn finishes — never interrupting.
  *
@@ -146,11 +125,7 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     // Only background/resumed runs are delivered: a foreground (sync) run already
     // returns its result inline as the tool result, so re-delivering would dup it.
     if (run?.background) {
-      deliver(
-        runId,
-        `This workflow has finished. Resume the original task, use the result below, and always reply to the user.\n\n` +
-          deliverText(run),
-      );
+      deliver(runId, deliverText(run));
     }
   });
   manager.on("error", ({ runId, error }: { runId: string; error?: unknown }) => {

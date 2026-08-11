@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1596,9 +1596,14 @@ test(
     const events: string[] = [];
     manager.on("agentStart", () => events.push("agentStart"));
     manager.on("agentEnd", () => events.push("agentEnd"));
-    manager.on("complete", () => events.push("complete"));
+    let outputFile: string | undefined;
+    manager.on("complete", (event: { outputFile?: string }) => {
+      events.push("complete");
+      outputFile = event.outputFile;
+    });
     await manager.runSync(oneAgentScript);
     assert.deepEqual(events, ["agentStart", "agentEnd", "complete"]);
+    assert.equal(outputFile, undefined, "foreground runs return inline and do not need an output sidecar");
   }),
 );
 
@@ -1626,15 +1631,20 @@ test(
 );
 
 test(
-  "manager emits complete event with runId",
+  "manager emits complete only after the full output file exists",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
     let capturedId = "";
-    manager.on("complete", ({ runId }: { runId: string }) => {
+    let capturedOutputFile = "";
+    manager.on("complete", ({ runId, outputFile }: { runId: string; outputFile?: string }) => {
       capturedId = runId;
+      capturedOutputFile = outputFile ?? "";
+      assert.equal(readFileSync(capturedOutputFile, "utf-8"), '{\n  "a": "ok"\n}');
     });
-    await manager.runSync(oneAgentScript);
+    const { promise } = manager.startInBackground(oneAgentScript);
+    await promise;
     assert.ok(capturedId, "should capture runId on complete");
+    assert.match(capturedOutputFile, new RegExp(`${capturedId}\\.stdout$`));
   }),
 );
 

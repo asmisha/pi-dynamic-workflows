@@ -222,6 +222,22 @@ test(
 );
 
 test(
+  "createRunPersistence writes the complete workflow output to a stdout sidecar",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const objectPath = rp.writeOutput("object-output", { findings: ["one"], synthesis: "complete" });
+    assert.equal(objectPath, join(workflowProjectPaths(cwd).runsDir, "object-output.stdout"));
+    assert.equal(
+      readFileSync(objectPath, "utf-8"),
+      '{\n  "findings": [\n    "one"\n  ],\n  "synthesis": "complete"\n}',
+    );
+
+    const stringPath = rp.writeOutput("string-output", "verbatim result");
+    assert.equal(readFileSync(stringPath, "utf-8"), "verbatim result");
+  }),
+);
+
+test(
   "createRunPersistence delete removes run and returns true",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
@@ -236,10 +252,13 @@ test(
       startedAt: "2024-01-01T00:00:00.000Z",
       updatedAt: "2024-01-01T00:00:00.000Z",
     });
+    const outputPath = rp.writeOutput("delete-me", "full output");
     assert.ok(existsSync(join(workflowProjectPaths(cwd).runsDir, "delete-me.json")), "existsSync() should succeed");
+    assert.ok(existsSync(outputPath), "output sidecar should exist before deletion");
     const deleted = rp.delete("delete-me");
     assert.equal(deleted, true);
     assert.equal(rp.load("delete-me"), null);
+    assert.equal(existsSync(outputPath), false, "deleting the run should remove its output sidecar");
   }),
 );
 

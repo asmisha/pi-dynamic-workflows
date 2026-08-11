@@ -534,7 +534,6 @@ describe("deliverText", () => {
   function fakeManagedRun(overrides: Record<string, unknown> = {}) {
     return {
       runId: "r-123",
-      workflowName: "my-wf",
       snapshot: {
         name: "my-wf",
         agentCount: 5,
@@ -545,8 +544,9 @@ describe("deliverText", () => {
       },
       background: true,
       status: "completed",
+      outputFile: "/tmp/workflows/r-123.stdout",
       result: {
-        result: { verdict: "All checks passed" },
+        result: { synthesis: "complete result stays in the output file" },
         agentCount: 5,
         tokenUsage: { input: 100, output: 50, total: 150, cost: 0.003 },
         durationMs: 12345,
@@ -555,114 +555,24 @@ describe("deliverText", () => {
     } as never;
   }
 
-  it("prefers verdict property when available", async () => {
+  it("emits the compact completion notification with the full output path", async () => {
+    const { deliverText } = await loadTaskPanel();
+    assert.equal(
+      deliverText(fakeManagedRun()),
+      '✓ Background workflow "my-wf" finished (5 agents · 150 tokens · 12.3s). full output: /tmp/workflows/r-123.stdout',
+    );
+  });
+
+  it("does not inject the workflow result into the notification", async () => {
     const { deliverText } = await loadTaskPanel();
     const text = deliverText(fakeManagedRun());
-    assert.ok(text.includes("All checks passed"), "should include verdict text");
+    assert.doesNotMatch(text, /complete result stays in the output file/);
   });
 
-  it("falls back to report when no verdict", async () => {
+  it("reports an unavailable output file instead of inventing a path", async () => {
     const { deliverText } = await loadTaskPanel();
-    const run = fakeManagedRun({
-      result: {
-        result: { report: "Found 5 issues in codebase" },
-        agentCount: 3,
-      },
-    });
-    const text = deliverText(run);
-    assert.ok(text.includes("Found 5 issues"), "should include report text");
-  });
-
-  it("falls back to summary when no verdict or report", async () => {
-    const { deliverText } = await loadTaskPanel();
-    const run = fakeManagedRun({
-      result: {
-        result: { summary: "Analysis complete" },
-        agentCount: 2,
-      },
-    });
-    const text = deliverText(run);
-    assert.ok(text.includes("Analysis complete"), "should include summary text");
-  });
-
-  it("falls back to JSON when result has no structured properties", async () => {
-    const { deliverText } = await loadTaskPanel();
-    const run = fakeManagedRun({
-      result: {
-        result: { raw: "data", count: 42 },
-        agentCount: 1,
-      },
-    });
-    const text = deliverText(run);
-    assert.ok(text.includes("count"), "should include JSON keys");
-    assert.ok(text.includes("42"), "should include JSON values");
-  });
-
-  it("uses string result directly", async () => {
-    const { deliverText } = await loadTaskPanel();
-    const run = fakeManagedRun({
-      result: {
-        result: "Everything is fine",
-        agentCount: 1,
-      },
-    });
-    const text = deliverText(run);
-    assert.ok(text.includes("Everything is fine"), "should contain Everything is fine");
-  });
-
-  it("handles null result gracefully", async () => {
-    const { deliverText } = await loadTaskPanel();
-    const run = fakeManagedRun({
-      result: {
-        result: null,
-        agentCount: 1,
-      },
-    });
-    const text = deliverText(run);
-    assert.ok(text.includes("null"), "should say null");
-    assert.ok(text.includes("finished"), "should include finished message");
-  });
-
-  it("includes token count when available", async () => {
-    const { deliverText } = await loadTaskPanel();
-    const text = deliverText(fakeManagedRun());
-    assert.ok(text.includes("150"), "should show token count");
-    assert.ok(text.includes("tokens"), "should mention tokens");
-  });
-
-  it("includes agent count", async () => {
-    const { deliverText } = await loadTaskPanel();
-    const text = deliverText(fakeManagedRun());
-    assert.ok(text.includes("5"), "should show 5 agents");
-    assert.ok(text.includes("agents"), "should mention agents");
-  });
-
-  it("includes duration in seconds", async () => {
-    const { deliverText } = await loadTaskPanel();
-    const text = deliverText(fakeManagedRun());
-    assert.ok(text.includes("12.3"), "should show duration in seconds");
-    assert.ok(text.includes("s"), "should show unit");
-  });
-
-  it("starts with checkmark and workflow name", async () => {
-    const { deliverText } = await loadTaskPanel();
-    const text = deliverText(fakeManagedRun());
-    assert.ok(text.startsWith("✓"), "should start with checkmark");
-    assert.ok(text.includes("my-wf"), "should include workflow name");
-  });
-
-  it("truncates very long JSON at 400 chars", async () => {
-    const { deliverText } = await loadTaskPanel();
-    const large = { data: "x".repeat(500) };
-    const run = fakeManagedRun({
-      result: {
-        result: large,
-        agentCount: 1,
-      },
-    });
-    const text = deliverText(run);
-    // JSON of large object + "...(truncated)" — deliverText has slice(0,400) logic
-    assert.ok(text.includes("truncated") || text.length < 600, "very long JSON should be truncated");
+    const text = deliverText(fakeManagedRun({ outputFile: undefined }));
+    assert.match(text, /full output: unavailable$/);
   });
 });
 
