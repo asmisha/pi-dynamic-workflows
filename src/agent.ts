@@ -29,6 +29,21 @@ import { createReadOnlyBashSession } from "./read-only-bash.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 import { resolveWorkflowSessionPath } from "./workflow-paths.js";
 
+/**
+ * Subagents never orchestrate. A nested workflow run duplicates the parent
+ * workflow's own stages outside its journal, budget, and lease control, so the
+ * workflow tools are excluded from every subagent session — the agent verifies
+ * its own work in its own session instead of delegating it.
+ */
+const WORKFLOW_TOOL_NAMES = [
+  "workflow",
+  "workflow_status",
+  "workflow_resume",
+  "workflow_pause",
+  "workflow_stop",
+  "workflow_retry",
+];
+
 const READ_ONLY_TOOL_NAMES = [
   "read",
   "grep",
@@ -790,6 +805,7 @@ export class WorkflowAgent {
           // and clamps it to what that model supports.
           ...(options.thinking ? { thinkingLevel: options.thinking } : {}),
           ...(options.readOnly ? { tools: readOnlyToolNames } : {}),
+          excludeTools: WORKFLOW_TOOL_NAMES,
         });
         // createAgentSession loads configured extensions, but hooks (including
         // compaction/autocontinue extensions and session_start tool setup) only run

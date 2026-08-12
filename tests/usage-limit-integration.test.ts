@@ -313,6 +313,63 @@ test("a read-only real subagent excludes write-capable tools and preserves read-
     }
   }));
 
+test("workflow orchestration tools are excluded from every subagent session", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
+    let activeTools: string[] = [];
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          pi.on("session_start", () => {
+            for (const name of [
+              "workflow",
+              "workflow_status",
+              "workflow_resume",
+              "workflow_pause",
+              "workflow_stop",
+              "workflow_retry",
+              "structured_return",
+            ]) {
+              pi.registerTool(
+                defineTool({
+                  name,
+                  description: `${name} test tool`,
+                  parameters: Type.Object({}),
+                  async execute() {
+                    return { content: [{ type: "text", text: "ok" }] };
+                  },
+                }),
+              );
+            }
+            activeTools = pi.getActiveTools();
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
+    await agent.run("implement the change", { label: "writer" });
+
+    for (const name of ["read", "edit", "write", "bash", "structured_return"]) {
+      assert.ok(activeTools.includes(name), `expected ${name} to remain active, got ${activeTools.join(", ")}`);
+    }
+    for (const name of [
+      "workflow",
+      "workflow_status",
+      "workflow_resume",
+      "workflow_pause",
+      "workflow_stop",
+      "workflow_retry",
+    ]) {
+      assert.ok(!activeTools.includes(name), `expected ${name} to be excluded, got ${activeTools.join(", ")}`);
+    }
+  }));
+
 test("live usage removes an assistant response discarded by SDK auto-retry", () =>
   withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     const agentDir = getAgentDir();
