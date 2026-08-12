@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -1195,7 +1195,14 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
 export async function loadWorkflowModule(modulePath: string): Promise<WorkflowModuleDefinition> {
   let loaded: Record<string, unknown>;
   try {
-    loaded = (await import(pathToFileURL(modulePath).href)) as Record<string, unknown>;
+    // Node's ESM loader caches modules by full URL (query string included) and
+    // never re-imports edits. Appending the file's mtime busts the cache when
+    // the module changes while an unchanged file still resolves to the same
+    // URL and reuses the cached instance. Edits to the module's own imports
+    // are NOT detected — only the entry file's mtime is checked.
+    const url = new URL(pathToFileURL(modulePath).href);
+    url.searchParams.set("mtime", String(statSync(modulePath).mtimeMs));
+    loaded = (await import(url.href)) as Record<string, unknown>;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Could not load workflow module ${modulePath}: ${message}`, { cause: error });

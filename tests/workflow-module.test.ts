@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { loadWorkflowModule } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowTool } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -131,6 +132,35 @@ export async function run(context) {
   } finally {
     rmSync(cwd, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("loadWorkflowModule re-imports an edited module (mtime cache invalidation)", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-native-reload-"));
+  try {
+    const scriptPath = join(cwd, "workflow.mjs");
+    const source = (version: string) =>
+      `export const meta = { name: 'reload_test', description: 'reload test' }
+export async function run() { return '${version}' }
+`;
+
+    writeFileSync(scriptPath, source("v1"));
+    // Pin distinct mtimes: same-millisecond writes would otherwise produce
+    // identical cache keys and make the test flaky.
+    utimesSync(scriptPath, new Date(1000), new Date(1000));
+    const first = await loadWorkflowModule(scriptPath);
+    assert.equal(await first.run({} as any), "v1");
+
+    writeFileSync(scriptPath, source("v2"));
+    utimesSync(scriptPath, new Date(2000), new Date(2000));
+    const second = await loadWorkflowModule(scriptPath);
+    assert.equal(await second.run({} as any), "v2");
+
+    // Unchanged file: same URL, cached instance is reused.
+    const third = await loadWorkflowModule(scriptPath);
+    assert.equal(third.run, second.run);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
 
