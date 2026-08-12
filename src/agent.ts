@@ -30,10 +30,11 @@ import { createStructuredOutputTool, type StructuredOutputCapture } from "./stru
 import { resolveWorkflowSessionPath } from "./workflow-paths.js";
 
 /**
- * Subagents never orchestrate. A nested workflow run duplicates the parent
- * workflow's own stages outside its journal, budget, and lease control, so the
- * workflow tools are excluded from every subagent session — the agent verifies
- * its own work in its own session instead of delegating it.
+ * Subagents do not orchestrate by default. A nested workflow run lives outside
+ * the parent workflow's journal, budget, and lease control, so the workflow
+ * tools are excluded from subagent sessions unless the call opts in with
+ * `allowSubagents` — the agent verifies its own work in its own session
+ * instead of delegating it.
  */
 const WORKFLOW_TOOL_NAMES = [
   "workflow",
@@ -623,6 +624,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   toolNames?: string[];
   /** Remove these coding-tool names after the allowlist (an agentType `disallowedTools` denylist). */
   disallowedToolNames?: string[];
+  /** Allow this subagent to launch nested workflow runs; the workflow orchestration tools are excluded by default. */
+  allowSubagents?: boolean;
   /** Restrict tools to repository reads plus a filesystem-sandboxed bash when supported. */
   readOnly?: boolean;
   /**
@@ -805,7 +808,7 @@ export class WorkflowAgent {
           // and clamps it to what that model supports.
           ...(options.thinking ? { thinkingLevel: options.thinking } : {}),
           ...(options.readOnly ? { tools: readOnlyToolNames } : {}),
-          excludeTools: WORKFLOW_TOOL_NAMES,
+          ...(options.allowSubagents ? {} : { excludeTools: WORKFLOW_TOOL_NAMES }),
         });
         // createAgentSession loads configured extensions, but hooks (including
         // compaction/autocontinue extensions and session_start tool setup) only run

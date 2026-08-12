@@ -239,6 +239,12 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   retryable?: boolean;
   /** Exclude code-writing tools and default this call to one automatic recoverable retry. */
   readOnly?: boolean;
+  /**
+   * Allow this agent to launch nested workflow runs. The workflow orchestration
+   * tools are excluded from subagent sessions by default; readOnly sessions
+   * never receive them regardless of this flag.
+   */
+  allowSubagents?: boolean;
   /** Run this agent in a different working directory (tools + session bind to it). */
   cwd?: string;
   /**
@@ -726,6 +732,7 @@ export async function runWorkflow<T = unknown>(
               toolNames: agentDef?.tools,
               disallowedToolNames: agentDef?.disallowedTools,
               readOnly: agentOptions.readOnly,
+              allowSubagents: agentOptions.allowSubagents,
               cwd: agentOptions.cwd ?? baseCwd,
               forkFrom: agentOptions.forkFrom,
               sessionPath: agentOptions.sessionPath,
@@ -1389,6 +1396,9 @@ function hashAgentCall(
     sessionPath: options.sessionPath ?? null,
     retryable: options.retryable ?? true,
     readOnly: options.readOnly ?? false,
+    // Conditional so journals recorded before this option existed keep their
+    // hashes; setting it changes the toolset, which changes the answer.
+    ...(options.allowSubagents ? { allowSubagents: true } : {}),
   });
   return createHash("sha256").update(identity).digest("hex");
 }
