@@ -474,9 +474,10 @@ test("a real subagent provider turn receives the configured system prompt", () =
     );
   }));
 
-test("a real subagent session binds extensions so session_start-registered tools become active", () =>
+test("a real subagent completes the extension lifecycle it starts", () =>
   withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     let sessionStartRan = false;
+    let sessionShutdownRan = false;
     let activeAfterRegistration: string[] = [];
     const agentDir = getAgentDir();
     const resourceLoader = new DefaultResourceLoader({
@@ -499,6 +500,12 @@ test("a real subagent session binds extensions so session_start-registered tools
             );
             activeAfterRegistration = pi.getActiveTools();
           });
+          pi.on("session_shutdown", async () => {
+            // Prove WorkflowAgent awaits async native-resource cleanup instead
+            // of disposing the extension runner immediately after emission.
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            sessionShutdownRan = true;
+          });
         },
       ],
     });
@@ -514,6 +521,32 @@ test("a real subagent session binds extensions so session_start-registered tools
       activeAfterRegistration.includes("late_session_tool"),
       `expected late_session_tool to be active, got ${activeAfterRegistration.join(", ")}`,
     );
+    assert.equal(sessionShutdownRan, true, "subagents must await session_shutdown before returning");
+  }));
+
+test("a failed subagent attempt still emits session_shutdown", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
+    let sessionShutdownCount = 0;
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          pi.on("session_shutdown", () => {
+            sessionShutdownCount++;
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider failed" })]);
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
+    await assert.rejects(agent.run("do the task", { label: "extension-failure" }), /provider failed/);
+
+    assert.equal(sessionShutdownCount, 1, "failed attempts must release extension-owned resources");
   }));
 
 test("a real subagent waits for deferred extension continuation before returning and disposing", () =>

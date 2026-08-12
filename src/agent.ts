@@ -3,11 +3,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
+  type AgentSession,
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
   getAgentDir,
-  ModelRegistry,
+  type ModelRegistry,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
@@ -270,6 +271,17 @@ const SUBAGENT_IDLE_STABLE_MS = 100;
 
 function abortError(): Error {
   return new Error("Subagent was aborted");
+}
+
+/** Complete the extension lifecycle before invalidating a subagent session. */
+async function shutdownAndDisposeSession(session: AgentSession): Promise<void> {
+  try {
+    if (session.extensionRunner.hasHandlers("session_shutdown")) {
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    }
+  } finally {
+    session.dispose();
+  }
 }
 
 function waitForTimer(ms: number, signal?: AbortSignal): Promise<void> {
@@ -789,6 +801,7 @@ export class WorkflowAgent {
     // inherits another session's context; sessionPath persists/continues one.
     const forked = resolveSubagentSession({ forkFrom: options.forkFrom, sessionPath: options.sessionPath }, runCwd);
     const session = await (async () => {
+      let createdSession: AgentSession | undefined;
       try {
         const created = await createAgentSession({
           cwd: runCwd,
@@ -810,13 +823,24 @@ export class WorkflowAgent {
           ...(options.readOnly ? { tools: readOnlyToolNames } : {}),
           ...(options.allowSubagents ? {} : { excludeTools: WORKFLOW_TOOL_NAMES }),
         });
+        createdSession = created.session;
         // createAgentSession loads configured extensions, but hooks (including
         // compaction/autocontinue extensions and session_start tool setup) only run
         // after binding. Bind headlessly so workflow subagents participate in the
         // same extension lifecycle as normal sessions.
-        await created.session.bindExtensions({});
-        return created.session;
+        await createdSession.bindExtensions({});
+        return createdSession;
       } catch (error) {
+        // session_start may already have allocated extension-owned resources
+        // before a later bind step failed. Preserve the bind error, but still
+        // make a best effort to release those resources.
+        if (createdSession) {
+          try {
+            await shutdownAndDisposeSession(createdSession);
+          } catch (shutdownError) {
+            console.warn("[workflow] failed to shut down subagent extensions after bind failure", shutdownError);
+          }
+        }
         readOnlyBash?.cleanup();
         forked.cleanup();
         throw error;
@@ -977,7 +1001,11 @@ export class WorkflowAgent {
       }
       emitUsage(options.onUsage);
       try {
-        session.dispose();
+        // bindExtensions() emits session_start, so every bound subagent must
+        // complete the matching extension lifecycle before disposal. Native
+        // resources such as FFF file watchers are released by session_shutdown
+        // handlers, not by AgentSession.dispose().
+        await shutdownAndDisposeSession(session);
       } finally {
         readOnlyBash?.cleanup();
         forked?.cleanup();
