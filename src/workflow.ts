@@ -23,6 +23,7 @@ import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_CONCURRENCY } from "./
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { nativeImport } from "./native-import.mjs";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 const AGENT_TIMEOUT_CLEANUP_GRACE_MS = 1000;
@@ -1200,9 +1201,12 @@ export async function loadWorkflowModule(modulePath: string): Promise<WorkflowMo
     // the module changes while an unchanged file still resolves to the same
     // URL and reuses the cached instance. Edits to the module's own imports
     // are NOT detected — only the entry file's mtime is checked.
+    // The import goes through the nativeImport helper because a literal
+    // import() here gets rewritten by jiti (pi's extension loader) into a
+    // path-keyed jitiImport() that strips the query — see native-import.mjs.
     const url = new URL(pathToFileURL(modulePath).href);
     url.searchParams.set("mtime", String(statSync(modulePath).mtimeMs));
-    loaded = (await import(url.href)) as Record<string, unknown>;
+    loaded = (await nativeImport(url.href)) as Record<string, unknown>;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Could not load workflow module ${modulePath}: ${message}`, { cause: error });

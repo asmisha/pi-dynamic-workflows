@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { loadWorkflowModule } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowTool } from "../src/workflow-tool.js";
@@ -158,6 +160,45 @@ export async function run() { return '${version}' }
 
     // Unchanged file: same URL, cached instance is reused.
     const third = await loadWorkflowModule(scriptPath);
+    assert.equal(third.run, second.run);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("loadWorkflowModule re-imports an edited module under pi's jiti extension loader", async () => {
+  // pi loads extension TypeScript through jiti, which rewrites source-level
+  // dynamic import() into jitiImport() and resolves the specifier back to a
+  // bare file path — a ?mtime= query on the import URL does not survive. Load
+  // workflow.ts through the same jiti version and options as pi's extension
+  // loader to prove cache busting works on the production path too.
+  const piRequire = createRequire(new URL("../node_modules/@earendil-works/pi-coding-agent/_.js", import.meta.url));
+  const { createJiti } = piRequire("jiti");
+  const jiti = createJiti(import.meta.url, { moduleCache: false });
+  const wf = (await jiti.import(
+    fileURLToPath(new URL("../src/workflow.ts", import.meta.url)),
+  )) as typeof import("../src/workflow.js");
+
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-jiti-reload-"));
+  try {
+    const scriptPath = join(cwd, "workflow.mjs");
+    const source = (version: string) =>
+      `export const meta = { name: 'jiti_reload_test', description: 'jiti reload test' }
+export async function run() { return '${version}' }
+`;
+
+    writeFileSync(scriptPath, source("v1"));
+    utimesSync(scriptPath, new Date(1000), new Date(1000));
+    const first = await wf.loadWorkflowModule(scriptPath);
+    assert.equal(await first.run({} as any), "v1");
+
+    writeFileSync(scriptPath, source("v2"));
+    utimesSync(scriptPath, new Date(2000), new Date(2000));
+    const second = await wf.loadWorkflowModule(scriptPath);
+    assert.equal(await second.run({} as any), "v2");
+
+    // Unchanged file: same URL, cached instance is reused.
+    const third = await wf.loadWorkflowModule(scriptPath);
     assert.equal(third.run, second.run);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
