@@ -171,3 +171,66 @@ return { first, second }`;
     second: "second answer",
   });
 });
+
+test("checkpoint(): an unchanged question reuses the stored reply after an earlier hash miss", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+const before = await agent('before v1')
+const reply = await checkpoint('Approve?')
+return { before, reply }`;
+  const journal: JournalEntry[] = [];
+  let pending: PendingCheckpoint | undefined;
+  try {
+    await runWorkflow(script, {
+      agent: noopAgent,
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+    });
+  } catch (error) {
+    if (error instanceof WorkflowError) pending = error.details as PendingCheckpoint;
+  }
+  assert.ok(pending);
+  journal.push({ index: pending.callIndex, hash: pending.hash, result: "approved" });
+
+  // A mid-run module update changed the agent prompt but not the question:
+  // the upstream call re-runs live, the owner is not re-asked.
+  const updated = script.replace("before v1", "before v2");
+  let reran = 0;
+  const resumed = await runWorkflow<{ before: string; reply: string }>(updated, {
+    agent: {
+      run: async () => {
+        reran += 1;
+        return "fresh";
+      },
+    },
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+  });
+  assert.equal(reran, 1);
+  assert.equal(resumed.result.before, "fresh");
+  assert.equal(resumed.result.reply, "approved");
+});
+
+test("checkpoint(): a changed question is re-asked even when its stored reply exists", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+const reply = await checkpoint('Approve v1?')
+return { reply }`;
+  let pending: PendingCheckpoint | undefined;
+  try {
+    await runWorkflow(script, { agent: noopAgent, persistLogs: false });
+  } catch (error) {
+    if (error instanceof WorkflowError) pending = error.details as PendingCheckpoint;
+  }
+  assert.ok(pending);
+  const journal = new Map<number, JournalEntry>([
+    [pending.callIndex, { index: pending.callIndex, hash: pending.hash, result: "approved" }],
+  ]);
+  await assert.rejects(
+    () =>
+      runWorkflow(script.replace("Approve v1?", "Approve v2?"), {
+        agent: noopAgent,
+        persistLogs: false,
+        resumeJournal: journal,
+      }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED,
+  );
+});

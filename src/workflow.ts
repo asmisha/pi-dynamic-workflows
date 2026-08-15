@@ -1045,12 +1045,11 @@ export async function runWorkflow<T = unknown>(
     const callHash = hashCheckpoint(promptText);
     const cached = cachedForCall(callId, callIndex);
     ensureRetryHash(cached, callHash, callId);
-    if (
-      cached != null &&
-      cached.hash === callHash &&
-      isJournalSuccess(cached) &&
-      (retryMode || callIndex < state.firstMiss)
-    ) {
+    // A checkpoint's input is fully captured by its prompt hash: the owner
+    // answered exactly this question text. The reply stays valid even when an
+    // earlier call re-executed after a mid-run module update, so reuse does not
+    // depend on firstMiss — a byte-identical question is never re-asked.
+    if (cached != null && cached.hash === callHash && isJournalSuccess(cached)) {
       return cached.result;
     }
     if (!retryMode && (cached == null || cached.hash !== callHash || !isJournalSuccess(cached))) {
