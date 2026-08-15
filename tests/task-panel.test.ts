@@ -55,7 +55,6 @@ describe("installResultDelivery", () => {
   function makeRun(overrides: Record<string, unknown> = {}) {
     return {
       runId: "test-run-1",
-      background: true,
       snapshot: {
         name: "test-workflow",
         agentCount: 3,
@@ -138,20 +137,6 @@ describe("installResultDelivery", () => {
     assert.ok(true, "should not throw"); // reached without crash
   });
 
-  // ── Only background runs are delivered ──
-
-  it("skips delivery for foreground runs (background=false)", () => {
-    const pi = createMockPi();
-    const run = makeRun({ background: false });
-    const manager = createMockManager(run);
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("complete", { runId: "test-run-1" });
-
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 0);
-  });
-
   // ── Error event ──
 
   it("delivers error message on error event for background runs", () => {
@@ -166,18 +151,6 @@ describe("installResultDelivery", () => {
     assert.equal(calls[0].display, true);
     assert.ok(calls[0].content.includes("failed"), "should contain failed");
     assert.ok(calls[0].content.includes("Something went wrong"), "should contain Something went wrong");
-  });
-
-  it("skips error delivery for foreground runs", () => {
-    const pi = createMockPi();
-    const run = makeRun({ background: false });
-    const manager = createMockManager(run);
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("error", { runId: "test-run-1", error: { message: "fail" } });
-
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 0);
   });
 
   it("does not deliver terminal results or errors outside the current session", () => {
@@ -275,17 +248,6 @@ describe("installResultDelivery", () => {
 
     mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
     manager.emit("paused", { runId: "test-run-1" });
-
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 0);
-  });
-
-  it("skips usage-limit pause delivery for foreground runs", () => {
-    const pi = createMockPi();
-    const manager = createMockManager(makeRun({ background: false }));
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("paused", { runId: "test-run-1", reason: "usage_limit", error: { message: "usage limit" } });
 
     const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
     assert.equal(calls.length, 0);

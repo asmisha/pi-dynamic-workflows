@@ -5,21 +5,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { listAvailableModelSpecs } from "./agent.js";
 import { listAgentTypes, loadAgentRegistry } from "./agent-registry.js";
-import {
-  createToolUpdateWorkflowDisplay,
-  createWorkflowSnapshot,
-  recomputeWorkflowSnapshot,
-  renderWorkflowText,
-  resolveWorkflowFailureLocation,
-  type WorkflowSnapshot,
-} from "./display.js";
-import { formatWorkflowFailure, WorkflowError, WorkflowErrorCode } from "./errors.js";
-import {
-  loadWorkflowModule,
-  parseWorkflowScript,
-  type WorkflowModuleDefinition,
-  type WorkflowRunResult,
-} from "./workflow.js";
+import { recomputeWorkflowSnapshot, renderWorkflowText, type WorkflowSnapshot } from "./display.js";
+import { loadWorkflowModule, parseWorkflowScript, type WorkflowModuleDefinition } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
 
@@ -37,7 +24,7 @@ export const WORKFLOW_CONTRACT = [
   "Inline globals, also available as fields of a native run(context): agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), bash(cmd, opts), checkpoint(question), log, args, cwd, runId. Use runId, never an invented id, when a run needs its own artifact or session paths.",
   "Subagents inherit no parent context: every prompt must carry its own task, paths, and expected output. Set opts.readOnly = true for reviewers and searchers, and opts.retryable = false for any agent that can duplicate side effects. Subagents cannot launch nested workflow runs unless the call sets opts.allowSubagents = true.",
   "parallel() and pipeline() reject on branch failure: for best effort catch inside the branch, never on the aggregate. bash() returns {pid, exitCode, stdoutFile, stderrFile}; pass those paths to agents instead of pasting output through results.",
-  "Runs are background by default — the call returns a run ID, and every completion, failure, and checkpoint is delivered back into this conversation and wakes you automatically. Never wait for a run: no workflow_status polling, no sleep, no idle turns. Do other useful work or end the turn. Pass background: false only when the result is required inline this turn.",
+  "Runs always execute in the background — the call returns a run ID, and every completion, failure, and checkpoint is delivered back into this conversation and wakes you automatically. Never wait for a run: no workflow_status polling, no sleep, no idle turns. Do other useful work or end the turn.",
 ];
 
 /**
@@ -80,16 +67,6 @@ export function agentTypeGuideline(cwd: string = process.cwd()): string | undefi
 
 const MAX_WORKFLOW_SCRIPT_BYTES = 1024 * 1024;
 
-function agentFailurePauseDetails(
-  error: WorkflowError,
-): { runId: string; pauseReason: "agent_failure"; retryState?: unknown } | undefined {
-  const details = error.details;
-  if (!details || typeof details !== "object") return undefined;
-  const value = details as { runId?: unknown; pauseReason?: unknown; retryState?: unknown };
-  if (typeof value.runId !== "string" || value.pauseReason !== "agent_failure") return undefined;
-  return { runId: value.runId, pauseReason: "agent_failure", retryState: value.retryState };
-}
-
 const workflowToolSchema = Type.Object({
   resumeRunId: Type.Optional(
     Type.String({
@@ -128,12 +105,6 @@ const workflowToolSchema = Type.Object({
         "Optional JSON object exposed to the workflow script as global `args`. Pass an object, not stringified JSON.",
     }),
   ),
-  background: Type.Optional(
-    Type.Boolean({
-      description:
-        "Default true: return immediately with a run ID; the result is delivered back when the run finishes. false blocks for the result inline.",
-    }),
-  ),
   concurrency: Type.Optional(
     Type.Number({
       description:
@@ -161,7 +132,6 @@ export type WorkflowToolInput = {
   scriptPath?: string;
   cwd?: string;
   args?: unknown;
-  background?: boolean;
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number;
@@ -399,7 +369,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     prepareArguments(args) {
       return normalizeWorkflowToolArgs(args);
     },
-    async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       if (params.resumeRunId) {
         const resumed = await manager.resumeWithReply(params.resumeRunId, params.reply);
         if (!resumed) {
@@ -414,7 +384,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
               text: `Checkpoint reply accepted. Workflow ${params.resumeRunId} resumed in the background. Its result will return to this conversation.`,
             },
           ],
-          details: { runId: params.resumeRunId, background: true, resumed: true },
+          details: { runId: params.resumeRunId, resumed: true },
         };
       }
 
@@ -422,141 +392,20 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       const runCwd = resolveWorkflowCwd(params.cwd);
       const parsed = source.workflowModule ? { meta: source.workflowModule.meta } : parseWorkflowScript(source.script);
 
-      // Background execution is the default: return immediately so the turn ends
-      // and the user isn't blocked. The result is delivered back into the
-      // conversation when the run finishes (see installResultDelivery). Only an
-      // explicit `background: false` blocks for the result inline.
-      if (params.background ?? true) {
-        const { runId } = manager.startInBackground(source.script, params.args, {
-          workflowModulePath: source.workflowModulePath,
-          workflowModule: source.workflowModule,
-          concurrency: params.concurrency,
-          agentRetries: params.agentRetries,
-          agentTimeoutMs: params.agentTimeoutMs,
-          cwd: runCwd,
-        });
-        return {
-          content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
-          details: { runId, background: true },
-        };
-      }
-
-      // Synchronous execution (blocking) — but routed through the manager so the
-      // run shows up live in the /workflows navigator and the task panel while it
-      // runs, then stays in history afterwards. We still block on the result and
-      // return it inline, so the model gets the full output in the same turn.
-      let snapshot: WorkflowSnapshot = createWorkflowSnapshot(parsed.meta);
-      const display = createToolUpdateWorkflowDisplay(onUpdate, undefined, {
-        key: "workflow",
-        streamToolUpdates: true,
-        maxAgents: 4,
-        showResultPreviews: false,
+      // Always background: return immediately so the turn ends and the user
+      // isn't blocked. The result is delivered back into the conversation when
+      // the run finishes (see installResultDelivery).
+      const { runId } = manager.startInBackground(source.script, params.args, {
+        workflowModulePath: source.workflowModulePath,
+        workflowModule: source.workflowModule,
+        concurrency: params.concurrency,
+        agentRetries: params.agentRetries,
+        agentTimeoutMs: params.agentTimeoutMs,
+        cwd: runCwd,
       });
-
-      let result: WorkflowRunResult;
-      try {
-        result = await manager.runSync(source.script, params.args, {
-          workflowModulePath: source.workflowModulePath,
-          workflowModule: source.workflowModule,
-          concurrency: params.concurrency,
-          agentRetries: params.agentRetries,
-          agentTimeoutMs: params.agentTimeoutMs,
-          cwd: runCwd,
-          externalSignal: signal,
-          onProgress(live) {
-            snapshot = recomputeWorkflowSnapshot(live);
-            display.update(snapshot);
-          },
-        });
-      } catch (error) {
-        if (error instanceof WorkflowError && error.code === WorkflowErrorCode.CHECKPOINT_INPUT_REQUIRED) {
-          const checkpoint = error.details as { runId?: string; prompt?: string };
-          return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `Workflow ${checkpoint.runId ?? "unknown"} paused for parent-conversation input.\n` +
-                  `${checkpoint.prompt ?? error.message}\n` +
-                  `After the user replies, continue it with workflow({resumeRunId, reply}).`,
-              },
-            ],
-            details: { runId: checkpoint.runId, paused: true, checkpoint },
-          };
-        }
-        if (error instanceof WorkflowError) {
-          const pause = agentFailurePauseDetails(error);
-          if (pause) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `Workflow ${pause.runId} paused after a retryable agent failure: ${error.message}\n` +
-                    `Retry it with workflow_retry({ runId: "${pause.runId}" }) or /workflows retry ${pause.runId}.`,
-                },
-              ],
-              details: { runId: pause.runId, paused: true, pauseReason: "agent_failure", retryState: pause.retryState },
-            };
-          }
-        }
-        const aborted =
-          signal?.aborted || (error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED);
-        if (aborted) {
-          for (const agent of snapshot.agents) {
-            if (agent.status === "running") {
-              agent.status = "skipped";
-              agent.error = "aborted";
-            }
-          }
-          snapshot = recomputeWorkflowSnapshot(snapshot);
-          display.complete(snapshot);
-        }
-        const failureLocation = resolveWorkflowFailureLocation(
-          snapshot,
-          error instanceof WorkflowError ? error.agentLabel : undefined,
-        );
-        throw new Error(formatWorkflowFailure(error, failureLocation), { cause: error });
-      }
-
-      if (result.agentCount === 0) {
-        throw new Error(
-          "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",
-        );
-      }
-
-      snapshot.result = result.result;
-      snapshot.durationMs = result.durationMs;
-      snapshot = recomputeWorkflowSnapshot(snapshot);
-      display.complete(snapshot);
-
-      // Format token usage (include cost when the provider reports it)
-      const tokenInfo = result.tokenUsage
-        ? `\n\nToken usage: ${result.tokenUsage.total.toLocaleString()} tokens${
-            result.tokenUsage.cost ? ` ($${result.tokenUsage.cost.toFixed(4)})` : ""
-          }`
-        : "";
-
-      const formattedResult =
-        result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
-
       return {
-        content: [
-          {
-            type: "text",
-            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}`,
-          },
-        ],
-        details: {
-          ...snapshot,
-          meta: result.meta,
-          phases: result.phases,
-          logs: result.logs,
-          result: result.result,
-          durationMs: result.durationMs,
-          tokenUsage: result.tokenUsage,
-          runId: result.runId,
-        },
+        content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
+        details: { runId },
       };
     },
     renderCall(_args, theme) {
@@ -656,16 +505,7 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
   if (Object.hasOwn(value, "reply")) {
     throw new Error("workflow `reply` requires `resumeRunId`");
   }
-  const startFields = new Set([
-    "script",
-    "scriptPath",
-    "cwd",
-    "args",
-    "background",
-    "concurrency",
-    "agentRetries",
-    "agentTimeoutMs",
-  ]);
+  const startFields = new Set(["script", "scriptPath", "cwd", "args", "concurrency", "agentRetries", "agentTimeoutMs"]);
   const unsupportedField = Object.keys(value).find((field) => !startFields.has(field));
   if (unsupportedField) throw new Error(`workflow \`${unsupportedField}\` is not supported`);
   if (hasScript && typeof value.script !== "string") {

@@ -179,7 +179,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowMana
           }
           const runs = manager.listRuns();
           if (!runs.length) {
-            await print("No workflow runs yet. Start one with a background workflow (background: true).");
+            await print("No workflow runs yet. Start one with the workflow tool.");
             return;
           }
           await print(["Workflow runs:", ...runs.map(summarizeRun), "", USAGE].join("\n"));

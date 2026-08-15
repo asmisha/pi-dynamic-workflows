@@ -6,8 +6,13 @@ import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import type { AgentHistoryEntry } from "../src/agent-history.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { WorkflowManager } from "../src/workflow-manager.js";
+import { type ExecOptions, WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+
+/** Start a background run and await its result: the direct driver for runtime-semantics tests. */
+function runAndWait(manager: WorkflowManager, script: string, args?: unknown, exec: ExecOptions = {}) {
+  return manager.startInBackground(script, args, exec).promise;
+}
 
 /** Agent runner that reports fixed usage so token accounting is exercised. */
 function fakeAgent(usage: Partial<AgentUsage> = {}, result: unknown = "ok") {
@@ -118,7 +123,7 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
 }
 
 test(
-  "runSync registers the run so /workflows (listRuns) can see it",
+  "runAndWait registers the run so /workflows (listRuns) can see it",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent({ input: 100, output: 40, total: 140 }) });
     const events: string[] = [];
@@ -126,7 +131,7 @@ test(
       manager.on(ev, () => events.push(ev));
     }
     let progressCalls = 0;
-    const result = await manager.runSync(oneAgentScript, undefined, {
+    const result = await runAndWait(manager, oneAgentScript, undefined, {
       onProgress: () => {
         progressCalls++;
       },
@@ -148,10 +153,10 @@ test(
   "args.name labels the run so two launches of one script are distinguishable",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
-    await manager.runSync(oneAgentScript, { name: "  PR 14039 review  " });
-    await manager.runSync(oneAgentScript, { name: "PR 14040 review" });
-    await manager.runSync(oneAgentScript, undefined);
-    await manager.runSync(oneAgentScript, { name: 42 });
+    await runAndWait(manager, oneAgentScript, { name: "  PR 14039 review  " });
+    await runAndWait(manager, oneAgentScript, { name: "PR 14040 review" });
+    await runAndWait(manager, oneAgentScript, undefined);
+    await runAndWait(manager, oneAgentScript, { name: 42 });
 
     const names = manager
       .listRuns()
@@ -167,7 +172,7 @@ test(
 );
 
 test(
-  "runSync uses and persists a per-run cwd",
+  "runAndWait uses and persists a per-run cwd",
   withTempCwd(async (hostCwd) => {
     const runCwd = mkdtempSync(join(tmpdir(), "pi-dw-run-cwd-"));
     try {
@@ -185,7 +190,7 @@ test(
 await agent('ok')
 return cwd`;
 
-      const result = await manager.runSync(script, undefined, { cwd: runCwd });
+      const result = await runAndWait(manager, script, undefined, { cwd: runCwd });
 
       assert.equal(result.result, runCwd);
       assert.equal(agentCwd, runCwd);
@@ -203,7 +208,7 @@ test(
     manager.on("error", () => {});
 
     await assert.rejects(
-      manager.runSync(oneAgentScript),
+      runAndWait(manager, oneAgentScript),
       (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_TIMEOUT,
     );
 
@@ -219,7 +224,7 @@ test(
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: delayedAgent(25), defaultAgentTimeoutMs: 5 });
 
-    const result = await manager.runSync(oneAgentScript, undefined, { agentTimeoutMs: null });
+    const result = await runAndWait(manager, oneAgentScript, undefined, { agentTimeoutMs: null });
 
     assert.equal((result.result as { a: unknown }).a, "slow");
     const agent = manager.listRuns()[0]?.agents[0];
@@ -253,7 +258,7 @@ test(
 const xs = await parallel(['a','b'].map((p) => () => agent(p, { label: p })))
 return xs`;
 
-    const result = await manager.runSync(script, undefined, { concurrency: 1, agentRetries: 1 });
+    const result = await runAndWait(manager, script, undefined, { concurrency: 1, agentRetries: 1 });
 
     assert.deepEqual(result.result, ["ok:a", "ok:b"]);
     assert.equal(maxActive, 1, "exec concurrency should override the manager default");
@@ -276,7 +281,7 @@ test(
       },
     });
 
-    const result = await manager.runSync(oneAgentScript);
+    const result = await runAndWait(manager, oneAgentScript);
 
     assert.equal((result.result as { a: unknown }).a, "ok");
     assert.equal(calls, 2);
@@ -284,7 +289,7 @@ test(
 );
 
 test(
-  "runSync persists the run immediately (visible while still running)",
+  "runAndWait persists the run immediately (visible while still running)",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
     let listedWhileRunning = 0;
@@ -294,7 +299,7 @@ test(
       listedWhileRunning = running.length;
       persistedOptions = running[0]?.executionOptions;
     });
-    await manager.runSync(oneAgentScript, undefined, {
+    await runAndWait(manager, oneAgentScript, undefined, {
       concurrency: 2,
       agentRetries: 1,
       agentTimeoutMs: 500,
@@ -309,11 +314,11 @@ test(
 );
 
 test(
-  "runSync persists phase and running agent progress before completion",
+  "runAndWait persists phase and running agent progress before completion",
   withTempCwd(async (cwd) => {
     const slow = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: slow.runner });
-    const promise = manager.runSync(oneAgentScript);
+    const promise = runAndWait(manager, oneAgentScript);
 
     try {
       const persisted = await waitFor(() => {
@@ -335,7 +340,7 @@ test(
 );
 
 test(
-  "runSync persists the resolved model while a tier-routed agent is still running",
+  "runAndWait persists the resolved model while a tier-routed agent is still running",
   withTempCwd(async (cwd) => {
     const gate = createDeferred<unknown>();
     const manager = new WorkflowManager({
@@ -347,7 +352,7 @@ test(
         },
       },
     });
-    const promise = manager.runSync(oneAgentScript);
+    const promise = runAndWait(manager, oneAgentScript);
 
     try {
       // Before the fix the snapshot kept the session-default model until agent
@@ -367,7 +372,7 @@ test(
 );
 
 test(
-  "runSync persists live agent history and heartbeats while the agent is blocked",
+  "runAndWait persists live agent history and heartbeats while the agent is blocked",
   withTempCwd(async (cwd) => {
     const gate = createDeferred<unknown>();
     const history: AgentHistoryEntry[] = [{ role: "assistant", kind: "text", text: "working", timestamp: 1 }];
@@ -380,7 +385,7 @@ test(
         },
       },
     });
-    const promise = manager.runSync(oneAgentScript);
+    const promise = runAndWait(manager, oneAgentScript);
 
     try {
       const withHistory = await waitFor(() => {
@@ -504,7 +509,7 @@ test(
 const a = await agent('explore', { label: 'scan', model: 'openai/gpt-5-mini' })
 const b = await agent('reason', { label: 'judge' })
 return { a, b }`;
-    await manager.runSync(script);
+    await runAndWait(manager, script);
 
     const run = manager.listRuns().find((r) => r.workflowName === "model_demo");
     const byLabel = Object.fromEntries((run?.agents ?? []).map((a) => [a.label, a.model]));
@@ -514,7 +519,7 @@ return { a, b }`;
 );
 
 test(
-  "runSync persists recoverable agent error details for /workflows",
+  "runAndWait persists recoverable agent error details for /workflows",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({
       cwd,
@@ -527,7 +532,7 @@ test(
     manager.on("error", () => {});
 
     await assert.rejects(
-      manager.runSync(oneAgentScript),
+      runAndWait(manager, oneAgentScript),
       (error: unknown) =>
         error instanceof WorkflowError && error.code === WorkflowErrorCode.AGENT_EXECUTION_ERROR && error.recoverable,
     );
@@ -560,8 +565,11 @@ test(
     manager.on("error", () => {});
 
     await assert.rejects(
-      manager.runSync(`export const meta = { name: 'readonly_pause', description: 'read-only retry before pause' }
-return await agent('review', { label: 'reviewer', readOnly: true })`),
+      runAndWait(
+        manager,
+        `export const meta = { name: 'readonly_pause', description: 'read-only retry before pause' }
+return await agent('review', { label: 'reviewer', readOnly: true })`,
+      ),
     );
 
     const run = manager.listRuns().find((entry) => entry.workflowName === "readonly_pause");
@@ -594,7 +602,7 @@ test(
     manager.on("error", () => {});
 
     await assert.rejects(
-      manager.runSync(retryParallelScript),
+      runAndWait(manager, retryParallelScript),
       (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.SCHEMA_NONCOMPLIANCE,
     );
 
@@ -646,7 +654,7 @@ test(
     });
     manager.on("error", () => {});
 
-    await assert.rejects(manager.runSync(retryParallelScript));
+    await assert.rejects(runAndWait(manager, retryParallelScript));
     const paused = manager.listRuns().find((entry) => entry.workflowName === "retry_parallel");
     assert.equal(paused?.status, "paused");
     assert.ok(paused?.runId);
@@ -688,7 +696,7 @@ return { results }`;
     });
     manager.on("error", () => {});
 
-    await assert.rejects(manager.runSync(script));
+    await assert.rejects(runAndWait(manager, script));
     const paused = manager.listRuns().find((entry) => entry.workflowName === "multi_retry");
     assert.equal(paused?.retryState?.failures.length, 2);
     assert.ok(paused?.runId);
@@ -787,7 +795,7 @@ return await parallel([
   () => agent('writer', { label: 'writer', retryable: false }),
 ])`;
 
-    await assert.rejects(manager.runSync(script));
+    await assert.rejects(runAndWait(manager, script));
     const paused = manager.listRuns().find((entry) => entry.workflowName === "pause_active_retry");
     assert.ok(paused?.runId);
     assert.equal(writerCalls, 1);
@@ -844,7 +852,7 @@ return await parallel([
     const first = new WorkflowManager({ cwd, agent });
     first.on("error", () => {});
 
-    await assert.rejects(first.runSync(script));
+    await assert.rejects(runAndWait(first, script));
     const paused = first.listRuns().find((entry) => entry.workflowName === "stale_active_retry");
     assert.ok(paused?.runId);
     const activeRetryCallIds = paused.retryState?.failures.map((failure) => failure.callId) ?? [];
@@ -906,7 +914,7 @@ return await pipeline(
   (_previous, item) => agent('stage2 ' + item, { label: 'stage2-' + item }),
 )`;
 
-    const firstRun = manager.runSync(script);
+    const firstRun = runAndWait(manager, script);
     await waitFor(() => (fastStageTwoCalls === 1 ? true : undefined), "fast second stage should fail first");
     releaseSlowStage.resolve("slow one");
     await assert.rejects(firstRun);
@@ -947,7 +955,7 @@ test(
 await agent('write files', { label: 'writer', retryable: false })
 return { ok: true }`;
 
-    await assert.rejects(manager.runSync(script));
+    await assert.rejects(runAndWait(manager, script));
     const run = manager.listRuns().find((entry) => entry.workflowName === "non_retryable");
     assert.equal(run?.status, "failed");
     assert.equal(run?.pauseReason, undefined);
@@ -980,7 +988,7 @@ test(
 await agent('read only', { label: 'reader' })
 return { ok: true }`;
 
-    await assert.rejects(manager.runSync(script));
+    await assert.rejects(runAndWait(manager, script));
     const paused = manager.listRuns().find((entry) => entry.workflowName === "cwd_change_retry");
     assert.equal(paused?.status, "paused");
     assert.ok(paused?.runId);
@@ -1013,7 +1021,7 @@ test(
       },
     });
     first.on("error", () => {});
-    await assert.rejects(first.runSync(retryParallelScript));
+    await assert.rejects(runAndWait(first, retryParallelScript));
     const paused = first.listRuns().find((entry) => entry.workflowName === "retry_parallel");
     assert.ok(paused?.runId);
 
@@ -1062,7 +1070,7 @@ test(
     manager.on("error", () => {});
     const script = `export const meta = { name: 'persist_siblings', description: 'passive sibling drain' }
 return await parallel([() => agent('bad', { label: 'bad', retryable: false }), () => agent('slow', { label: 'slow' })])`;
-    const promise = manager.runSync(script, undefined, { concurrency: 2 });
+    const promise = runAndWait(manager, script, undefined, { concurrency: 2 });
     let failure: unknown;
     void promise.catch((error) => {
       failure = error;
@@ -1106,7 +1114,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: slow.runner });
     manager.on("error", () => {});
     const started = new Promise<void>((resolve) => manager.once("agentStart", () => resolve()));
-    const promise = manager.runSync(nonRetryableOneAgentScript);
+    const promise = runAndWait(manager, nonRetryableOneAgentScript);
     await started;
 
     const run = manager.listRuns().find((entry) => entry.workflowName === "tracked_demo");
@@ -1158,7 +1166,7 @@ test(
     manager.on("error", () => {});
     const script = `export const meta = { name: 'abort_passive_drain', description: 'host abort still wins' }
 return await parallel([() => agent('bad', { retryable: false }), () => agent('slow')])`;
-    const promise = manager.runSync(script, undefined, { concurrency: 2, externalSignal: external.signal });
+    const promise = runAndWait(manager, script, undefined, { concurrency: 2, externalSignal: external.signal });
     let failure: unknown;
     void promise.catch((error) => {
       failure = error;
@@ -1205,7 +1213,7 @@ test(
     manager.on("error", () => {});
     const script = `export const meta = { name: 'stop_failed_drain', description: 'stop surviving sibling' }
 return await parallel([() => agent('bad', { retryable: false }), () => agent('slow')])`;
-    const promise = manager.runSync(script, undefined, { concurrency: 2 });
+    const promise = runAndWait(manager, script, undefined, { concurrency: 2 });
     await slowStarted.promise;
     await assert.rejects(promise, (error: unknown) => error instanceof WorkflowError);
 
@@ -1236,12 +1244,16 @@ test(
 
     try {
       await assert.rejects(
-        manager.runSync(`export const meta = { name: 'detached_agent', description: 'direct failure' }
+        runAndWait(
+          manager,
+          `export const meta = { name: 'detached_agent', description: 'direct failure' }
 agent('fail')
-return 'done'`),
+return 'done'`,
+        ),
       );
       await assert.rejects(
-        manager.runSync(
+        runAndWait(
+          manager,
           `export const meta = { name: 'detached_bash', description: 'direct failure' }
 bash('echo no', { cwd: args.missing })
 return 'done'`,
@@ -1257,7 +1269,7 @@ return 'done'`,
 );
 
 test(
-  "runSync preserves and persists a top-level execution error before the first agent",
+  "runAndWait preserves and persists a top-level execution error before the first agent",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
     manager.on("error", () => {});
@@ -1268,7 +1280,7 @@ return await agent('unreachable')`;
 
     let thrown: unknown;
     try {
-      await manager.runSync(script, { fail: true });
+      await runAndWait(manager, script, { fail: true });
     } catch (error) {
       thrown = error;
     }
@@ -1299,7 +1311,7 @@ try { await agent('recoverable', { label: 'old-agent' }) } catch {}
 phase('Controller')
 throw new Error('controller exploded')`;
 
-    await assert.rejects(manager.runSync(script), /controller exploded/);
+    await assert.rejects(runAndWait(manager, script), /controller exploded/);
 
     const persisted = manager.listRuns().find((run) => run.workflowName === "later_failure");
     assert.equal(persisted?.status, "failed");
@@ -1326,7 +1338,7 @@ test(
 phase('Controller')
 await agent('fail', { label: 'schema-agent', phase: 'Special phase' })`;
 
-    await assert.rejects(manager.runSync(script), /schema exploded/);
+    await assert.rejects(runAndWait(manager, script), /schema exploded/);
 
     const persisted = manager.listRuns().find((run) => run.workflowName === "agent_phase_failure");
     assert.equal(persisted?.error?.phase, "Special phase");
@@ -1335,7 +1347,7 @@ await agent('fail', { label: 'schema-agent', phase: 'Special phase' })`;
 );
 
 test(
-  "runSync stores compact subagent history for /workflows detail",
+  "runAndWait stores compact subagent history for /workflows detail",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({
       cwd,
@@ -1347,7 +1359,7 @@ test(
       },
     });
 
-    await manager.runSync(oneAgentScript);
+    await runAndWait(manager, oneAgentScript);
 
     const run = manager.listRuns().find((r) => r.workflowName === "tracked_demo");
     const agent = run?.agents[0];
@@ -1558,7 +1570,7 @@ test(
     })();
     const manager = new WorkflowManager({ cwd, agent: rec });
     manager.setModelRegistry(fakeRegistry);
-    await manager.runSync(oneAgentScript);
+    await runAndWait(manager, oneAgentScript);
     assert.equal(rec.calls.length, 1);
     assert.equal(rec.calls[0].options.modelRegistry, fakeRegistry);
   }),
@@ -1572,7 +1584,7 @@ test(
     const script = `export const meta = { name: 'mm_test', description: 'main model test' }
 const a = await agent('test', { label: 'a' })
 return { a }`;
-    await manager.runSync(script);
+    await runAndWait(manager, script);
     const run = manager.listRuns().find((r) => r.workflowName === "mm_test");
     assert.ok(run, "run should exist");
   }),
@@ -1590,7 +1602,7 @@ test(
 );
 
 test(
-  "runSync emits manager events (agentStart -> agentEnd -> complete)",
+  "runAndWait emits manager events (agentStart -> agentEnd -> complete)",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
     const events: string[] = [];
@@ -1601,9 +1613,9 @@ test(
       events.push("complete");
       outputFile = event.outputFile;
     });
-    await manager.runSync(oneAgentScript);
+    await runAndWait(manager, oneAgentScript);
     assert.deepEqual(events, ["agentStart", "agentEnd", "complete"]);
-    assert.equal(outputFile, undefined, "foreground runs return inline and do not need an output sidecar");
+    assert.ok(outputFile?.endsWith(".stdout"), "every completed run persists its output sidecar");
   }),
 );
 
@@ -1683,8 +1695,8 @@ test(
       stoppedEmitted = true;
     });
 
-    // runSync with externalSignal links the abort controller to the manager
-    const runPromise = manager.runSync(oneAgentScript, undefined, {
+    // runAndWait with externalSignal links the abort controller to the manager
+    const runPromise = runAndWait(manager, oneAgentScript, undefined, {
       externalSignal: ac.signal,
     });
 
@@ -1700,7 +1712,7 @@ test(
 
     try {
       await runPromise;
-      assert.fail("runSync should have thrown on abort");
+      assert.fail("runAndWait should have thrown on abort");
     } catch (err) {
       assert.ok(err instanceof WorkflowError, "error should be WorkflowError");
       assert.equal(
@@ -1734,7 +1746,7 @@ test(
     process.on("uncaughtException", errorHandler);
 
     try {
-      const runPromise = manager.runSync(oneAgentScript, undefined, {
+      const runPromise = runAndWait(manager, oneAgentScript, undefined, {
         externalSignal: ac.signal,
       });
       await new Promise((r) => setTimeout(r, 20));
@@ -2382,7 +2394,6 @@ test(
     assert.equal(run?.script, oneAgentScript);
     assert.ok(run?.controller instanceof AbortController, "should have an AbortController");
     assert.ok(run?.startedAt instanceof Date, "should have a startedAt date");
-    assert.equal(run?.background, true, "should be marked as background");
     assert.ok(Array.isArray(run?.journal), "should have a journal array");
 
     // snapshot should be populated
@@ -2628,7 +2639,7 @@ test(
       errorEmitted = true;
     });
 
-    const runPromise = manager.runSync(oneAgentScript, undefined, {
+    const runPromise = runAndWait(manager, oneAgentScript, undefined, {
       externalSignal: ac.signal,
     });
     await new Promise((r) => setTimeout(r, 20));
@@ -3045,7 +3056,7 @@ test(
     const script = `export const meta = { name: 'parallel_count', description: 'count parallel agents' }
 const results = await parallel([1,2,3].map(n => () => agent('task ' + n)))
 return results`;
-    const result = await manager.runSync(script);
+    const result = await runAndWait(manager, script);
     assert.equal(result.agentCount, 3, "parallel should execute all 3 agents");
     assert.ok(Array.isArray(result.result), "result should be an array");
     assert.equal(result.result.length, 3);
@@ -3066,7 +3077,7 @@ test(
     const script = `export const meta = { name: 'parallel_order', description: 'check parallel order' }
 const results = await parallel([1,2,3].map(n => () => agent('task ' + n)))
 return results`;
-    const result = await manager.runSync(script);
+    const result = await runAndWait(manager, script);
     assert.equal(result.agentCount, 3, "3 agents should have run");
     assert.deepEqual(result.result, ["task 1", "task 2", "task 3"], "parallel should return results in input order");
   }),
@@ -3079,7 +3090,7 @@ test(
     const script = `export const meta = { name: 'parallel_empty', description: 'empty parallel' }
 const results = await parallel([])
 return results`;
-    const result = await manager.runSync(script);
+    const result = await runAndWait(manager, script);
     assert.ok(Array.isArray(result.result), "result should be an array");
     assert.equal(result.result.length, 0, "empty parallel should return empty array");
     assert.equal(result.agentCount, 0, "no agents should run with empty parallel");
@@ -3308,7 +3319,7 @@ return 'ok'`;
     const events: string[] = [];
     for (const ev of ["bashStart", "bashEnd"]) manager.on(ev, () => events.push(ev));
 
-    await manager.runSync(script);
+    await runAndWait(manager, script);
 
     assert.deepEqual(events, ["bashStart", "bashEnd"]);
     const persisted = manager.listRuns()[0];

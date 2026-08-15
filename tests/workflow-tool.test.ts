@@ -505,18 +505,21 @@ test("workflow tool leaves legacy, user, and project saved-workflow JSON untouch
       const manager = new WorkflowManager({ cwd, agent: { run: async () => "unused" } as any });
       const tool = createWorkflowTool({ cwd, manager });
       const execute = tool.execute as (...args: any[]) => Promise<any>;
+      const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
       const result = await execute(
         "call-sentinel",
         {
           script: "export const meta = { name: 'inline', description: 'inline only' }\nawait agent('ok')\nreturn 'ok'",
-          background: false,
         },
         new AbortController().signal,
         () => {},
         { hasUI: false },
       );
 
-      assert.equal(result.details.result, "ok");
+      const runId = result.details.runId;
+      assert.ok(runId);
+      await completed;
+      assert.equal(manager.getRun(runId)?.result?.result, "ok");
       assert.deepEqual(
         sentinels.map((path) => readFileSync(path)),
         before,
@@ -528,32 +531,34 @@ test("workflow tool leaves legacy, user, and project saved-workflow JSON untouch
   }
 });
 
-test("foreground execution reports the original top-level workflow error", async () => {
+test("background run reports the original top-level workflow error through the error event", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "workflow-tool-error-"));
   try {
     const manager = new WorkflowManager({
       cwd,
       agent: { run: async () => "unused" } as any,
     });
-    manager.on("error", () => {});
+    const failed = new Promise<{ error?: { message?: string } }>((resolve) =>
+      manager.once("error", (event: { error?: { message?: string } }) => resolve(event)),
+    );
     const tool = createWorkflowTool({ cwd, manager });
-    const execute = tool.execute as (...args: any[]) => Promise<unknown>;
+    const execute = tool.execute as (...args: any[]) => Promise<any>;
     const script = `export const meta = { name: 'tool_failure', description: 'reports bootstrap failure' }
 if (args.fail) throw new Error('bootstrap exploded')
 return await agent('unreachable')`;
 
-    await assert.rejects(
-      execute("call-1", { script, args: { fail: true }, background: false }, new AbortController().signal, () => {}, {
-        hasUI: false,
-      }),
-      /AGENT_EXECUTION_ERROR: bootstrap exploded/,
-    );
+    const result = await execute("call-1", { script, args: { fail: true } }, new AbortController().signal, () => {}, {
+      hasUI: false,
+    });
+    assert.ok(result.details.runId);
+    const event = await failed;
+    assert.match(String(event.error?.message), /bootstrap exploded/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test("foreground retryable agent failure returns paused run id and retry guidance", async () => {
+test("background retryable agent failure pauses the run with retry state", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "workflow-tool-agent-pause-"));
   try {
     const manager = new WorkflowManager({
@@ -565,27 +570,23 @@ test("foreground retryable agent failure returns paused run id and retry guidanc
       } as any,
     });
     manager.on("error", () => {});
+    const paused = new Promise<{ reason?: string }>((resolve) =>
+      manager.once("paused", (event: { reason?: string }) => resolve(event)),
+    );
     const tool = createWorkflowTool({ cwd, manager });
     const execute = tool.execute as (...args: any[]) => Promise<any>;
-    const script = `export const meta = { name: 'tool_agent_pause', description: 'foreground retry pause' }
+    const script = `export const meta = { name: 'tool_agent_pause', description: 'background retry pause' }
 return await agent('try once', { label: 'reader' })`;
 
-    const result = await execute(
-      "call-agent-pause",
-      { script, background: false },
-      new AbortController().signal,
-      () => {},
-      {
-        hasUI: false,
-      },
-    );
+    const result = await execute("call-agent-pause", { script }, new AbortController().signal, () => {}, {
+      hasUI: false,
+    });
 
-    assert.equal(result.details.paused, true);
-    assert.equal(result.details.pauseReason, "agent_failure");
-    assert.ok(result.details.runId);
-    assert.match(result.content[0].text, new RegExp(result.details.runId));
-    assert.match(result.content[0].text, /workflow_retry|\/workflows retry/);
-    const persisted = manager.listRuns().find((entry) => entry.runId === result.details.runId);
+    const runId = result.details.runId;
+    assert.ok(runId);
+    const event = await paused;
+    assert.equal(event.reason, "agent_failure");
+    const persisted = manager.listRuns().find((entry) => entry.runId === runId);
     assert.equal(persisted?.status, "paused");
     assert.equal(persisted?.pauseReason, "agent_failure");
   } finally {
@@ -706,6 +707,19 @@ test("createWorkflowTool prepareArguments requires exactly one script source", (
   assert.throws(() => prepare({ scriptPath: "relative/workflow.mjs" }), /absolute/);
 });
 
+test("createWorkflowTool prepareArguments rejects the removed background flag", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as (args: unknown) => unknown;
+
+  // Synchronous (blocking) launches were removed: every run is a background run,
+  // so `background` is not a parameter anymore — in either polarity.
+  assert.throws(
+    () => prepare({ script: "export const meta = {}", background: false }),
+    /`background` is not supported/,
+  );
+  assert.throws(() => prepare({ script: "export const meta = {}", background: true }), /`background` is not supported/);
+});
+
 test("createWorkflowTool prepareArguments accepts only run ID and reply for continuation", () => {
   const tool = createWorkflowTool();
   const prepare = tool.prepareArguments as (args: unknown) => unknown;
@@ -740,7 +754,7 @@ test("scriptPath rejects files above the workflow source size limit", async () =
     const execute = tool.execute as (...args: any[]) => Promise<unknown>;
 
     await assert.rejects(
-      execute("call-large", { scriptPath, background: false }, new AbortController().signal, () => {}, {
+      execute("call-large", { scriptPath }, new AbortController().signal, () => {}, {
         hasUI: false,
       }),
       /exceeds 1048576 byte limit/,
@@ -750,7 +764,7 @@ test("scriptPath rejects files above the workflow source size limit", async () =
   }
 });
 
-test("foreground execution loads scriptPath once and runs in the requested cwd", async () => {
+test("background run loads scriptPath and runs in the requested cwd", async () => {
   const hostCwd = mkdtempSync(join(tmpdir(), "workflow-tool-host-"));
   const runCwd = mkdtempSync(join(tmpdir(), "workflow-tool-run-"));
   try {
@@ -763,15 +777,15 @@ test("foreground execution loads scriptPath once and runs in the requested cwd",
     const tool = createWorkflowTool({ cwd: hostCwd, manager });
     const execute = tool.execute as (...args: any[]) => Promise<any>;
 
-    const result = await execute(
-      "call-file",
-      { scriptPath, cwd: runCwd, background: false },
-      new AbortController().signal,
-      () => {},
-      { hasUI: false },
-    );
+    const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
+    const result = await execute("call-file", { scriptPath, cwd: runCwd }, new AbortController().signal, () => {}, {
+      hasUI: false,
+    });
 
-    assert.equal(result.details.result, runCwd);
+    const runId = result.details.runId;
+    assert.ok(runId);
+    await completed;
+    assert.equal(manager.getRun(runId)?.result?.result, runCwd);
     assert.equal(manager.listRuns()[0]?.cwd, runCwd);
   } finally {
     rmSync(hostCwd, { recursive: true, force: true });
@@ -801,19 +815,17 @@ const reply = await checkpoint('Accept?')
 const after = await agent('after:' + reply)
 return { before, reply, after }`;
 
-      const paused = await execute(
-        "call-start",
-        { script, background: false },
-        new AbortController().signal,
-        () => {},
-        {
-          hasUI: false,
-        },
+      const pausedEvent = new Promise<{ reason?: string; checkpoint?: { prompt?: string } }>((resolve) =>
+        manager.once("paused", (event: { reason?: string; checkpoint?: { prompt?: string } }) => resolve(event)),
       );
-      assert.equal(paused.details.paused, true);
-      assert.match(paused.content[0].text, /Accept\?/);
-      const runId = paused.details.runId;
+      const started = await execute("call-start", { script }, new AbortController().signal, () => {}, {
+        hasUI: false,
+      });
+      const runId = started.details.runId;
       assert.ok(runId);
+      const pause = await pausedEvent;
+      assert.equal(pause.reason, "human_input");
+      assert.match(pause.checkpoint?.prompt ?? "", /Accept\?/);
 
       const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
       const continued = await execute(

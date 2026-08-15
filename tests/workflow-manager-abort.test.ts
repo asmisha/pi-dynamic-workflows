@@ -5,8 +5,13 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { WorkflowManager } from "../src/workflow-manager.js";
+import { type ExecOptions, WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+
+/** Start a background run and await its result: the direct driver for runtime-semantics tests. */
+function runAndWait(manager: WorkflowManager, script: string, args?: unknown, exec: ExecOptions = {}) {
+  return manager.startInBackground(script, args, exec).promise;
+}
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -79,7 +84,7 @@ test(
       stoppedEmitted = true;
     });
 
-    const runPromise = manager.runSync(oneAgentScript, undefined, {
+    const runPromise = runAndWait(manager, oneAgentScript, undefined, {
       externalSignal: ac.signal,
     });
 
@@ -95,7 +100,7 @@ test(
 
     try {
       await runPromise;
-      assert.fail("runSync should have thrown on abort");
+      assert.fail("runAndWait should have thrown on abort");
     } catch (err) {
       assert.ok(err instanceof WorkflowError, "error should be WorkflowError");
       assert.equal(
@@ -125,7 +130,7 @@ test(
     process.on("uncaughtException", errorHandler);
 
     try {
-      const runPromise = manager.runSync(oneAgentScript, undefined, {
+      const runPromise = runAndWait(manager, oneAgentScript, undefined, {
         externalSignal: ac.signal,
       });
       await new Promise((r) => setTimeout(r, 20));
@@ -459,7 +464,6 @@ test(
     assert.equal(run?.script, oneAgentScript);
     assert.ok(run?.controller instanceof AbortController, "should have an AbortController");
     assert.ok(run?.startedAt instanceof Date, "should have a startedAt date");
-    assert.equal(run?.background, true, "should be marked as background");
     assert.ok(Array.isArray(run?.journal), "should have a journal array");
 
     // snapshot should be populated
@@ -691,7 +695,7 @@ test(
     });
 
     const ac2 = new AbortController();
-    const runPromise = manager2.runSync(oneAgentScript, undefined, {
+    const runPromise = runAndWait(manager2, oneAgentScript, undefined, {
       externalSignal: ac2.signal,
     });
     await new Promise((r) => setTimeout(r, 20));

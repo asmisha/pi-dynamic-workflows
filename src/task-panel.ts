@@ -122,15 +122,13 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
 
   manager.on("complete", ({ runId }: { runId: string }) => {
     const run = manager.getRun(runId);
-    // Only background/resumed runs are delivered: a foreground (sync) run already
-    // returns its result inline as the tool result, so re-delivering would dup it.
-    if (run?.background) {
+    if (run) {
       deliver(runId, deliverText(run));
     }
   });
   manager.on("error", ({ runId, error }: { runId: string; error?: unknown }) => {
     const run = manager.getRun(runId);
-    if (!run?.background || !manager.isRunInCurrentSession(runId)) return;
+    if (!run || !manager.isRunInCurrentSession(runId)) return;
     deliver(
       runId,
       `✗ ${formatWorkflowFailure(error, {
@@ -156,7 +154,7 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
       resetHint?: string;
       checkpoint?: { prompt: string };
     }) => {
-      if (!manager.getRun(runId)?.background || !manager.isRunInCurrentSession(runId)) return;
+      if (!manager.getRun(runId) || !manager.isRunInCurrentSession(runId)) return;
       if (reason === "human_input" && checkpoint) {
         deliver(runId, checkpointText(runId, checkpoint.prompt));
         return;

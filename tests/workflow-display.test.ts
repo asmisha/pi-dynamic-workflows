@@ -542,7 +542,6 @@ describe("deliverText", () => {
         agents: [],
         ...((overrides.snapshot as Record<string, unknown>) ?? {}),
       },
-      background: true,
       status: "completed",
       outputFile: "/tmp/workflows/r-123.stdout",
       result: {

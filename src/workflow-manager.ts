@@ -129,16 +129,9 @@ export interface ManagedRun {
   draining?: boolean;
   /** True once all runtime-owned work unwound, final state persisted, and the lease released. */
   finalized?: boolean;
-  /**
-   * True when the run was started in the background (or resumed) and the caller is
-   * not awaiting its result inline. Only background runs deliver their result back
-   * into the conversation; a foreground sync run already returns it as the tool
-   * result, so re-delivering would duplicate it.
-   */
-  background: boolean;
 }
 
-/** Per-execution options shared by sync, background, and resume runs. */
+/** Per-execution options shared by background and resume runs. */
 export interface ExecOptions {
   /** Effective cwd for the workflow and its default subagent/bash execution. */
   cwd?: string;
@@ -322,7 +315,6 @@ export class WorkflowManager extends EventEmitter {
       cwd: exec.cwd ?? this.cwd,
       executionOptions: this.resolveExecutionOptions(exec),
       journal: [],
-      background: true,
       lease,
     };
 
@@ -361,54 +353,6 @@ export class WorkflowManager extends EventEmitter {
     promise.catch(() => {});
 
     return { runId, promise };
-  }
-
-  /**
-   * Execute a workflow synchronously (blocking) while still tracking it like a
-   * background run, so the `/workflows` navigator and the live task panel see it.
-   * `onProgress` fires on every progress event with the current snapshot, letting
-   * a caller (e.g. the workflow tool) drive its own inline display.
-   */
-  async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args, exec);
-    const lease = this.persistence.acquireRunLease(managed.runId);
-    if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
-    managed.lease = lease;
-    this.runs.set(managed.runId, managed);
-    // Persist the initial state immediately so listRuns()/the task panel can see
-    // the run the moment it starts, not only after the first agent journals.
-    this.persistRun(managed);
-    return this.executeRun(managed, script, args, exec);
-  }
-
-  /** Build a fresh managed run with an empty snapshot. */
-  private createManaged(script: string, args?: unknown, exec: ExecOptions = {}): ManagedRun {
-    const parsed = exec.workflowModule ? { meta: exec.workflowModule.meta } : parseWorkflowScript(script);
-    return {
-      runId: generateRunId(),
-      status: "running",
-      snapshot: {
-        name: runDisplayName(parsed.meta.name, args),
-        description: parsed.meta.description,
-        phases: parsed.meta.phases?.map((p) => p.title) ?? [],
-        logs: [],
-        agents: [],
-        agentCount: 0,
-        runningCount: 0,
-        doneCount: 0,
-        errorCount: 0,
-      },
-      controller: new AbortController(),
-      startedAt: new Date(),
-      script,
-      workflowModulePath: exec.workflowModulePath,
-      args,
-      sessionId: this.sessionId,
-      cwd: exec.cwd ?? this.cwd,
-      executionOptions: this.resolveExecutionOptions(exec),
-      journal: [],
-      background: false,
-    };
   }
 
   private resolveExecutionOptions(exec: ExecOptions): PersistedExecutionOptions {
@@ -625,14 +569,12 @@ export class WorkflowManager extends EventEmitter {
       managed.status = "completed";
       managed.result = result;
 
-      // Background completion delivery points to this sidecar instead of
-      // injecting an arbitrarily large return value into the parent context.
-      if (managed.background) {
-        try {
-          managed.outputFile = this.persistence.writeOutput(managed.runId, result.result);
-        } catch (err) {
-          console.warn("[workflow-manager] Persist workflow output failed:", err);
-        }
+      // Completion delivery points to this sidecar instead of injecting an
+      // arbitrarily large return value into the parent context.
+      try {
+        managed.outputFile = this.persistence.writeOutput(managed.runId, result.result);
+      } catch (err) {
+        console.warn("[workflow-manager] Persist workflow output failed:", err);
       }
       this.persistRun(managed);
       this.emit("complete", { runId: managed.runId, result, outputFile: managed.outputFile });
@@ -1065,7 +1007,6 @@ export class WorkflowManager extends EventEmitter {
       retryState: persisted.retryState,
       activeRetryCallIds:
         retryFailedCallIds ?? (persisted.activeRetryCallIds ? new Set(persisted.activeRetryCallIds) : undefined),
-      background: true,
       lease,
     };
     this.runs.set(persisted.runId, managed);

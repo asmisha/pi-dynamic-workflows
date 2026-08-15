@@ -55,15 +55,19 @@ export async function run(context) {
         },
       });
 
+      const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
       const result = await executeTool(manager, cwd)(
         "native-module",
-        { scriptPath, cwd, args: { topic: "imports" }, background: false },
+        { scriptPath, cwd, args: { topic: "imports" } },
         new AbortController().signal,
         () => {},
         { hasUI: false },
       );
 
-      assert.equal(result.details.result, "native-ok");
+      const runId = result.details.runId;
+      assert.ok(runId);
+      await completed;
+      assert.equal(manager.getRun(runId)?.result?.result, "native-ok");
       assert.deepEqual(prompts, [`shared:imports:${cwd}`]);
       assert.ok(manager.listRuns()[0]?.logs.includes("shared helper"));
     });
@@ -108,23 +112,25 @@ export async function run(context) {
         },
       };
       const first = new WorkflowManager({ cwd, agent, sessionId: "native-session" });
-      const paused = await executeTool(first, cwd)(
+      const pausedEvent = new Promise<void>((resolve) => first.once("paused", () => resolve()));
+      const started = await executeTool(first, cwd)(
         "native-checkpoint-start",
-        { scriptPath, cwd, background: false },
+        { scriptPath, cwd },
         new AbortController().signal,
         () => {},
         { hasUI: false },
       );
-      assert.equal(paused.details.paused, true);
+      assert.ok(started.details.runId);
+      await pausedEvent;
       assert.equal(prompts.length, 1);
 
       const second = new WorkflowManager({ cwd, agent, sessionId: "native-session" });
       const completed = new Promise<void>((resolve) => second.once("complete", () => resolve()));
-      assert.equal(await second.resumeWithReply(paused.details.runId, "yes"), true);
+      assert.equal(await second.resumeWithReply(started.details.runId, "yes"), true);
       await completed;
 
       assert.deepEqual(prompts, ["before", "after:yes"]);
-      const result = second.getRun(paused.details.runId)?.result?.result as {
+      const result = second.getRun(started.details.runId)?.result?.result as {
         before?: string;
         answer?: string;
         after?: string;
@@ -216,13 +222,9 @@ test("scriptPath requires native ESM meta and run exports", async () => {
       writeFileSync(scriptPath, source);
       const manager = new WorkflowManager({ cwd, agent: { run: async () => "unused" } });
       await assert.rejects(
-        executeTool(manager, cwd)(
-          `native-${name}`,
-          { scriptPath, cwd, background: false },
-          new AbortController().signal,
-          () => {},
-          { hasUI: false },
-        ),
+        executeTool(manager, cwd)(`native-${name}`, { scriptPath, cwd }, new AbortController().signal, () => {}, {
+          hasUI: false,
+        }),
         message,
       );
     }
