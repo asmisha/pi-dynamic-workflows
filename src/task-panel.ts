@@ -117,8 +117,7 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
   const checkpointText = (runId: string, prompt: string) =>
     `⏸ Background workflow ${runId} paused for parent-conversation input.\n\n` +
     `${prompt}\n\n` +
-    `Ask the user this question. Do not start a new run. After the user replies, continue the same run with ` +
-    `workflow({resumeRunId: "${runId}", reply}).`;
+    `The run stays paused until a reply continues the same run with workflow({resumeRunId: "${runId}", reply}).`;
 
   manager.on("complete", ({ runId }: { runId: string }) => {
     const run = manager.getRun(runId);

@@ -29,21 +29,16 @@ function fakeRegistry(models: Array<{ provider: string; id: string }>) {
 
 // ─── backgroundStartedText ─────────────────────────────────────────────────────
 
-test("backgroundStartedText tells the user it auto-continues and they can wait", () => {
+test("backgroundStartedText carries only facts and commands", () => {
   const text = backgroundStartedText("audit", "abc-123");
   assert.match(text, /audit/);
   assert.match(text, /abc-123/);
-  assert.match(text, /wait here/i);
-  assert.match(text, /continues automatically|resume the conversation/i);
-  assert.match(text, /other things/i);
+  assert.match(text, /delivered back into this conversation automatically/i);
   assert.match(text, /\/workflows status abc-123/);
-});
-
-test("backgroundStartedText forbids polling or sleeping to await the run", () => {
-  const text = backgroundStartedText("audit", "abc-123");
-  assert.match(text, /do not wait for it/i);
-  assert.match(text, /no workflow_status polling/i);
-  assert.match(text, /no sleep/i);
+  assert.match(text, /\/workflows stop abc-123/);
+  // Conduct stays out of runtime delivery text: no waiting/polling directives,
+  // no dictated user messaging. The standing ban lives in WORKFLOW_CONTRACT.
+  assert.doesNotMatch(text, /do not wait|polling|sleep|tell the user|wait here|other things/i);
 });
 
 // ─── WORKFLOW_CONTRACT ─────────────────────────────────────────────────────────

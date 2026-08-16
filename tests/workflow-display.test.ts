@@ -593,10 +593,11 @@ describe("backgroundStartedText", () => {
     assert.ok(text.includes("background"), "should say background");
   });
 
-  it("tells user they can wait or do other things", async () => {
+  it("states automatic delivery without conduct directives", async () => {
     const { backgroundStartedText } = await loadTool();
     const text = backgroundStartedText("audit", "r-1");
-    assert.ok(text.includes("wait here") || text.includes("other things"), "should mention options");
+    assert.ok(text.includes("delivered back into this conversation automatically"), "should state delivery");
+    assert.ok(!/tell the user|wait here|other things|polling|sleep/i.test(text), "no conduct directives");
   });
 
   it("mentions /workflows status command for tracking", async () => {

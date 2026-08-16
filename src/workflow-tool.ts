@@ -453,25 +453,16 @@ function resolveWorkflowToolDefaults(
  * own and the conversation will resume automatically when it finishes, so the
  * user can just wait here (or go do something else).
  *
- * It also has to stop the model from waiting on the run itself: without an
- * explicit ban, models fall into a workflow_status + `sleep` poll loop that
- * burns tokens and wall clock for a notification that arrives on its own
- * (installResultDelivery delivers completion, failure, and pause with
- * triggerTurn, so the model is always woken).
+ * Facts and commands only. Conduct — not polling, what to tell the user —
+ * belongs to the host's skill layer; the standing ban on waiting lives in
+ * WORKFLOW_CONTRACT so skill-less hosts stay guarded.
  */
 export function backgroundStartedText(name: string, runId: string): string {
   return [
     `Workflow "${name}" started in the background.`,
     `Run ID: ${runId}`,
-    "It keeps running on its own. When it finishes, fails, or needs input, the result",
-    "is delivered back here and the conversation continues automatically — nobody has",
-    "to do anything.",
-    "So do not wait for it: no workflow_status polling, no sleep, no idle turns. Spend",
-    "the meantime on unrelated useful work, or end the turn now.",
-    "Tell the user they can simply wait here for it to finish (it will resume the",
-    "conversation by itself), or keep chatting / working on other things in the",
-    "meantime; either way the result will come back to this conversation.",
-    `They can also track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
+    "Completion, failure, or a checkpoint is delivered back into this conversation automatically.",
+    `Track or cancel with /workflows status ${runId} or /workflows stop ${runId}.`,
   ].join("\n");
 }
 

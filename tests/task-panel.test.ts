@@ -239,7 +239,9 @@ describe("installResultDelivery", () => {
     assert.equal(calls.length, 1);
     assert.match(calls[0].content, /Accept the bounded rollout risk\?/);
     assert.match(calls[0].content, /resumeRunId/);
-    assert.match(calls[0].content, /Do not start a new run/);
+    assert.match(calls[0].content, /continues the same run/);
+    // Mechanics only: no conduct directives in runtime delivery text.
+    assert.doesNotMatch(calls[0].content, /Ask the user|Do not start a new run/);
   });
 
   it("ignores a manual pause (no reason) — no delivery", () => {
