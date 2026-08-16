@@ -118,7 +118,9 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     `⏸ Background workflow ${runId} paused for parent-conversation input.\n\n` +
     `${prompt}\n\n` +
     `Ask the user this question. Do not start a new run. After the user replies, continue the same run with ` +
-    `workflow({resumeRunId: "${runId}", reply: <user reply>}).`;
+    `workflow({resumeRunId: "${runId}", reply}). The run reads the reply against the question text above, not ` +
+    `against your relay of it: if you asked in other words or another language, restate the answer as the decision ` +
+    `it makes in the question's own terms, naming its object — never a bare "yes"/"keep it". Add nothing the user did not decide.`;
 
   manager.on("complete", ({ runId }: { runId: string }) => {
     const run = manager.getRun(runId);
