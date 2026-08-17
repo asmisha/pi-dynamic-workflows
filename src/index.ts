@@ -45,7 +45,7 @@ export {
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
-export type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
+export type { PersistedRunState, RunPersistence, RunStatus, TerminalDelivery } from "./run-persistence.js";
 export { createRunPersistence, generateRunId } from "./run-persistence.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
@@ -64,8 +64,9 @@ export type {
 } from "./workflow.js";
 export { loadWorkflowModule, parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { buildForcedWorkflowPrompt, registerWorkflowCommands, WORKFLOW_TOOL_NAME } from "./workflow-commands.js";
-export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
+export type { ManagedRun, PendingTerminalDelivery, WorkflowManagerOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";
+export { workflowOutcome } from "./workflow-outcome.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {
   resolveWorkflowSessionPath,

@@ -8,6 +8,7 @@ import { listAgentTypes, loadAgentRegistry } from "./agent-registry.js";
 import { recomputeWorkflowSnapshot, renderWorkflowText, type WorkflowSnapshot } from "./display.js";
 import { loadWorkflowModule, parseWorkflowScript, type WorkflowModuleDefinition } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
+import { workflowOutcome } from "./workflow-outcome.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
 
 /**
@@ -193,6 +194,7 @@ export function createWorkflowStatusTool(
       };
       const workflowName = snapshot?.name ?? persisted?.workflowName ?? "workflow";
       const status = live?.status ?? persisted?.status;
+      const outcome = workflowOutcome(live?.result?.result ?? persisted?.result);
       const currentPhase = snapshot?.currentPhase ?? persisted?.currentPhase;
       const tokenUsage = snapshot?.tokenUsage ?? persisted?.tokenUsage;
       const pauseReason = live?.pauseReason ?? persisted?.pauseReason;
@@ -210,6 +212,7 @@ export function createWorkflowStatusTool(
         runId: params.runId,
         workflowName,
         status,
+        outcome,
         currentPhase,
         agents,
         tokenUsage,
@@ -218,7 +221,8 @@ export function createWorkflowStatusTool(
         error,
       };
       const lines = [
-        `Workflow ${workflowName} (${params.runId}) is ${status}.`,
+        `Workflow execution ${workflowName} (${params.runId}) is ${status}.`,
+        ...(outcome ? [`Workflow outcome: ${outcome}.`] : []),
         ...(currentPhase ? [`Current phase: ${currentPhase}.`] : []),
         `Agents: ${agents.done}/${agents.total} done, ${agents.running} running, ${agents.error} error.`,
         ...(tokenUsage ? [`Tokens: ${tokenUsage.total}.`] : []),

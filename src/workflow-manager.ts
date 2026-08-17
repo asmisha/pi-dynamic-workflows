@@ -16,7 +16,9 @@ import {
   type RunLease,
   type RunPersistence,
   type RunStatus,
+  type TerminalDelivery,
 } from "./run-persistence.js";
+import { deliverText, failureDeliveryText, stoppedDeliveryText } from "./task-panel.js";
 import {
   type JournalEntry,
   loadWorkflowModule,
@@ -70,6 +72,22 @@ function failedAgentEntries(journal: JournalEntry[]): JournalEntry[] {
   return journal.filter((entry) => entry.kind === "agent" && entry.status === "failed");
 }
 
+function terminalDeliveryId(runId: string, status: "completed" | "failed" | "aborted"): string {
+  return `${runId}:${status}`;
+}
+
+function appendTerminalDelivery(
+  deliveries: TerminalDelivery[] | undefined,
+  runId: string,
+  status: "completed" | "failed" | "aborted",
+  sessionId: string | undefined,
+  content: string,
+): TerminalDelivery[] {
+  const deliveryId = terminalDeliveryId(runId, status);
+  if (deliveries?.some((delivery) => delivery.deliveryId === deliveryId)) return deliveries;
+  return [...(deliveries ?? []), { deliveryId, sessionId, content, state: "pending" }];
+}
+
 function retryableAgentFailureState(
   journal: JournalEntry[],
   escapedCallIds: Set<string>,
@@ -113,6 +131,8 @@ export interface ManagedRun {
   executionOptions?: PersistedExecutionOptions;
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
+  /** Durable outbox records created before terminal events are emitted. */
+  terminalDeliveries?: TerminalDelivery[];
   /** Cross-process execution lease for this run, when it is actively executing. */
   lease?: RunLease;
   /** Durable checkpoint currently awaiting a reply from the parent conversation. */
@@ -155,6 +175,10 @@ export interface ExecOptions {
   concurrency?: number;
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
+}
+
+export interface PendingTerminalDelivery extends TerminalDelivery {
+  runId: string;
 }
 
 export interface WorkflowManagerOptions {
@@ -218,6 +242,11 @@ export class WorkflowManager extends EventEmitter {
       save: (state, opts) => {
         this.runsCache = undefined;
         persistence.save(state, opts);
+      },
+      markTerminalDeliveryDelivered: (runId, deliveryId) => {
+        const marked = persistence.markTerminalDeliveryDelivered(runId, deliveryId);
+        if (marked) this.runsCache = undefined;
+        return marked;
       },
       delete: (runId) => {
         this.runsCache = undefined;
@@ -576,8 +605,9 @@ export class WorkflowManager extends EventEmitter {
       } catch (err) {
         console.warn("[workflow-manager] Persist workflow output failed:", err);
       }
+      const deliveryId = this.prepareTerminalDelivery(managed, deliverText(managed));
       this.persistRun(managed);
-      this.emit("complete", { runId: managed.runId, result, outputFile: managed.outputFile });
+      this.emit("complete", { runId: managed.runId, result, outputFile: managed.outputFile, deliveryId });
       managed.finalized = true;
       this.releaseRunLease(managed);
 
@@ -616,7 +646,9 @@ export class WorkflowManager extends EventEmitter {
           managed.pendingCheckpoint = undefined;
           managed.pauseReason = undefined;
           managed.error = persistenceError;
-          this.emit("error", { runId: managed.runId, error: persistenceError });
+          const deliveryId = this.prepareTerminalDelivery(managed, failureDeliveryText(managed, persistenceError));
+          this.persistRun(managed);
+          this.emit("error", { runId: managed.runId, error: persistenceError, deliveryId });
           managed.finalized = true;
           this.releaseRunLease(managed);
           throw persistenceError;
@@ -655,7 +687,9 @@ export class WorkflowManager extends EventEmitter {
               managed.pauseReason = undefined;
               managed.retryState = undefined;
               managed.error = persistenceError;
-              this.emit("error", { runId: managed.runId, error: persistenceError });
+              const deliveryId = this.prepareTerminalDelivery(managed, failureDeliveryText(managed, persistenceError));
+              this.persistRun(managed);
+              this.emit("error", { runId: managed.runId, error: persistenceError, deliveryId });
               managed.finalized = true;
               this.releaseRunLease(managed);
               throw persistenceError;
@@ -700,6 +734,18 @@ export class WorkflowManager extends EventEmitter {
         throw workflowError;
       }
 
+      const deliveryId =
+        managed.status === "failed"
+          ? this.prepareTerminalDelivery(managed, failureDeliveryText(managed, workflowError))
+          : managed.status === "aborted"
+            ? this.prepareTerminalDelivery(managed, stoppedDeliveryText(managed.runId))
+            : undefined;
+
+      // Persist the first terminal error and its delivery outbox before emitting
+      // the terminal event. Failed fan-outs retain their lease while surviving
+      // runtime-owned siblings drain, preventing another process from racing late
+      // journal/snapshot updates.
+      const terminalPersisted = this.persistRun(managed);
       if (usageLimitPaused) {
         this.emit("paused", {
           runId: managed.runId,
@@ -710,16 +756,10 @@ export class WorkflowManager extends EventEmitter {
       } else if (abortedByHost) {
         // Host abort (Esc / external signal): the run was stopped, not failed —
         // pause()/stop() paths already emitted their own event before this unwind.
-        this.emit("stopped", { runId: managed.runId });
+        this.emit("stopped", { runId: managed.runId, deliveryId });
       } else if (!managed.controller.signal.aborted) {
-        this.emit("error", { runId: managed.runId, error: workflowError });
+        this.emit("error", { runId: managed.runId, error: workflowError, deliveryId });
       }
-
-      // Persist the first terminal error promptly. Failed fan-outs retain their
-      // lease while surviving runtime-owned siblings drain, preventing another
-      // process from racing late journal/snapshot updates. The workflow promise
-      // still rejects now; stop/delete/external abort can interrupt the drain.
-      const terminalPersisted = this.persistRun(managed);
       if (managed.status === "failed") {
         managed.draining = true;
         void (async () => {
@@ -742,6 +782,21 @@ export class WorkflowManager extends EventEmitter {
 
       throw workflowError;
     }
+  }
+
+  private prepareTerminalDelivery(managed: ManagedRun, content: string): string {
+    const status = managed.status;
+    if (status !== "completed" && status !== "failed" && status !== "aborted") {
+      throw new Error(`Cannot create a terminal delivery for ${status} run ${managed.runId}`);
+    }
+    managed.terminalDeliveries = appendTerminalDelivery(
+      managed.terminalDeliveries,
+      managed.runId,
+      status,
+      managed.sessionId,
+      content,
+    );
+    return terminalDeliveryId(managed.runId, status);
   }
 
   private releaseRunLease(managed: ManagedRun): void {
@@ -858,6 +913,7 @@ export class WorkflowManager extends EventEmitter {
           updatedAt: new Date().toISOString(),
           completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
           durationMs: managed.result?.durationMs,
+          terminalDeliveries: managed.terminalDeliveries,
           // Skip the .bak sidecar while the run is hot; final states keep the backup.
         },
         { backup: managed.status !== "running" },
@@ -1004,6 +1060,7 @@ export class WorkflowManager extends EventEmitter {
       cwd: persisted.cwd ?? this.cwd,
       executionOptions: persisted.executionOptions,
       journal,
+      terminalDeliveries: persisted.terminalDeliveries,
       retryState: persisted.retryState,
       activeRetryCallIds:
         retryFailedCallIds ?? (persisted.activeRetryCallIds ? new Set(persisted.activeRetryCallIds) : undefined),
@@ -1084,14 +1141,15 @@ export class WorkflowManager extends EventEmitter {
       managed.controller.abort();
       managed.draining = false;
       managed.status = "aborted";
-      this.emit("stopped", { runId });
+      const deliveryId = this.prepareTerminalDelivery(managed, stoppedDeliveryText(runId));
       // Same contract as pause(): suppress late writes only after the terminal
-      // state is durable. If persistence fails, retain the lease so a sparse run
-      // cannot be resumed by this or another live manager.
+      // state and delivery outbox are durable. If persistence fails, retain the
+      // lease so a sparse run cannot be resumed by this or another live manager.
       if (this.persistRun(managed)) {
         managed.finalized = true;
         this.releaseRunLease(managed);
       }
+      this.emit("stopped", { runId, deliveryId });
       return true;
     }
 
@@ -1107,6 +1165,7 @@ export class WorkflowManager extends EventEmitter {
     try {
       const latest = this.persistence.load(runId) ?? persisted;
       if (latest.status !== "running" && latest.status !== "paused") return false;
+      const deliveryId = terminalDeliveryId(runId, "aborted");
       this.persistence.save({
         ...latest,
         status: "aborted",
@@ -1115,8 +1174,15 @@ export class WorkflowManager extends EventEmitter {
         resetHint: undefined,
         retryState: undefined,
         activeRetryCallIds: undefined,
+        terminalDeliveries: appendTerminalDelivery(
+          latest.terminalDeliveries,
+          runId,
+          "aborted",
+          latest.sessionId,
+          stoppedDeliveryText(runId),
+        ),
       });
-      this.emit("stopped", { runId });
+      this.emit("stopped", { runId, deliveryId });
       return true;
     } finally {
       this.persistence.releaseRunLease(lease);
@@ -1138,6 +1204,41 @@ export class WorkflowManager extends EventEmitter {
   isRunInCurrentSession(runId: string): boolean {
     const owner = this.runs.get(runId)?.sessionId ?? this.persistence.load(runId)?.sessionId;
     return this.ownsCurrentSession(owner);
+  }
+
+  /** Pending terminal notifications for one exact parent session. */
+  listPendingTerminalDeliveries(sessionId: string): PendingTerminalDelivery[] {
+    const byDeliveryId = new Map<string, PendingTerminalDelivery>();
+    for (const run of this.persistence.list()) {
+      for (const delivery of run.terminalDeliveries ?? []) {
+        if (delivery.sessionId === sessionId && delivery.state === "pending") {
+          byDeliveryId.set(delivery.deliveryId, { runId: run.runId, ...delivery });
+        }
+      }
+    }
+    for (const run of this.runs.values()) {
+      for (const delivery of run.terminalDeliveries ?? []) {
+        if (delivery.sessionId === sessionId && delivery.state === "pending") {
+          byDeliveryId.set(delivery.deliveryId, { runId: run.runId, ...delivery });
+        }
+      }
+    }
+    return [...byDeliveryId.values()];
+  }
+
+  /** Mark a terminal notification delivered after its session entry is durable. */
+  markTerminalDeliveryDelivered(runId: string, deliveryId: string): boolean {
+    try {
+      if (!this.persistence.markTerminalDeliveryDelivered(runId, deliveryId)) return false;
+      const delivery = this.runs
+        .get(runId)
+        ?.terminalDeliveries?.find((candidate) => candidate.deliveryId === deliveryId);
+      if (delivery) delivery.state = "delivered";
+      return true;
+    } catch (err) {
+      console.warn("[workflow-manager] Mark terminal delivery failed:", err);
+      return false;
+    }
   }
 
   /**

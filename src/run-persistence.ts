@@ -64,6 +64,14 @@ export interface AgentFailureRetryState {
   pausedAt: string;
 }
 
+export interface TerminalDelivery {
+  deliveryId: string;
+  /** Parent Pi session that must receive this notification. */
+  sessionId?: string;
+  content: string;
+  state: "pending" | "delivered";
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -111,6 +119,8 @@ export interface PersistedRunState {
   };
   /** Cached runtime call states for resume/retry, keyed by deterministic call index/callId. */
   journal?: JournalEntry[];
+  /** Durable outbox records for terminal notifications. */
+  terminalDeliveries?: TerminalDelivery[];
 }
 
 export interface RunPersistence {
@@ -122,6 +132,8 @@ export interface RunPersistence {
   load(runId: string): PersistedRunState | null;
   /** List all persisted runs. */
   list(): PersistedRunState[];
+  /** Atomically mark one persisted terminal notification as delivered. */
+  markTerminalDeliveryDelivered(runId: string, deliveryId: string): boolean;
   /** Delete a persisted run. */
   delete(runId: string): boolean;
   /** Inspect the current run lock, if any. */
@@ -211,6 +223,42 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
     }
   };
 
+  const saveState = (state: PersistedRunState, opts?: { backup?: boolean }) => {
+    ensureDir();
+    state.updatedAt = new Date().toISOString();
+    const path = primaryRunPath(state.runId);
+    // Compact JSON: run files are rewritten on every journal flush and can carry
+    // large agent results — pretty-printing inflates every write by ~30%.
+    const json = JSON.stringify(state);
+    // Atomic write: a crash mid-write can't corrupt the live file (tmp+rename is
+    // atomic on the same filesystem). A .bak from the previous good save is the
+    // recovery fallback if the primary is somehow truncated.
+    _writeFileSync(`${path}.tmp`, json);
+    _renameSync(`${path}.tmp`, path);
+    if (opts?.backup !== false) {
+      try {
+        _writeFileSync(`${path}.bak`, json);
+      } catch {
+        // backup is best-effort; the primary write already succeeded
+      }
+    }
+  };
+
+  const loadState = (runId: string): PersistedRunState | null => {
+    // Try the primary, then the .bak — so a corrupt primary doesn't lose the run.
+    for (const path of candidateRunPaths(runId)) {
+      for (const candidate of [path, `${path}.bak`]) {
+        try {
+          if (!_existsSync(candidate)) continue;
+          return JSON.parse(_readFileSync(candidate, "utf-8")) as PersistedRunState;
+        } catch {
+          // corrupt candidate -> fall through to the next candidate
+        }
+      }
+    }
+    return null;
+  };
+
   const readLockAt = (path: string): LockFile | null => {
     try {
       return JSON.parse(_readFileSync(path, "utf-8")) as LockFile;
@@ -234,26 +282,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
   };
 
   return {
-    save(state: PersistedRunState, opts?: { backup?: boolean }) {
-      ensureDir();
-      state.updatedAt = new Date().toISOString();
-      const path = primaryRunPath(state.runId);
-      // Compact JSON: run files are rewritten on every journal flush and can carry
-      // large agent results — pretty-printing inflates every write by ~30%.
-      const json = JSON.stringify(state);
-      // Atomic write: a crash mid-write can't corrupt the live file (tmp+rename is
-      // atomic on the same filesystem). A .bak from the previous good save is the
-      // recovery fallback if the primary is somehow truncated.
-      _writeFileSync(`${path}.tmp`, json);
-      _renameSync(`${path}.tmp`, path);
-      if (opts?.backup !== false) {
-        try {
-          _writeFileSync(`${path}.bak`, json);
-        } catch {
-          // backup is best-effort; the primary write already succeeded
-        }
-      }
-    },
+    save: saveState,
 
     writeOutput(runId: string, output: unknown): string {
       ensureDir();
@@ -264,20 +293,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       return path;
     },
 
-    load(runId: string): PersistedRunState | null {
-      // Try the primary, then the .bak — so a corrupt primary doesn't lose the run.
-      for (const path of candidateRunPaths(runId)) {
-        for (const candidate of [path, `${path}.bak`]) {
-          try {
-            if (!_existsSync(candidate)) continue;
-            return JSON.parse(_readFileSync(candidate, "utf-8")) as PersistedRunState;
-          } catch {
-            // corrupt candidate -> fall through to the next candidate
-          }
-        }
-      }
-      return null;
-    },
+    load: loadState,
 
     list(): PersistedRunState[] {
       const byRunId = new Map<string, PersistedRunState>();
@@ -298,6 +314,16 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
         }
       }
       return [...byRunId.values()].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    },
+
+    markTerminalDeliveryDelivered(runId: string, deliveryId: string): boolean {
+      const state = loadState(runId);
+      const delivery = state?.terminalDeliveries?.find((candidate) => candidate.deliveryId === deliveryId);
+      if (!state || !delivery) return false;
+      if (delivery.state === "delivered") return true;
+      delivery.state = "delivered";
+      saveState(state);
+      return true;
     },
 
     delete(runId: string): boolean {

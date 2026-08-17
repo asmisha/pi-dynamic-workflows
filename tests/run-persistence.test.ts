@@ -108,6 +108,37 @@ test(
 );
 
 test(
+  "createRunPersistence atomically marks a terminal delivery delivered",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save({
+      runId: "delivery-test",
+      workflowName: "wf",
+      script: "export const meta = { name: 'w', description: 'w' }",
+      sessionId: "parent-session",
+      status: "completed",
+      phases: [],
+      agents: [],
+      logs: [],
+      terminalDeliveries: [
+        {
+          deliveryId: "delivery-test:completed",
+          sessionId: "parent-session",
+          content: "done",
+          state: "pending",
+        },
+      ],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+
+    assert.equal(rp.markTerminalDeliveryDelivered("delivery-test", "delivery-test:completed"), true);
+    assert.equal(rp.load("delivery-test")?.terminalDeliveries?.[0].state, "delivered");
+    assert.equal(rp.markTerminalDeliveryDelivered("delivery-test", "missing"), false);
+  }),
+);
+
+test(
   "createRunPersistence load returns null for missing run",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);

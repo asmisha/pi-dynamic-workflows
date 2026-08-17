@@ -1620,6 +1620,75 @@ test(
 );
 
 test(
+  "complete persists its pending terminal delivery before emitting",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent(), sessionId: "parent-session" });
+    manager.on("complete", ({ runId, deliveryId }: { runId: string; deliveryId: string }) => {
+      const persisted = manager.getPersistence().load(runId);
+      assert.equal(persisted?.status, "completed");
+      assert.equal(persisted?.terminalDeliveries?.[0].deliveryId, deliveryId);
+      assert.equal(persisted?.terminalDeliveries?.[0].sessionId, "parent-session");
+      assert.equal(persisted?.terminalDeliveries?.[0].state, "pending");
+      assert.match(persisted?.terminalDeliveries?.[0].content ?? "", /Background workflow "tracked_demo" finished/);
+    });
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await promise;
+    const delivery = manager.getPersistence().load(runId)?.terminalDeliveries?.[0];
+    assert.equal(delivery?.deliveryId, `${runId}:completed`);
+    assert.match(delivery?.content ?? "", /Background workflow "tracked_demo" finished/);
+    assert.match(delivery?.content ?? "", /full output: .*\.stdout$/);
+  }),
+);
+
+test(
+  "failure persists its pending terminal delivery before emitting",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      sessionId: "parent-session",
+      agent: {
+        async run() {
+          throw new WorkflowError("broken", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+        },
+      },
+    });
+    manager.on("error", ({ runId, deliveryId }: { runId: string; deliveryId: string }) => {
+      const persisted = manager.getPersistence().load(runId);
+      assert.equal(persisted?.status, "failed");
+      assert.equal(persisted?.terminalDeliveries?.[0].deliveryId, deliveryId);
+      assert.equal(persisted?.terminalDeliveries?.[0].state, "pending");
+      assert.match(persisted?.terminalDeliveries?.[0].content ?? "", /broken/);
+    });
+
+    const { runId, promise } = manager.startInBackground(nonRetryableOneAgentScript);
+    await assert.rejects(promise, /broken/);
+    assert.equal(manager.getPersistence().load(runId)?.terminalDeliveries?.[0].deliveryId, `${runId}:failed`);
+  }),
+);
+
+test(
+  "stop persists its pending terminal delivery before emitting",
+  withTempCwd(async (cwd) => {
+    const deferred = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner, sessionId: "parent-session" });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    manager.on("stopped", ({ deliveryId }: { deliveryId: string }) => {
+      const persisted = manager.getPersistence().load(runId);
+      assert.equal(persisted?.status, "aborted");
+      assert.equal(persisted?.terminalDeliveries?.[0].deliveryId, deliveryId);
+      assert.equal(persisted?.terminalDeliveries?.[0].state, "pending");
+    });
+
+    assert.equal(manager.stop(runId), true);
+    deferred.resolve();
+    await promise.catch(() => {});
+    assert.equal(manager.getPersistence().load(runId)?.terminalDeliveries?.[0].deliveryId, `${runId}:aborted`);
+  }),
+);
+
+test(
   "resume returns false when run is already running",
   withTempCwd(async (cwd) => {
     const da = deferredAgent();

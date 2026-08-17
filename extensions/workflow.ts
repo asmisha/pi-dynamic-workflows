@@ -68,16 +68,12 @@ export default function extension(pi: ExtensionAPI) {
     const active = pi.getActiveTools();
     const missing = workflowToolNames.filter((name) => !active.includes(name));
     if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
-    // Scope the /workflows history to this session: runs persist on disk across
-    // sessions, but the navigator/task panel show only the current session's runs.
+    // Scope persisted runs and terminal delivery records to this parent session.
     // Switching back to a previous session re-shows that session's runs.
-    try {
-      manager.setSessionId(ctx.sessionManager?.getSessionId());
-    } catch {
-      // sessionManager may be unavailable in some contexts — fall back to global history.
-    }
-    // Deliver a background run's result into the conversation when it finishes.
-    installResultDelivery(pi, manager);
+    manager.setSessionId(ctx.sessionManager.getSessionId());
+    // Deliver terminal results through the run outbox and reconcile them against
+    // the current session's append-only entries after restarts and settled turns.
+    installResultDelivery(pi, manager, ctx.sessionManager);
     // Live "workflows running" panel below the input.
     installTaskPanel(pi, manager, ctx.ui, { loadSettings: () => loadWorkflowSettings({ cwd }) });
   });
