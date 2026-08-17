@@ -6,7 +6,7 @@
  *    conversation so the paused task continues with the outcome.
  */
 
-import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   isAgentStep,
@@ -18,6 +18,7 @@ import {
 } from "./display.js";
 import { formatWorkflowFailure } from "./errors.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
+import { workflowOutcome } from "./workflow-outcome.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
 import { shortModel } from "./workflow-ui.js";
 
@@ -61,56 +62,127 @@ export function deliverText(run: ManagedRun): string {
   const tokens = run.result?.tokenUsage ? ` · ${run.result.tokenUsage.total.toLocaleString()} tokens` : "";
   const agents = run.result?.agentCount ?? run.snapshot.agents.filter(isAgentStep).length;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
+  const outcome = workflowOutcome(run.result?.result);
+  const icon = outcome && !outcome.startsWith("completed") ? "⚠" : "✓";
+  const verdict = outcome ? `; outcome: ${outcome}` : "";
   return (
-    `✓ Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}). ` +
+    `${icon} Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}${verdict}). ` +
     `full output: ${run.outputFile ?? "unavailable"}`
   );
 }
 
+export function failureDeliveryText(run: ManagedRun, error: unknown): string {
+  return `✗ ${formatWorkflowFailure(error, {
+    runId: run.runId,
+    ...resolveWorkflowFailureLocation(run.snapshot, run.error?.agentLabel),
+  })}`;
+}
+
+export function stoppedDeliveryText(runId: string): string {
+  return `⊘ Background workflow ${runId} stopped.`;
+}
+
+type DeliverySessionManager = ExtensionContext["sessionManager"];
+type WorkflowResultDetails = { runId: string; deliveryId: string };
+
+function deliveredTerminalIds(sessionManager: DeliverySessionManager): Set<string> {
+  const ids = new Set<string>();
+  for (const entry of sessionManager.getEntries()) {
+    if (entry.type !== "custom_message" || entry.customType !== "workflow-result") continue;
+    const details = entry.details as Partial<WorkflowResultDetails> | undefined;
+    if (typeof details?.deliveryId === "string") ids.add(details.deliveryId);
+  }
+  return ids;
+}
+
 /**
- * When a background run finishes (or fails), deliver its result back into the
- * conversation AND continue the turn so the assistant can act on it — without
- * blocking the user meanwhile:
- *
- *  - `triggerTurn: true` starts a fresh turn when the agent is idle, feeding the
- *    result to the model so the paused conversation continues.
- *  - Completed results point to an untruncated output file instead of injecting
- *    arbitrarily large workflow results into the parent context.
- *  - `deliverAs: "followUp"` means that if the user is busy in another turn, the
- *    result is queued and picked up after that turn finishes — never interrupting.
- *
- * Set up once per extension; idempotent via an internal guard.
+ * Deliver terminal notifications through the persisted run outbox. An outbox
+ * record remains pending until its matching custom message is visible in the
+ * append-only session, so a queued message lost with the process is replayed.
  */
-export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager): void {
+export function installResultDelivery(
+  pi: ExtensionAPI,
+  manager: WorkflowManager,
+  sessionManager: DeliverySessionManager,
+): void {
   // Mutable holder on manager so shared across re-calls (e.g. session_start after /reload).
   const m = manager as unknown as {
     __deliveryInstalled?: boolean;
-    __holder?: { pi: ExtensionAPI };
+    __holder?: {
+      pi: ExtensionAPI;
+      sessionManager: DeliverySessionManager;
+      sessionId: string;
+      queuedDeliveryIds: Set<string>;
+    };
   };
+  const sessionId = sessionManager.getSessionId();
+
+  const reconcile = () => {
+    const holder = m.__holder;
+    if (!holder) return;
+
+    let deliveredIds: Set<string>;
+    try {
+      deliveredIds = deliveredTerminalIds(holder.sessionManager);
+    } catch {
+      return;
+    }
+
+    const pending = manager.listPendingTerminalDeliveries(holder.sessionId);
+    const pendingIds = new Set(pending.map((delivery) => delivery.deliveryId));
+    for (const deliveryId of holder.queuedDeliveryIds) {
+      if (!pendingIds.has(deliveryId)) holder.queuedDeliveryIds.delete(deliveryId);
+    }
+
+    for (const delivery of pending) {
+      if (deliveredIds.has(delivery.deliveryId)) {
+        manager.markTerminalDeliveryDelivered(delivery.runId, delivery.deliveryId);
+        holder.queuedDeliveryIds.delete(delivery.deliveryId);
+        continue;
+      }
+      if (holder.queuedDeliveryIds.has(delivery.deliveryId)) continue;
+
+      holder.queuedDeliveryIds.add(delivery.deliveryId);
+      try {
+        holder.pi.sendMessage<WorkflowResultDetails>(
+          {
+            customType: "workflow-result",
+            content: delivery.content,
+            display: true,
+            details: { runId: delivery.runId, deliveryId: delivery.deliveryId },
+          },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      } catch {
+        holder.queuedDeliveryIds.delete(delivery.deliveryId);
+      }
+    }
+  };
+
   if (m.__deliveryInstalled) {
-    if (m.__holder) m.__holder.pi = pi;
+    if (m.__holder) {
+      // A session_start/reload is a process-boundary equivalent for queued
+      // follow-ups: if no durable entry exists, enqueue the pending record again.
+      m.__holder.queuedDeliveryIds.clear();
+      m.__holder.pi = pi;
+      m.__holder.sessionManager = sessionManager;
+      m.__holder.sessionId = sessionId;
+    }
+    reconcile();
     return;
   }
   m.__deliveryInstalled = true;
-  m.__holder = { pi };
+  m.__holder = { pi, sessionManager, sessionId, queuedDeliveryIds: new Set() };
 
-  const deliver = (runId: string, content: string, attempt = 0) => {
-    // A retry may fire after session_start swapped the mutable Pi holder. Recheck
-    // ownership on every attempt so diagnostics never cross session boundaries.
+  const deliverTransient = (runId: string, content: string) => {
     if (!manager.isRunInCurrentSession(runId)) return;
-    const retry = () => {
-      if (attempt >= 2) return;
-      const timer = setTimeout(() => deliver(runId, content, attempt + 1), 250 * (attempt + 1));
-      (timer as { unref?: () => void }).unref?.();
-    };
     try {
-      const ret = m.__holder?.pi.sendMessage(
+      m.__holder?.pi.sendMessage(
         { customType: "workflow-result", content, display: true },
         { triggerTurn: true, deliverAs: "followUp" },
       );
-      void Promise.resolve(ret).catch(retry);
     } catch {
-      retry();
+      // Paused notifications are advisory; terminal notifications use the durable outbox above.
     }
   };
 
@@ -119,23 +191,14 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     `${prompt}\n\n` +
     `The run stays paused until a reply continues the same run with workflow({resumeRunId: "${runId}", reply}).`;
 
-  manager.on("complete", ({ runId }: { runId: string }) => {
-    const run = manager.getRun(runId);
-    if (run) {
-      deliver(runId, deliverText(run));
-    }
+  manager.on("complete", reconcile);
+  manager.on("error", reconcile);
+  manager.on("stopped", reconcile);
+  pi.on("agent_settled", () => {
+    m.__holder?.queuedDeliveryIds.clear();
+    reconcile();
   });
-  manager.on("error", ({ runId, error }: { runId: string; error?: unknown }) => {
-    const run = manager.getRun(runId);
-    if (!run || !manager.isRunInCurrentSession(runId)) return;
-    deliver(
-      runId,
-      `✗ ${formatWorkflowFailure(error, {
-        runId,
-        ...resolveWorkflowFailureLocation(run.snapshot, run.error?.agentLabel),
-      })}`,
-    );
-  });
+
   // Durable checkpoints and provider limits both pause without failing. Deliver
   // the reason to the parent conversation so it can ask the user or explain resume.
   manager.on(
@@ -155,12 +218,12 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     }) => {
       if (!manager.getRun(runId) || !manager.isRunInCurrentSession(runId)) return;
       if (reason === "human_input" && checkpoint) {
-        deliver(runId, checkpointText(runId, checkpoint.prompt));
+        deliverTransient(runId, checkpointText(runId, checkpoint.prompt));
         return;
       }
       if (reason === "agent_failure") {
         const cause = error?.message ?? "retryable agent failure";
-        deliver(
+        deliverTransient(
           runId,
           `⏸ Background workflow ${runId} paused after ${cause}. ` +
             `Completed sibling work is saved — run /workflows retry ${runId} to rerun only the failed agent call(s).`,
@@ -170,13 +233,15 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
       if (reason !== "usage_limit") return;
       const when = resetHint ? ` (${resetHint})` : "";
       const cause = error?.message ?? "provider usage limit reached";
-      deliver(
+      deliverTransient(
         runId,
         `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
           `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
       );
     },
   );
+
+  reconcile();
 }
 
 export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {

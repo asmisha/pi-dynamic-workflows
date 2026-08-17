@@ -5,8 +5,33 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 type TaskPanelModule = {
-  installResultDelivery: (pi: ExtensionAPI, manager: unknown) => void;
+  deliverText: (run: unknown) => string;
+  installResultDelivery: (pi: ExtensionAPI, manager: unknown, sessionManager: unknown) => void;
   installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown) => void;
+};
+
+type Delivery = {
+  runId: string;
+  deliveryId: string;
+  sessionId: string;
+  content: string;
+  state: "pending" | "delivered";
+};
+
+type MockSessionManager = {
+  getSessionId: () => string;
+  getEntries: () => unknown[];
+  entries: unknown[];
+};
+
+type MockPi = ExtensionAPI & {
+  _calls: Array<{
+    content: string;
+    customType?: string;
+    display?: boolean;
+    details?: { runId: string; deliveryId: string };
+  }>;
+  _emit: (event: string) => void;
 };
 
 // Loaded once before all tests
@@ -16,179 +41,307 @@ before(async () => {
   mod = (await import("../src/task-panel.js")) as TaskPanelModule;
 });
 
-// ─── Pure-function tests (tested indirectly via installResultDelivery) ─────────
+function createMockSessionManager(sessionId = "session-1", entries: unknown[] = []): MockSessionManager {
+  return {
+    getSessionId: () => sessionId,
+    getEntries: () => entries,
+    entries,
+  };
+}
+
+function createMockManager(run?: unknown) {
+  const pending: Delivery[] = [];
+  const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+    getRun: (...args: unknown[]) => unknown;
+    isRunInCurrentSession: (...args: unknown[]) => boolean;
+    listPendingTerminalDeliveries: (sessionId: string) => Delivery[];
+    markTerminalDeliveryDelivered: (runId: string, deliveryId: string) => boolean;
+    _queue: (content: string, options?: Partial<Delivery>) => Delivery;
+  };
+  manager.getRun = () => run;
+  manager.isRunInCurrentSession = () => true;
+  manager.listPendingTerminalDeliveries = (sessionId) =>
+    pending.filter((delivery) => delivery.sessionId === sessionId && delivery.state === "pending");
+  manager.markTerminalDeliveryDelivered = (runId, deliveryId) => {
+    const delivery = pending.find((candidate) => candidate.runId === runId && candidate.deliveryId === deliveryId);
+    if (!delivery) return false;
+    delivery.state = "delivered";
+    return true;
+  };
+  manager._queue = (content, options = {}) => {
+    const delivery: Delivery = {
+      runId: options.runId ?? "test-run-1",
+      deliveryId: options.deliveryId ?? "test-run-1:completed",
+      sessionId: options.sessionId ?? "session-1",
+      content,
+      state: options.state ?? "pending",
+    };
+    pending.push(delivery);
+    return delivery;
+  };
+  return manager;
+}
+
+function createMockPi(): MockPi {
+  const calls: MockPi["_calls"] = [];
+  const handlers = new Map<string, Array<() => void>>();
+  const obj = {
+    sendMessage(msg: unknown, _opts?: unknown) {
+      calls.push({
+        content: (msg as { content?: string }).content ?? "",
+        customType: (msg as { customType?: string }).customType,
+        display: (msg as { display?: boolean }).display,
+        details: (msg as { details?: { runId: string; deliveryId: string } }).details,
+      });
+    },
+    registerTool: () => {},
+    on: (event: string, handler: () => void) => {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
+    getActiveTools: () => [],
+    setActiveTools: () => {},
+    reload: () => Promise.resolve(),
+    _calls: calls,
+    _emit: (event: string) => {
+      for (const handler of handlers.get(event) ?? []) handler();
+    },
+  };
+  return obj as unknown as MockPi;
+}
+
+function makeRun(overrides: Record<string, unknown> = {}) {
+  return {
+    runId: "test-run-1",
+    snapshot: {
+      name: "test-workflow",
+      agentCount: 3,
+      agents: [
+        { id: "a1", status: "done", step: "agent 1", phase: "phase-1" },
+        { id: "a2", status: "done", step: "agent 2", phase: "phase-1" },
+        { id: "a3", status: "done", step: "agent 3", phase: "phase-2" },
+      ],
+      phases: [{ title: "phase-1" }, { title: "phase-2" }],
+      currentPhase: "phase-2",
+      startedAt: new Date(),
+      completedAt: new Date(),
+    },
+    outputFile: "/tmp/workflows/test-run-1.stdout",
+    result: {
+      agentCount: 3,
+      durationMs: 1500,
+      tokenUsage: { total: 50000, input: 25000, output: 25000 },
+      result: { verdict: "## All tests passed\n\nEverything looks good!" },
+    },
+    ...overrides,
+  };
+}
+
+function persistedRun(delivery: Delivery) {
+  const timestamp = new Date().toISOString();
+  return {
+    runId: delivery.runId,
+    workflowName: "test-workflow",
+    script: "export const meta = { name: 'test-workflow', description: 'test' }",
+    sessionId: delivery.sessionId,
+    status: "completed" as const,
+    phases: [],
+    agents: [],
+    logs: [],
+    startedAt: timestamp,
+    updatedAt: timestamp,
+    terminalDeliveries: [delivery],
+  };
+}
+
+// ─── Durable terminal-result delivery ────────────────────────────────────────
 
 describe("installResultDelivery", () => {
-  function createMockManager(run?: unknown) {
-    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
-      getRun: (...args: unknown[]) => unknown;
-      isRunInCurrentSession: (...args: unknown[]) => boolean;
-      __deliveryInstalled?: boolean;
-      listRuns?: () => unknown[];
-    };
-    manager.getRun = () => run;
-    manager.isRunInCurrentSession = () => true;
-    manager.listRuns = () => [];
-    return manager;
-  }
-
-  function createMockPi(): ExtensionAPI & { _calls: { content: string; customType?: string; display?: boolean }[] } {
-    const calls: { content: string; customType?: string; display?: boolean }[] = [];
-    const obj = {
-      sendMessage(msg: unknown, _opts?: unknown) {
-        calls.push({
-          content: (msg as { content?: string }).content ?? "",
-          customType: (msg as { customType?: string }).customType,
-          display: (msg as { display?: boolean }).display,
-        });
-      },
-      registerTool: () => {},
-      on: () => {},
-      getActiveTools: () => [],
-      setActiveTools: () => {},
-      reload: () => Promise.resolve(),
-      _calls: calls,
-    };
-    return obj as unknown as ExtensionAPI & { _calls: { content: string; customType?: string }[] };
-  }
-
-  function makeRun(overrides: Record<string, unknown> = {}) {
-    return {
-      runId: "test-run-1",
-      snapshot: {
-        name: "test-workflow",
-        agentCount: 3,
-        agents: [
-          { id: "a1", status: "done", step: "agent 1", phase: "phase-1" },
-          { id: "a2", status: "done", step: "agent 2", phase: "phase-1" },
-          { id: "a3", status: "done", step: "agent 3", phase: "phase-2" },
-        ],
-        phases: [{ title: "phase-1" }, { title: "phase-2" }],
-        currentPhase: "phase-2",
-        startedAt: new Date(),
-        completedAt: new Date(),
-      },
-      outputFile: "/tmp/workflows/test-run-1.stdout",
-      result: {
-        agentCount: 3,
-        durationMs: 1500,
-        tokenUsage: { total: 50000, input: 25000, output: 25000 },
-        result: { verdict: "## All tests passed\n\nEverything looks good!" },
-      },
-      ...overrides,
-    };
-  }
-
-  it("delivers only the compact completion line and full output path", () => {
+  it("delivers persisted terminal content with stable run and delivery details", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
+    const session = createMockSessionManager();
+    const content =
+      `✓ Background workflow "test-workflow" finished (3 agents · ${Number(50000).toLocaleString()} tokens · 1.5s). ` +
+      "full output: /tmp/workflows/test-run-1.stdout";
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("complete", { runId: "test-run-1" });
+    mod.installResultDelivery(pi, manager, session);
+    manager._queue(content);
+    manager.emit("complete", { runId: "test-run-1", deliveryId: "test-run-1:completed" });
 
-    const calls = (pi as unknown as { _calls: { content: string; customType?: string; display?: boolean }[] })._calls;
-    assert.deepEqual(calls, [
+    assert.deepEqual(pi._calls, [
       {
         customType: "workflow-result",
         display: true,
-        content:
-          `✓ Background workflow "test-workflow" finished (3 agents · ${Number(50000).toLocaleString()} tokens · 1.5s). ` +
-          "full output: /tmp/workflows/test-run-1.stdout",
+        content,
+        details: { runId: "test-run-1", deliveryId: "test-run-1:completed" },
       },
     ]);
-    assert.doesNotMatch(
-      calls[0].content,
-      /All tests passed/,
-      "the result belongs in the output file, not the notification",
-    );
   });
 
-  // ── installResultDelivery: guard / stale ctx ──
-
-  it("installs delivery only once — second call skips listener registration", () => {
+  it("installs terminal listeners only once", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
+    const session = createMockSessionManager();
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    // Second call: should only refresh holder.pi, not add another listener
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-
+    mod.installResultDelivery(pi, manager, session);
+    mod.installResultDelivery(pi, manager, session);
+    manager._queue("done");
     manager.emit("complete", { runId: "test-run-1" });
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1); // exactly once, not twice
+
+    assert.equal(pi._calls.length, 1);
   });
 
-  it("does not crash when sendMessage throws (stale ctx after reload)", () => {
-    const pi = {
-      sendMessage: (_msg: unknown, _opts?: unknown) => {
-        throw new Error("This extension ctx is stale");
-      },
-      registerTool: () => {},
-      on: () => {},
-      getActiveTools: () => [],
-      setActiveTools: () => {},
-      reload: () => Promise.resolve(),
+  it("leaves a delivery pending when sendMessage throws", () => {
+    const pi = createMockPi();
+    pi.sendMessage = () => {
+      throw new Error("This extension ctx is stale");
     };
     const manager = createMockManager(makeRun());
+    const session = createMockSessionManager();
+    manager._queue("done");
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    // Should not throw — stale ctx is silently swallowed
-    manager.emit("complete", { runId: "test-run-1" });
-    assert.ok(true, "should not throw"); // reached without crash
+    assert.doesNotThrow(() => mod.installResultDelivery(pi, manager, session));
+    assert.equal(manager.listPendingTerminalDeliveries("session-1").length, 1);
   });
 
-  // ── Error event ──
-
-  it("delivers error message on error event for background runs", () => {
+  it("does not deliver terminal records owned by another session", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
+    manager._queue("private failure", { sessionId: "other-session", deliveryId: "test-run-1:failed" });
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("error", { runId: "test-run-1", error: { message: "Something went wrong" } });
+    mod.installResultDelivery(pi, manager, createMockSessionManager("session-1"));
+    manager.emit("error", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string; display?: boolean }[] })._calls;
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].display, true);
-    assert.ok(calls[0].content.includes("failed"), "should contain failed");
-    assert.ok(calls[0].content.includes("Something went wrong"), "should contain Something went wrong");
+    assert.equal(pi._calls.length, 0);
   });
 
-  it("does not deliver terminal results or errors outside the current session", () => {
-    const pi = createMockPi();
-    const manager = createMockManager(makeRun());
-    manager.isRunInCurrentSession = () => false;
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("complete", { runId: "test-run-1" });
-    manager.emit("error", { runId: "test-run-1", error: { message: "private failure" } });
-
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 0);
-  });
-
-  it("rechecks session ownership before retrying delivery", async () => {
+  it("requeues an uncertain in-memory delivery when the session binding reloads", () => {
     const first = createMockPi();
-    first.sendMessage = () => Promise.reject(new Error("stale session"));
     const second = createMockPi();
     const manager = createMockManager(makeRun());
+    const session = createMockSessionManager();
 
-    mod.installResultDelivery(first as unknown as ExtensionAPI, manager);
+    mod.installResultDelivery(first, manager, session);
+    manager._queue("done");
     manager.emit("complete", { runId: "test-run-1" });
+    mod.installResultDelivery(second, manager, session);
 
-    manager.isRunInCurrentSession = () => false;
-    mod.installResultDelivery(second as unknown as ExtensionAPI, manager);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-
-    assert.equal(second._calls.length, 0, "a retry must not cross into the newly active session");
+    assert.equal(first._calls.length, 1);
+    assert.equal(second._calls.length, 1);
+    assert.equal(second._calls[0].details?.deliveryId, "test-run-1:completed");
   });
 
-  // ── Paused (usage-limit checkpoint) event ──
+  it("redelivers a pending terminal notification after a simulated manager restart", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { WorkflowManager } = await import("../src/workflow-manager.js");
+    const { withFakeHomeAsync } = await import("./helpers/fake-home.js");
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-delivery-"));
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        const delivery: Delivery = {
+          runId: "restart-run",
+          deliveryId: "restart-run:completed",
+          sessionId: "session-1",
+          content: "durable completion",
+          state: "pending",
+        };
+        const original = new WorkflowManager({ cwd, sessionId: "session-1" });
+        original.getPersistence().save(persistedRun(delivery));
 
+        const restarted = new WorkflowManager({ cwd, sessionId: "session-1" });
+        const pi = createMockPi();
+        mod.installResultDelivery(pi, restarted, createMockSessionManager());
+
+        assert.deepEqual(pi._calls, [
+          {
+            customType: "workflow-result",
+            display: true,
+            content: "durable completion",
+            details: { runId: "restart-run", deliveryId: "restart-run:completed" },
+          },
+        ]);
+        assert.equal(
+          restarted.getPersistence().load("restart-run")?.terminalDeliveries?.[0].state,
+          "pending",
+          "enqueueing is not proof that Pi persisted the message",
+        );
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("does not duplicate a custom message already persisted before restart", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { WorkflowManager } = await import("../src/workflow-manager.js");
+    const { withFakeHomeAsync } = await import("./helpers/fake-home.js");
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-dedup-"));
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        const delivery: Delivery = {
+          runId: "dedup-run",
+          deliveryId: "dedup-run:completed",
+          sessionId: "session-1",
+          content: "already delivered",
+          state: "pending",
+        };
+        const original = new WorkflowManager({ cwd, sessionId: "session-1" });
+        original.getPersistence().save(persistedRun(delivery));
+        const restarted = new WorkflowManager({ cwd, sessionId: "session-1" });
+        const pi = createMockPi();
+        const session = createMockSessionManager("session-1", [
+          {
+            type: "custom_message",
+            customType: "workflow-result",
+            content: "already delivered",
+            display: true,
+            details: { runId: "dedup-run", deliveryId: "dedup-run:completed" },
+          },
+        ]);
+
+        mod.installResultDelivery(pi, restarted, session);
+
+        assert.equal(pi._calls.length, 0);
+        assert.equal(restarted.getPersistence().load("dedup-run")?.terminalDeliveries?.[0].state, "delivered");
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("marks an enqueued delivery delivered only after agent-settled sees its session entry", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const session = createMockSessionManager();
+    const delivery = manager._queue("done");
+
+    mod.installResultDelivery(pi, manager, session);
+    assert.equal(delivery.state, "pending");
+    session.entries.push({
+      type: "custom_message",
+      customType: "workflow-result",
+      details: { runId: delivery.runId, deliveryId: delivery.deliveryId },
+    });
+    pi._emit("agent_settled");
+
+    assert.equal(delivery.state, "delivered");
+    assert.equal(pi._calls.length, 1);
+  });
+
+  // Paused notifications remain transient: they are resumable, not terminal.
   it("delivers a resumable checkpoint message on a usage-limit paused event", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
+    mod.installResultDelivery(pi, manager, createMockSessionManager());
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
     manager.emit("paused", {
       runId: "test-run-1",
       reason: "usage_limit",
@@ -196,83 +349,55 @@ describe("installResultDelivery", () => {
       resetHint: "Resets in ~3h",
     });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1);
-    assert.ok(calls[0].content.includes("paused"), "should say paused");
-    assert.ok(calls[0].content.includes("/workflows resume test-run-1"), "should name the resume command");
-    assert.ok(calls[0].content.includes("Resets in ~3h"), "should include the reset hint");
-    assert.ok(!calls[0].content.includes("failed"), "should not say failed");
+    assert.equal(pi._calls.length, 1);
+    assert.match(pi._calls[0].content, /paused/);
+    assert.match(pi._calls[0].content, /\/workflows resume test-run-1/);
+    assert.match(pi._calls[0].content, /Resets in ~3h/);
+    assert.doesNotMatch(pi._calls[0].content, /failed/);
   });
 
-  it("does not replay a persisted human checkpoint when delivery installs after reload", () => {
+  it("delivers a retryable agent-failure pause without treating it as terminal", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
-    manager.listRuns = () => [
-      {
-        runId: "persisted-run",
-        status: "paused",
-        pauseReason: "human_input",
-        pendingCheckpoint: { prompt: "Already delivered question?" },
-      },
-    ];
+    mod.installResultDelivery(pi, manager, createMockSessionManager());
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("paused", {
+      runId: "test-run-1",
+      reason: "agent_failure",
+      error: { message: "reviewer returned malformed output" },
+    });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 0);
+    assert.equal(pi._calls.length, 1);
+    assert.match(pi._calls[0].content, /reviewer returned malformed output/);
+    assert.match(pi._calls[0].content, /\/workflows retry test-run-1/);
+    assert.equal(pi._calls[0].details, undefined);
   });
 
   it("delivers a human checkpoint to the parent conversation", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
+    mod.installResultDelivery(pi, manager, createMockSessionManager());
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
     manager.emit("paused", {
       runId: "test-run-1",
       reason: "human_input",
-      checkpoint: {
-        prompt: "Accept the bounded rollout risk?",
-      },
+      checkpoint: { prompt: "Accept the bounded rollout risk?" },
     });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1);
-    assert.match(calls[0].content, /Accept the bounded rollout risk\?/);
-    assert.match(calls[0].content, /resumeRunId/);
-    assert.match(calls[0].content, /continues the same run/);
-    // Mechanics only: no conduct directives in runtime delivery text.
-    assert.doesNotMatch(calls[0].content, /Ask the user|Do not start a new run/);
+    assert.equal(pi._calls.length, 1);
+    assert.match(pi._calls[0].content, /Accept the bounded rollout risk\?/);
+    assert.match(pi._calls[0].content, /resumeRunId/);
+    assert.doesNotMatch(pi._calls[0].content, /Ask the user|Do not start a new run/);
   });
 
-  it("ignores a manual pause (no reason) — no delivery", () => {
+  it("ignores a manual pause", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
+    mod.installResultDelivery(pi, manager, createMockSessionManager());
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
     manager.emit("paused", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 0);
-  });
-
-  // ── Holder refresh on re-call ──
-
-  it("refreshes holder.pi on second call for stale ctx recovery", () => {
-    const pi1 = createMockPi();
-    const pi2 = createMockPi();
-    const manager = createMockManager(makeRun());
-
-    // Install with first pi
-    mod.installResultDelivery(pi1 as unknown as ExtensionAPI, manager);
-    // Re-call with second pi (fresh after reload)
-    mod.installResultDelivery(pi2 as unknown as ExtensionAPI, manager);
-
-    manager.emit("complete", { runId: "test-run-1" });
-
-    const calls1 = (pi1 as unknown as { _calls: { content: string }[] })._calls;
-    const calls2 = (pi2 as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls1.length, 0, "pi1 should not be used after refresh");
-    assert.equal(calls2.length, 1, "pi2 should receive the delivery");
+    assert.equal(pi._calls.length, 0);
   });
 });
 

@@ -316,10 +316,12 @@ test("workflow status tool returns compact live progress", async () => {
   );
 
   assert.equal(result.details.status, "running");
+  assert.equal(result.details.outcome, undefined);
   assert.equal(result.details.currentPhase, "Implement");
   assert.deepEqual(result.details.agents, { total: 2, running: 1, done: 1, error: 0 });
   assert.match(result.content[0].text, /full_review/);
   assert.match(result.content[0].text, /running/);
+  assert.doesNotMatch(result.content[0].text, /Workflow outcome:/);
 });
 
 test("workflow status tool reads terminal persisted runs without exposing their script", async () => {
@@ -337,7 +339,10 @@ test("workflow status tool reads terminal persisted runs without exposing their 
         currentPhase: "Review",
         agents: [{ id: 1, label: "reviewer", prompt: "private prompt", status: "done" }],
         logs: [],
-        result: "private result",
+        result: {
+          report: "private result",
+          continuationState: { outcome: "blocked" },
+        },
         startedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         tokenUsage: { input: 20, output: 10, total: 30 },
@@ -350,7 +355,10 @@ test("workflow status tool reads terminal persisted runs without exposing their 
   });
 
   assert.equal(result.details.status, "completed");
+  assert.equal(result.details.outcome, "blocked");
   assert.equal(result.details.workflowName, "finished_review");
+  assert.match(result.content[0].text, /Workflow outcome: blocked\./);
+  assert.doesNotMatch(result.content[0].text, /private result/);
   assert.equal("script" in result.details, false);
   assert.equal("args" in result.details, false);
   assert.equal("result" in result.details, false);

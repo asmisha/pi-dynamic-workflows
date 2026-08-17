@@ -568,6 +568,25 @@ describe("deliverText", () => {
     assert.doesNotMatch(text, /complete result stays in the output file/);
   });
 
+  it("warns and names a non-completed workflow outcome", async () => {
+    const { deliverText } = await loadTaskPanel();
+    const text = deliverText(
+      fakeManagedRun({
+        result: {
+          result: { report: "private", continuationState: { outcome: "blocked" } },
+          agentCount: 5,
+          tokenUsage: { input: 100, output: 50, total: 150, cost: 0.003 },
+          durationMs: 12345,
+        },
+      }),
+    );
+    assert.equal(
+      text,
+      '⚠ Background workflow "my-wf" finished (5 agents · 150 tokens · 12.3s; outcome: blocked). full output: /tmp/workflows/r-123.stdout',
+    );
+    assert.doesNotMatch(text, /private/);
+  });
+
   it("reports an unavailable output file instead of inventing a path", async () => {
     const { deliverText } = await loadTaskPanel();
     const text = deliverText(fakeManagedRun({ outputFile: undefined }));
