@@ -27,6 +27,10 @@ import { nativeImport } from "./native-import.mjs";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 const AGENT_TIMEOUT_CLEANUP_GRACE_MS = 1000;
+const AGENT_TIERS = ["small", "medium", "big"] as const;
+const EXACT_MODEL_SPEC = /^[a-z0-9][a-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+
+export type AgentTier = (typeof AGENT_TIERS)[number];
 
 export interface WorkflowMetaPhase {
   title: string;
@@ -199,10 +203,9 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   phase?: string;
   schema?: TSchemaDef;
   /**
-   * Run this agent on a specific model (`provider/modelId` or a bare `modelId`).
-   * The workflow author chooses per-agent models per the routing policy in the
-   * tool guidelines (e.g. a lighter model for exploration, the main model for
-   * analysis). When omitted, the session's main model is used.
+   * Run this agent on an exact `provider/modelId`. The workflow author chooses
+   * per-agent models per the routing policy in the tool guidelines. When
+   * omitted, the tier, phase route, or session model applies.
    */
   model?: string;
   /**
@@ -217,7 +220,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * precedence; a tier takes precedence over the phase model. When the tier has
    * no configured entry it falls back to the session's main model.
    */
-  tier?: string;
+  tier?: AgentTier;
   /**
    * Reasoning effort for this agent: "low" | "medium" | "high" | "xhigh" | "max".
    * Independent of `model`/`tier` — each model translates the level itself, so the
@@ -537,6 +540,27 @@ export async function runWorkflow<T = unknown>(
     if (agentOptions.thinking !== undefined && !isAgentThinkingLevel(agentOptions.thinking)) {
       throw new WorkflowError(
         `agent opts.thinking must be one of: ${AGENT_THINKING_LEVELS.join(", ")}`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: agentOptions.label },
+      );
+    }
+    if (
+      agentOptions.model !== undefined &&
+      (typeof agentOptions.model !== "string" || !EXACT_MODEL_SPEC.test(agentOptions.model))
+    ) {
+      const tierHint =
+        typeof agentOptions.model === "string" && AGENT_TIERS.includes(agentOptions.model as AgentTier)
+          ? `; use opts.tier: "${agentOptions.model}"`
+          : "";
+      throw new WorkflowError(
+        `agent opts.model must be an exact provider/modelId${tierHint}`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: agentOptions.label },
+      );
+    }
+    if (agentOptions.tier !== undefined && !AGENT_TIERS.includes(agentOptions.tier as AgentTier)) {
+      throw new WorkflowError(
+        `agent opts.tier must be one of: ${AGENT_TIERS.join(", ")}`,
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
         { recoverable: false, agentLabel: agentOptions.label },
       );
