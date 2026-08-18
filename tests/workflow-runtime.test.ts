@@ -624,7 +624,7 @@ test("runWorkflow routes models: explicit opts.model > phase model > default", a
     phases: [{ title: 'A', model: 'phase-a-model' }, { title: 'B' }]
   }
   phase('A')
-  await agent('explicit wins', { label: 'e', model: 'explicit-model' })
+  await agent('explicit wins', { label: 'e', model: 'provider/explicit-model' })
   await agent('phase routed', { label: 'p' })
   phase('B')
   await agent('no model -> default', { label: 'n' })
@@ -632,7 +632,7 @@ test("runWorkflow routes models: explicit opts.model > phase model > default", a
 
   await runWorkflow(script, { agent: capturingAgent, persistLogs: false });
 
-  assert.deepEqual(seen, ["explicit-model", "phase-a-model", undefined]);
+  assert.deepEqual(seen, ["provider/explicit-model", "phase-a-model", undefined]);
 });
 
 test("runWorkflow forwards an exact fallback model with the primary route", async () => {
@@ -669,7 +669,7 @@ test("runWorkflow plumbs opts.tier through to the agent with correct precedence"
   }
   phase('A')
   await agent('tier beats phase', { label: 't', tier: 'small' })
-  await agent('explicit beats tier', { label: 'e', tier: 'small', model: 'explicit-model' })
+  await agent('explicit beats tier', { label: 'e', tier: 'small', model: 'provider/explicit-model' })
   return {}`;
 
   await runWorkflow(script, { agent: capturingAgent, persistLogs: false });
@@ -678,7 +678,7 @@ test("runWorkflow plumbs opts.tier through to the agent with correct precedence"
   //    inside run()) wins over the phase model; tier is forwarded.
   assert.deepEqual(seen[0], { model: undefined, tier: "small" });
   // 2) explicit model + tier: explicit model is forwarded and still wins.
-  assert.deepEqual(seen[1], { model: "explicit-model", tier: "small" });
+  assert.deepEqual(seen[1], { model: "provider/explicit-model", tier: "small" });
 });
 
 test("runWorkflow plumbs opts.thinking through to the agent and reports it for display", async () => {
@@ -726,6 +726,51 @@ test("an unknown opts.thinking level fails the script instead of silently downgr
       return true;
     },
   );
+});
+
+test("agent routing rejects tier names in opts.model before launch", async () => {
+  for (const tier of ["small", "medium", "big"]) {
+    const counter = countingAgent();
+    const script = `export const meta = { name: 'bad_model_tier', description: 'invalid model option' }
+    return await agent('task', { label: 'a', model: '${tier}' })`;
+
+    await assert.rejects(
+      () => runWorkflow(script, { agent: counter.runner, persistLogs: false }),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.match(
+          error.message,
+          new RegExp(`opts\\.model must be an exact provider/modelId; use opts\\.tier: "${tier}"`),
+        );
+        return true;
+      },
+    );
+    assert.equal(counter.state.calls, 0);
+  }
+});
+
+test("agent routing rejects bare models and unknown tiers before launch", async () => {
+  const cases = [
+    { option: "model: 'gpt-5'", expected: /opts\.model must be an exact provider\/modelId/ },
+    { option: "tier: 'large'", expected: /opts\.tier must be one of: small, medium, big/ },
+  ];
+
+  for (const { option, expected } of cases) {
+    const counter = countingAgent();
+    const script = `export const meta = { name: 'bad_route', description: 'invalid routing option' }
+    return await agent('task', { label: 'a', ${option} })`;
+    await assert.rejects(
+      () => runWorkflow(script, { agent: counter.runner, persistLogs: false }),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.match(error.message, expected);
+        return true;
+      },
+    );
+    assert.equal(counter.state.calls, 0);
+  }
 });
 
 const resumeScript = `export const meta = { name: 'resume_demo', description: 'resume' }
