@@ -212,7 +212,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowMana
         }
         case "stop": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
-          const stopped = manager.stop(id);
+          const stopped = manager.stop(id, { notifyParent: false });
           ctx.ui.notify(stopped ? `Stopped ${id}` : `Cannot stop ${id} (not running)`, stopped ? "info" : "warning");
           return;
         }

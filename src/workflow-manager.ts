@@ -108,6 +108,11 @@ function retryableAgentFailureState(
   };
 }
 
+export interface StopOptions {
+  /** Skip the asynchronous parent notification when this stop is acknowledged by its caller. */
+  notifyParent?: boolean;
+}
+
 export interface ManagedRun {
   runId: string;
   status: RunStatus;
@@ -145,6 +150,8 @@ export interface ManagedRun {
   activeRetryCallIds?: Set<string>;
   /** True after the user removes the run; suppresses final persistence from the unwinding execution. */
   deleted?: boolean;
+  /** Prevent a caller-acknowledged stop from being re-enqueued while the aborted execution unwinds. */
+  stopNotificationSuppressed?: boolean;
   /** True while surviving runtime-owned siblings drain after the first terminal failure. */
   draining?: boolean;
   /** True once all runtime-owned work unwound, final state persisted, and the lease released. */
@@ -737,7 +744,7 @@ export class WorkflowManager extends EventEmitter {
       const deliveryId =
         managed.status === "failed"
           ? this.prepareTerminalDelivery(managed, failureDeliveryText(managed, workflowError))
-          : managed.status === "aborted"
+          : managed.status === "aborted" && !managed.stopNotificationSuppressed
             ? this.prepareTerminalDelivery(managed, stoppedDeliveryText(managed.runId))
             : undefined;
 
@@ -1129,7 +1136,8 @@ export class WorkflowManager extends EventEmitter {
   /**
    * Stop a running/paused workflow or surviving siblings draining after failure.
    */
-  stop(runId: string): boolean {
+  stop(runId: string, options: StopOptions = {}): boolean {
+    const notifyParent = options.notifyParent !== false;
     const managed = this.runs.get(runId);
     if (managed) {
       const canStop =
@@ -1138,10 +1146,11 @@ export class WorkflowManager extends EventEmitter {
         (managed.status === "failed" && !managed.finalized);
       if (!canStop) return false;
 
+      managed.stopNotificationSuppressed = !notifyParent;
       managed.controller.abort();
       managed.draining = false;
       managed.status = "aborted";
-      const deliveryId = this.prepareTerminalDelivery(managed, stoppedDeliveryText(runId));
+      const deliveryId = notifyParent ? this.prepareTerminalDelivery(managed, stoppedDeliveryText(runId)) : undefined;
       // Same contract as pause(): suppress late writes only after the terminal
       // state and delivery outbox are durable. If persistence fails, retain the
       // lease so a sparse run cannot be resumed by this or another live manager.
@@ -1165,7 +1174,7 @@ export class WorkflowManager extends EventEmitter {
     try {
       const latest = this.persistence.load(runId) ?? persisted;
       if (latest.status !== "running" && latest.status !== "paused") return false;
-      const deliveryId = terminalDeliveryId(runId, "aborted");
+      const deliveryId = notifyParent ? terminalDeliveryId(runId, "aborted") : undefined;
       this.persistence.save({
         ...latest,
         status: "aborted",
@@ -1174,13 +1183,17 @@ export class WorkflowManager extends EventEmitter {
         resetHint: undefined,
         retryState: undefined,
         activeRetryCallIds: undefined,
-        terminalDeliveries: appendTerminalDelivery(
-          latest.terminalDeliveries,
-          runId,
-          "aborted",
-          latest.sessionId,
-          stoppedDeliveryText(runId),
-        ),
+        ...(notifyParent
+          ? {
+              terminalDeliveries: appendTerminalDelivery(
+                latest.terminalDeliveries,
+                runId,
+                "aborted",
+                latest.sessionId,
+                stoppedDeliveryText(runId),
+              ),
+            }
+          : {}),
       });
       this.emit("stopped", { runId, deliveryId });
       return true;

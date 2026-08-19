@@ -1451,6 +1451,30 @@ test(
 );
 
 test(
+  "caller-acknowledged stop suppresses delivery for a persisted paused run",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    manager.getPersistence().save({
+      runId: "persisted-acknowledged-stop",
+      workflowName: "old_checkpoint",
+      script: oneAgentScript,
+      status: "paused",
+      pauseReason: "usage_limit",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    assert.equal(manager.stop("persisted-acknowledged-stop", { notifyParent: false }), true);
+    const persisted = manager.getPersistence().load("persisted-acknowledged-stop");
+    assert.equal(persisted?.status, "aborted");
+    assert.deepEqual(persisted?.terminalDeliveries ?? [], []);
+  }),
+);
+
+test(
   "live-locked runs not owned by this manager are hidden and not mutated",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd });
@@ -1685,6 +1709,27 @@ test(
     deferred.resolve();
     await promise.catch(() => {});
     assert.equal(manager.getPersistence().load(runId)?.terminalDeliveries?.[0].deliveryId, `${runId}:aborted`);
+  }),
+);
+
+test(
+  "caller-acknowledged stop does not enqueue a terminal notification",
+  withTempCwd(async (cwd) => {
+    const deferred = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner, sessionId: "parent-session" });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(manager.stop(runId, { notifyParent: false }), true);
+    assert.deepEqual(manager.getPersistence().load(runId)?.terminalDeliveries ?? [], []);
+
+    deferred.resolve();
+    await promise.catch(() => {});
+    assert.deepEqual(
+      manager.getPersistence().load(runId)?.terminalDeliveries ?? [],
+      [],
+      "abort unwind must not recreate the suppressed notification",
+    );
   }),
 );
 

@@ -272,7 +272,8 @@ function createWorkflowControlTool(
       if (!manager.isRunInCurrentSession(params.runId)) {
         throw new Error(`Workflow ${params.runId} is unavailable in this session`);
       }
-      const ok = await manager[action](params.runId);
+      const ok =
+        action === "stop" ? manager.stop(params.runId, { notifyParent: false }) : await manager[action](params.runId);
       if (!ok) {
         throw new Error(`Workflow ${params.runId} cannot be ${pastTense} in its current state`);
       }

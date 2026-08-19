@@ -49,8 +49,8 @@ function harness(
     listRuns: () => [],
     getSnapshot: () => null,
     getRun: () => undefined,
-    stop: (id: string) => {
-      calls.push(`stop:${id}`);
+    stop: (id: string, options?: { notifyParent?: boolean }) => {
+      calls.push(`stop:${id}:notify=${String(options?.notifyParent)}`);
       return true;
     },
     pause: (id: string) => {
@@ -135,10 +135,10 @@ test("/workflows run adds the workflow tool when absent and does not depend on t
   assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("summarize the auth module"));
 });
 
-test("/workflows stop <id> calls manager.stop", async () => {
+test("/workflows stop <id> acknowledges the stop without a parent notification", async () => {
   const h = harness();
   await h.run("stop run-9");
-  assert.deepEqual(h.calls, ["stop:run-9"]);
+  assert.deepEqual(h.calls, ["stop:run-9:notify=false"]);
 });
 
 test("/workflows retry <id> calls manager.retry", async () => {

@@ -418,15 +418,15 @@ test("workflow status tool exposes retryable failure inventory without source da
 });
 
 test("workflow pause and stop tools expose agent-callable controls", async () => {
-  const calls: Array<{ action: "pause" | "stop"; runId: string }> = [];
+  const calls: Array<{ action: "pause" | "stop"; runId: string; notifyParent?: boolean }> = [];
   const manager = {
     isRunInCurrentSession: () => true,
     pause: (runId: string) => {
       calls.push({ action: "pause", runId });
       return true;
     },
-    stop: (runId: string) => {
-      calls.push({ action: "stop", runId });
+    stop: (runId: string, options?: { notifyParent?: boolean }) => {
+      calls.push({ action: "stop", runId, notifyParent: options?.notifyParent });
       return true;
     },
   } as unknown as WorkflowManager;
@@ -452,7 +452,7 @@ test("workflow pause and stop tools expose agent-callable controls", async () =>
 
   assert.deepEqual(calls, [
     { action: "pause", runId: "run-123" },
-    { action: "stop", runId: "run-456" },
+    { action: "stop", runId: "run-456", notifyParent: false },
   ]);
   assert.equal(pauseResult.details.paused, true);
   assert.equal(stopResult.details.stopped, true);
