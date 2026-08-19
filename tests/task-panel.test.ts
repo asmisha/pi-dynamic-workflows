@@ -6,7 +6,12 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 
 type TaskPanelModule = {
   deliverText: (run: unknown) => string;
-  installResultDelivery: (pi: ExtensionAPI, manager: unknown, sessionManager: unknown) => void;
+  installResultDelivery: (
+    pi: ExtensionAPI,
+    manager: unknown,
+    sessionManager: unknown,
+    options?: { isIdle?: () => boolean },
+  ) => void;
   installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown) => void;
 };
 
@@ -16,12 +21,16 @@ type Delivery = {
   sessionId: string;
   content: string;
   state: "pending" | "delivered";
+  deliveryMode?: "no-trigger";
+  parentLeafId?: string | null;
 };
 
 type MockSessionManager = {
   getSessionId: () => string;
   getEntries: () => unknown[];
+  getBranch: () => Array<{ id: string }>;
   entries: unknown[];
+  branch: Array<{ id: string }>;
 };
 
 type MockPi = ExtensionAPI & {
@@ -32,6 +41,7 @@ type MockPi = ExtensionAPI & {
     details?: { runId: string; deliveryId: string };
   }>;
   _emit: (event: string) => void;
+  _options: unknown[];
 };
 
 // Loaded once before all tests
@@ -41,11 +51,17 @@ before(async () => {
   mod = (await import("../src/task-panel.js")) as TaskPanelModule;
 });
 
-function createMockSessionManager(sessionId = "session-1", entries: unknown[] = []): MockSessionManager {
+function createMockSessionManager(
+  sessionId = "session-1",
+  entries: unknown[] = [],
+  branch: Array<{ id: string }> = [],
+): MockSessionManager {
   return {
     getSessionId: () => sessionId,
     getEntries: () => entries,
+    getBranch: () => branch,
     entries,
+    branch,
   };
 }
 
@@ -75,6 +91,8 @@ function createMockManager(run?: unknown) {
       sessionId: options.sessionId ?? "session-1",
       content,
       state: options.state ?? "pending",
+      deliveryMode: options.deliveryMode,
+      parentLeafId: options.parentLeafId,
     };
     pending.push(delivery);
     return delivery;
@@ -84,9 +102,11 @@ function createMockManager(run?: unknown) {
 
 function createMockPi(): MockPi {
   const calls: MockPi["_calls"] = [];
+  const options: unknown[] = [];
   const handlers = new Map<string, Array<() => void>>();
   const obj = {
-    sendMessage(msg: unknown, _opts?: unknown) {
+    sendMessage(msg: unknown, opts?: unknown) {
+      options.push(opts);
       calls.push({
         content: (msg as { content?: string }).content ?? "",
         customType: (msg as { customType?: string }).customType,
@@ -102,6 +122,7 @@ function createMockPi(): MockPi {
     setActiveTools: () => {},
     reload: () => Promise.resolve(),
     _calls: calls,
+    _options: options,
     _emit: (event: string) => {
       for (const handler of handlers.get(event) ?? []) handler();
     },
@@ -204,6 +225,25 @@ describe("installResultDelivery", () => {
     assert.equal(manager.listPendingTerminalDeliveries("session-1").length, 1);
   });
 
+  it("leaves a no-trigger result pending when its captured session context is stale", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const session = createMockSessionManager("session-1", [], [{ id: "origin-leaf" }]);
+    manager._queue("completed before session replacement", {
+      deliveryMode: "no-trigger",
+      parentLeafId: "origin-leaf",
+    });
+    mod.installResultDelivery(pi, manager, session, {
+      isIdle: () => {
+        throw new Error("This extension context is stale");
+      },
+    });
+
+    assert.doesNotThrow(() => manager.emit("complete", { runId: "test-run-1" }));
+    assert.equal(pi._calls.length, 0);
+    assert.equal(manager.listPendingTerminalDeliveries("session-1").length, 1);
+  });
+
   it("does not deliver terminal records owned by another session", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
@@ -213,6 +253,113 @@ describe("installResultDelivery", () => {
     manager.emit("error", { runId: "test-run-1" });
 
     assert.equal(pi._calls.length, 0);
+  });
+
+  it("defers no-trigger delivery until idle and then appends without starting a turn", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const session = createMockSessionManager("session-1", [], [{ id: "origin-leaf" }]);
+    let idle = false;
+
+    mod.installResultDelivery(pi, manager, session, { isIdle: () => idle });
+    manager._queue("fork done", {
+      deliveryMode: "no-trigger",
+      parentLeafId: "origin-leaf",
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.equal(pi._calls.length, 0, "streaming parent sessions must not receive the result yet");
+
+    idle = true;
+    pi._emit("agent_settled");
+    assert.equal(pi._calls.length, 1);
+    assert.deepEqual(pi._options[0], { triggerTurn: false });
+  });
+
+  it("does not use command branch-navigation reconciliation for tool-started delivery", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    mod.installResultDelivery(pi, manager, createMockSessionManager());
+    manager._queue("ordinary workflow result");
+
+    pi._emit("session_tree");
+    assert.equal(pi._calls.length, 0);
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.equal(pi._calls.length, 1);
+    assert.deepEqual(pi._options[0], { triggerTurn: true, deliverAs: "followUp" });
+  });
+
+  it("keeps a no-trigger delivery pending on an unrelated tree branch", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const session = createMockSessionManager("session-1", [], [{ id: "other-branch" }]);
+    mod.installResultDelivery(pi, manager, session, { isIdle: () => true });
+    manager._queue("branch-private result", {
+      deliveryMode: "no-trigger",
+      parentLeafId: "origin-leaf",
+    });
+
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.equal(pi._calls.length, 0);
+    assert.equal(manager.listPendingTerminalDeliveries("session-1").length, 1);
+
+    session.branch.push({ id: "origin-leaf" });
+    pi._emit("session_tree");
+    assert.equal(pi._calls.length, 1, "returning to the originating branch reconciles before the next turn");
+  });
+
+  it("makes a no-trigger custom result part of the next manually initiated parent context", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+    const root = mkdtempSync(join(tmpdir(), "pi-dw-parent-context-"));
+    try {
+      const parent = SessionManager.create(root, join(root, "sessions"));
+      parent.appendMessage({ role: "user", content: [{ type: "text", text: "shared parent task" }] } as Parameters<
+        typeof parent.appendMessage
+      >[0]);
+      const sharedLeaf = parent.getLeafId();
+      assert.ok(sharedLeaf);
+      parent.appendMessage({ role: "user", content: [{ type: "text", text: "originating branch" }] } as Parameters<
+        typeof parent.appendMessage
+      >[0]);
+      const originLeaf = parent.getLeafId();
+      assert.ok(originLeaf);
+      parent.branch(sharedLeaf);
+      parent.appendMessage({ role: "user", content: [{ type: "text", text: "unrelated branch" }] } as Parameters<
+        typeof parent.appendMessage
+      >[0]);
+
+      const pi = createMockPi();
+      const originalSend = pi.sendMessage.bind(pi);
+      pi.sendMessage = ((message: any, options?: unknown) => {
+        parent.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+        originalSend(message, options);
+      }) as typeof pi.sendMessage;
+      const manager = createMockManager(makeRun());
+      manager._queue("durable child result", {
+        sessionId: parent.getSessionId(),
+        deliveryMode: "no-trigger",
+        parentLeafId: originLeaf,
+      });
+
+      mod.installResultDelivery(pi, manager, parent as unknown as MockSessionManager, { isIdle: () => true });
+      manager.emit("complete", { runId: "test-run-1" });
+      assert.equal(pi._calls.length, 0, "the result stays off the unrelated branch");
+
+      parent.branch(originLeaf);
+      pi._emit("session_tree");
+      parent.appendMessage({ role: "user", content: [{ type: "text", text: "my next manual turn" }] } as Parameters<
+        typeof parent.appendMessage
+      >[0]);
+
+      const context = JSON.stringify(parent.buildSessionContext().messages);
+      assert.match(context, /durable child result/);
+      assert.match(context, /my next manual turn/);
+      assert.deepEqual(pi._options[0], { triggerTurn: false });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("requeues an uncertain in-memory delivery when the session binding reloads", () => {
@@ -268,6 +415,43 @@ describe("installResultDelivery", () => {
           "pending",
           "enqueueing is not proof that Pi persisted the message",
         );
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("redelivers a branch-affine no-trigger result after manager restart", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { WorkflowManager } = await import("../src/workflow-manager.js");
+    const { withFakeHomeAsync } = await import("./helpers/fake-home.js");
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-command-delivery-"));
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        const delivery: Delivery = {
+          runId: "command-restart-run",
+          deliveryId: "command-restart-run:completed",
+          sessionId: "session-1",
+          content: "durable fork completion",
+          state: "pending",
+          deliveryMode: "no-trigger",
+          parentLeafId: "origin-leaf",
+        };
+        const original = new WorkflowManager({ cwd, sessionId: "session-1" });
+        original.getPersistence().save(persistedRun(delivery));
+
+        const restarted = new WorkflowManager({ cwd, sessionId: "session-1" });
+        const pi = createMockPi();
+        mod.installResultDelivery(pi, restarted, createMockSessionManager("session-1", [], [{ id: "origin-leaf" }]), {
+          isIdle: () => true,
+        });
+
+        assert.equal(pi._calls[0]?.content, "durable fork completion");
+        assert.deepEqual(pi._options[0], { triggerTurn: false });
       });
     } finally {
       rmSync(cwd, { recursive: true, force: true });

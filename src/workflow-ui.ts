@@ -186,6 +186,7 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       history: a.history,
       model: a.model,
       thinking: a.thinking,
+      sessionPath: a.sessionPath,
     })),
     agentCount: p.agents.filter(isAgentStep).length,
     runningCount: p.agents.filter((a) => isAgentStep(a) && a.status === "running").length,
@@ -360,6 +361,7 @@ export function renderNavigator(
       body.push(dim("Status: ") + (a.status ?? ""));
       if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
       if (a.thinking) body.push(dim("Thinking: ") + a.thinking);
+      if (a.sessionPath) body.push(dim("Session: ") + a.sessionPath);
       if (a.error) body.push(dim("Error: ") + a.error);
       if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
       body.push("", dim("Prompt:"));

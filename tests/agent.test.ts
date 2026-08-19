@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
@@ -15,6 +17,7 @@ import {
 } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
+import { acquireSessionWriterLease } from "../src/session-writer-lease.js";
 import { runWorkflow } from "../src/workflow.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
@@ -902,10 +905,10 @@ test("forkSessionForSubagent throws a recoverable WorkflowError for a missing fi
   );
 });
 
-test("resolveSubagentSession defaults to an in-memory temp session", () => {
+test("resolveSubagentSession defaults to an in-memory temp session", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-matrix-"));
   try {
-    const { sessionManager, cleanup } = resolveSubagentSession({}, root);
+    const { sessionManager, cleanup } = await resolveSubagentSession({}, root);
     try {
       assert.equal(sessionManager.isPersisted(), false);
       assert.equal(sessionManager.getSessionFile(), undefined);
@@ -917,11 +920,11 @@ test("resolveSubagentSession defaults to an in-memory temp session", () => {
   }
 });
 
-test("resolveSubagentSession creates and continues a persisted sessionPath", () => {
+test("resolveSubagentSession creates and continues a persisted sessionPath", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-matrix-"));
   try {
     const target = join(root, "persisted.jsonl");
-    const first = resolveSubagentSession({ sessionPath: target }, root);
+    const first = await resolveSubagentSession({ sessionPath: target }, root);
     try {
       assert.equal(first.sessionManager.isPersisted(), true);
       assert.equal(first.sessionManager.getSessionFile(), target);
@@ -939,7 +942,7 @@ test("resolveSubagentSession creates and continues a persisted sessionPath", () 
       first.cleanup();
     }
 
-    const second = resolveSubagentSession({ sessionPath: target }, root);
+    const second = await resolveSubagentSession({ sessionPath: target }, root);
     try {
       const text = JSON.stringify(second.sessionManager.buildSessionContext().messages);
       assert.ok(text.includes("persist me"), "existing sessionPath is continued");
@@ -951,7 +954,197 @@ test("resolveSubagentSession creates and continues a persisted sessionPath", () 
   }
 });
 
-test("resolveSubagentSession can fork into a new persistent sessionPath", () => {
+test("persistent session writers queue at the session-opening boundary and waiting is abortable", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-writer-"));
+  try {
+    const target = join(root, "shared.jsonl");
+    const first = await resolveSubagentSession({ sessionPath: target }, root);
+    try {
+      let secondSettled = false;
+      const secondPromise = resolveSubagentSession({ sessionPath: target }, root).finally(() => {
+        secondSettled = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(secondSettled, false, "a same-process contender waits instead of opening or rejecting");
+
+      const controller = new AbortController();
+      const aborted = resolveSubagentSession({ sessionPath: target }, root, controller.signal);
+      controller.abort();
+      await assert.rejects(aborted, (error: unknown) => (error as Error).name === "AbortError");
+
+      first.cleanup();
+      const second = await secondPromise;
+      second.cleanup();
+    } finally {
+      first.cleanup();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable live session-writer lock is never stolen", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-unreadable-writer-"));
+  const target = join(root, "shared.jsonl");
+  const lockRoot = join(
+    tmpdir(),
+    `pi-dynamic-workflows-${typeof process.getuid === "function" ? process.getuid() : (process.env.USER ?? "default")}`,
+    "session-locks",
+  );
+  const findOwnedLock = (directory: string): string | undefined => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        const nested = findOwnedLock(path);
+        if (nested) return nested;
+        continue;
+      }
+      try {
+        const value = JSON.parse(readFileSync(path, "utf8")) as { sessionPath?: string; pid?: number };
+        if (value.sessionPath === resolve(target) && value.pid === process.pid) return path;
+      } catch {
+        // Other lock users may be publishing or removing unrelated files.
+      }
+    }
+    return undefined;
+  };
+
+  const first = await acquireSessionWriterLease(target);
+  let ownedLock: string | undefined;
+  try {
+    ownedLock = findOwnedLock(lockRoot);
+    assert.ok(ownedLock, "the acquired lease should publish its ownership");
+    writeFileSync(ownedLock, "");
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 75);
+    try {
+      await assert.rejects(
+        acquireSessionWriterLease(target, controller.signal).then((lease) => lease.release()),
+        (error: unknown) => (error as Error).name === "AbortError",
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  } finally {
+    first.release();
+    if (ownedLock) rmSync(ownedLock, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("persistent session writer exclusion is cross-process", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-cross-process-writer-"));
+  const target = join(root, "shared.jsonl");
+  const moduleUrl = new URL("../src/agent.ts", import.meta.url).href;
+  const runChild = async (script: string) => {
+    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += String(chunk)));
+    child.stderr.on("data", (chunk) => (stderr += String(chunk)));
+    const [code] = (await once(child, "close")) as [number];
+    assert.equal(code, 0, stderr);
+    return stdout.trim();
+  };
+  const runContender = (abortAfterMs?: number) =>
+    runChild(`
+      import { resolveSubagentSession } from ${JSON.stringify(moduleUrl)};
+      const controller = new AbortController();
+      ${abortAfterMs ? `setTimeout(() => controller.abort(), ${abortAfterMs});` : ""}
+      try {
+        const owned = await resolveSubagentSession(
+          { sessionPath: ${JSON.stringify(target)} },
+          ${JSON.stringify(root)},
+          ${abortAfterMs ? "controller.signal" : "undefined"}
+        );
+        owned.cleanup();
+        console.log("acquired");
+      } catch (error) {
+        if (error?.name !== "AbortError") throw error;
+        console.log("blocked");
+      }
+    `);
+  const runCriticalContender = () =>
+    runChild(`
+      import { rmSync, writeFileSync } from "node:fs";
+      import { setTimeout as delay } from "node:timers/promises";
+      import { resolveSubagentSession } from ${JSON.stringify(moduleUrl)};
+      const criticalPath = ${JSON.stringify(join(root, "critical-section"))};
+      const owned = await resolveSubagentSession(
+        { sessionPath: ${JSON.stringify(target)} },
+        ${JSON.stringify(root)}
+      );
+      let entered = false;
+      try {
+        writeFileSync(criticalPath, String(process.pid), { flag: "wx" });
+        entered = true;
+        await delay(100);
+        console.log("acquired");
+      } finally {
+        if (entered) rmSync(criticalPath, { force: true });
+        owned.cleanup();
+      }
+    `);
+
+  let crashedOwner: ReturnType<typeof spawn> | undefined;
+  try {
+    const first = await resolveSubagentSession({ sessionPath: target }, root);
+    try {
+      assert.equal(await runContender(100), "blocked", "another process cannot open while the owner is live");
+    } finally {
+      first.cleanup();
+    }
+    assert.equal(await runContender(), "acquired", "a queued process can open after release");
+
+    crashedOwner = spawn(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        `
+          import { resolveSubagentSession } from ${JSON.stringify(moduleUrl)};
+          await resolveSubagentSession({ sessionPath: ${JSON.stringify(target)} }, ${JSON.stringify(root)});
+          console.log("owned");
+          setInterval(() => {}, 1_000);
+        `,
+      ],
+      { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let crashedStderr = "";
+    crashedOwner.stderr.on("data", (chunk) => (crashedStderr += String(chunk)));
+    await new Promise<void>((resolveOwned, rejectOwned) => {
+      const timer = setTimeout(() => rejectOwned(new Error(`owner did not acquire lease: ${crashedStderr}`)), 2_000);
+      crashedOwner.stdout.on("data", (chunk) => {
+        if (!String(chunk).includes("owned")) return;
+        clearTimeout(timer);
+        resolveOwned();
+      });
+      crashedOwner.once("error", rejectOwned);
+    });
+    crashedOwner.kill("SIGKILL");
+    await once(crashedOwner, "close");
+
+    assert.deepEqual(
+      (await Promise.all([runCriticalContender(), runCriticalContender()])).sort(),
+      ["acquired", "acquired"],
+      "contenders recover a dead owner without overlapping",
+    );
+  } finally {
+    if (crashedOwner?.exitCode === null && crashedOwner.signalCode === null) {
+      crashedOwner.kill("SIGKILL");
+      await once(crashedOwner, "close").catch(() => {});
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveSubagentSession can fork into a new persistent sessionPath", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-matrix-"));
   try {
     const sourceDir = join(root, "source");
@@ -970,7 +1163,7 @@ test("resolveSubagentSession can fork into a new persistent sessionPath", () => 
     const sourceBytes = readFileSync(sourcePath as string, "utf-8");
 
     const target = join(root, "child.jsonl");
-    const fork = resolveSubagentSession({ forkFrom: sourcePath as string, sessionPath: target }, root);
+    const fork = await resolveSubagentSession({ forkFrom: sourcePath as string, sessionPath: target }, root);
     try {
       assert.equal(fork.sessionManager.getSessionFile(), target);
       assert.equal(existsSync(target), true, "fork is persisted at the requested path immediately");
@@ -985,7 +1178,7 @@ test("resolveSubagentSession can fork into a new persistent sessionPath", () => 
   }
 });
 
-test("resolveSubagentSession rejects forkFrom + existing sessionPath", () => {
+test("resolveSubagentSession rejects forkFrom + existing sessionPath", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-matrix-"));
   try {
     const sourceDir = join(root, "source");
@@ -1003,7 +1196,7 @@ test("resolveSubagentSession rejects forkFrom + existing sessionPath", () => {
     assert.ok(sourcePath);
 
     const target = join(root, "existing.jsonl");
-    const existing = resolveSubagentSession({ sessionPath: target }, root);
+    const existing = await resolveSubagentSession({ sessionPath: target }, root);
     existing.sessionManager.appendMessage({
       role: "user",
       content: [{ type: "text", text: "existing" }],
@@ -1015,8 +1208,8 @@ test("resolveSubagentSession rejects forkFrom + existing sessionPath", () => {
     } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
     existing.cleanup();
 
-    assert.throws(
-      () => resolveSubagentSession({ forkFrom: sourcePath as string, sessionPath: target }, root),
+    await assert.rejects(
+      resolveSubagentSession({ forkFrom: sourcePath as string, sessionPath: target }, root),
       (err: unknown) => {
         assert.ok(err instanceof WorkflowError);
         assert.equal(err.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);

@@ -5,6 +5,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentHistoryEntry } from "./agent-history.js";
+import type { ConversationForkState } from "./conversation-fork.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { JournalEntry, PendingCheckpoint } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
@@ -34,6 +35,8 @@ export interface PersistedAgentState {
   model?: string;
   /** Reasoning effort requested for this agent, when the script set one. */
   thinking?: string;
+  /** Absolute persistent Pi session path used by this agent, when configured. */
+  sessionPath?: string;
 }
 
 export interface PersistedRunError {
@@ -70,6 +73,10 @@ export interface TerminalDelivery {
   sessionId?: string;
   content: string;
   state: "pending" | "delivered";
+  /** Undefined preserves the existing workflow-tool delivery contract. */
+  deliveryMode?: "no-trigger";
+  /** Required ancestor of the active parent branch for no-trigger delivery. */
+  parentLeafId?: string | null;
 }
 
 export interface PersistedRunState {
@@ -121,6 +128,8 @@ export interface PersistedRunState {
   journal?: JournalEntry[];
   /** Durable outbox records for terminal notifications. */
   terminalDeliveries?: TerminalDelivery[];
+  /** Command-started persistent conversation fork/continuation metadata. */
+  conversationFork?: ConversationForkState;
 }
 
 export interface RunPersistence {

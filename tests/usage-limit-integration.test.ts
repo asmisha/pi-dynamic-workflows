@@ -9,12 +9,18 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { DefaultResourceLoader, defineTool, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import {
+  DefaultResourceLoader,
+  defineTool,
+  getAgentDir,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type AgentUsage, WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
@@ -60,6 +66,7 @@ async function withFauxSession(
     setResponses: (msgs: unknown[]) => void;
     modelRegistry: import("@earendil-works/pi-coding-agent").ModelRegistry;
     anthropicCallCount: () => number;
+    deepseekCallCount: () => number;
     fauxAssistantMessage: typeof import("@earendil-works/pi-ai").fauxAssistantMessage;
     fauxToolCall: typeof import("@earendil-works/pi-ai").fauxToolCall;
   }) => Promise<void>,
@@ -85,8 +92,14 @@ async function withFauxSession(
   const faux = registerFauxProvider({
     provider: "deepseek",
     models: [
-      { id: "faux-deepseek", name: "Faux DeepSeek", contextWindow: 128000, maxTokens: 4096 },
-      { id: "faux-deepseek-fallback", name: "Faux DeepSeek Fallback", contextWindow: 128000, maxTokens: 4096 },
+      { id: "faux-deepseek", name: "Faux DeepSeek", contextWindow: 128000, maxTokens: 4096, reasoning: true },
+      {
+        id: "faux-deepseek-fallback",
+        name: "Faux DeepSeek Fallback",
+        contextWindow: 128000,
+        maxTokens: 4096,
+        reasoning: true,
+      },
     ],
   });
   mkdirSync(agentDir, { recursive: true });
@@ -119,6 +132,7 @@ async function withFauxSession(
         fallbackModel: faux.getModel("faux-deepseek-fallback"),
         setResponses: (msgs) => faux.setResponses(msgs as never),
         anthropicCallCount: () => anthropicFaux.state.callCount,
+        deepseekCallCount: () => faux.state.callCount,
         fauxAssistantMessage,
         fauxToolCall,
       }),
@@ -138,6 +152,170 @@ async function withFauxSession(
     rmSync(cwd, { recursive: true, force: true });
   }
 }
+
+test("command conversation forks and continuations use the real persistent createAgentSession path", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
+    const parent = SessionManager.create(cwd, join(cwd, "parent-session"));
+    parent.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "inherited parent request" }],
+    } as Parameters<SessionManager["appendMessage"]>[0]);
+    parent.appendMessage(
+      fauxAssistantMessage("inherited parent answer", { stopReason: "stop" }) as Parameters<
+        SessionManager["appendMessage"]
+      >[0],
+    );
+    const parentPath = parent.getSessionFile();
+    assert.ok(parentPath);
+    const parentBefore = readFileSync(parentPath, "utf8");
+    const currentModel = model as { provider: string; id: string };
+
+    const manager = new WorkflowManager({
+      cwd,
+      sessionId: parent.getSessionId(),
+      modelRegistry,
+      mainModel: "anthropic/faux-anthropic",
+    });
+    setResponses([fauxAssistantMessage("first persistent answer", { stopReason: "stop" })]);
+    const fork = await manager.startConversationFork({
+      task: "perform the first explicit task",
+      parentSession: parent,
+      model: { provider: currentModel.provider, id: currentModel.id },
+      thinkingLevel: "high",
+    });
+    const firstResult = await fork.promise;
+    assert.equal(firstResult.result, "first persistent answer");
+    assert.equal(readFileSync(parentPath, "utf8"), parentBefore);
+
+    setResponses([fauxAssistantMessage("continued persistent answer", { stopReason: "stop" })]);
+    const continuation = manager.continueConversationFork({
+      sourceRunId: fork.runId,
+      instruction: "perform the follow-up task",
+      parentSession: parent,
+    });
+    const secondResult = await continuation.promise;
+    assert.equal(secondResult.result, "continued persistent answer");
+    assert.notEqual(continuation.runId, fork.runId);
+    assert.equal(continuation.sessionPath, fork.sessionPath);
+
+    const child = SessionManager.open(fork.sessionPath, undefined, cwd);
+    const transcript = JSON.stringify(child.buildSessionContext().messages);
+    assert.match(transcript, /inherited parent request/);
+    assert.match(transcript, /perform the first explicit task/);
+    assert.match(transcript, /first persistent answer/);
+    assert.match(transcript, /perform the follow-up task/);
+    assert.match(transcript, /continued persistent answer/);
+    assert.equal(child.buildSessionContext().model?.provider, currentModel.provider);
+    assert.equal(child.buildSessionContext().thinkingLevel, "high");
+  }));
+
+test("an empty-parent command fork uses the parent model and thinking settings", () =>
+  withFauxSession(
+    async ({
+      cwd,
+      modelRegistry,
+      model,
+      setResponses,
+      anthropicCallCount,
+      deepseekCallCount,
+      fauxAssistantMessage,
+    }) => {
+      const parent = SessionManager.create(cwd, join(cwd, "empty-parent-session"));
+      const currentModel = model as { provider: string; id: string };
+      const manager = new WorkflowManager({ cwd, sessionId: parent.getSessionId(), modelRegistry });
+      setResponses([fauxAssistantMessage("empty-parent fork answer", { stopReason: "stop" })]);
+
+      const fork = await manager.startConversationFork({
+        task: "run from an empty parent branch",
+        parentSession: parent,
+        model: { provider: currentModel.provider, id: currentModel.id },
+        thinkingLevel: "high",
+      });
+      await fork.promise;
+
+      assert.equal(deepseekCallCount(), 1, "the command-time parent model executes the initial child turn");
+      assert.equal(anthropicCallCount(), 0, "global provider ordering must not replace the parent model");
+      const child = SessionManager.open(fork.sessionPath, undefined, cwd).buildSessionContext();
+      assert.equal(child.model?.provider, currentModel.provider);
+      assert.equal(child.thinkingLevel, "high");
+    },
+  ));
+
+test("stop then continue queues at the child session until the first AgentSession finishes cleanup", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, deepseekCallCount, fauxAssistantMessage }) => {
+    let announceShutdown!: () => void;
+    const shutdownStarted = new Promise<void>((resolve) => {
+      announceShutdown = resolve;
+    });
+    let allowShutdown!: () => void;
+    const shutdownGate = new Promise<void>((resolve) => {
+      allowShutdown = resolve;
+    });
+    let shutdownCount = 0;
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          pi.on("session_shutdown", async () => {
+            shutdownCount++;
+            if (shutdownCount !== 1) return;
+            announceShutdown();
+            await shutdownGate;
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([
+      fauxAssistantMessage("first child answer", { stopReason: "stop" }),
+      fauxAssistantMessage("continued child answer", { stopReason: "stop" }),
+    ]);
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { resourceLoader } });
+    const parent = SessionManager.create(cwd, join(cwd, "writer-window-parent"));
+    parent.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "parent context" }],
+    } as Parameters<SessionManager["appendMessage"]>[0]);
+    const currentModel = model as { provider: string; id: string };
+    const manager = new WorkflowManager({ cwd, sessionId: parent.getSessionId(), modelRegistry, agent });
+    const first = await manager.startConversationFork({
+      task: "first task",
+      parentSession: parent,
+      model: { provider: currentModel.provider, id: currentModel.id },
+      thinkingLevel: "high",
+    });
+
+    await shutdownStarted;
+    assert.equal(deepseekCallCount(), 1);
+    assert.equal(manager.stop(first.runId), true);
+    const continuation = manager.continueConversationFork({
+      sourceRunId: first.runId,
+      instruction: "continue immediately after stop",
+      parentSession: parent,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      deepseekCallCount(),
+      1,
+      "the continuation cannot reach its provider while the earlier AgentSession can still append during shutdown",
+    );
+
+    allowShutdown();
+    await first.promise.catch(() => undefined);
+    const result = await continuation.promise;
+    assert.equal(result.result, "continued child answer");
+    assert.equal(deepseekCallCount(), 2);
+    assert.equal(shutdownCount, 2);
+    const transcript = JSON.stringify(
+      SessionManager.open(first.sessionPath, undefined, cwd).buildSessionContext().messages,
+    );
+    assert.match(transcript, /first child answer/);
+    assert.match(transcript, /continued child answer/);
+  }));
 
 test("a real subagent session that hits a usage limit surfaces PROVIDER_USAGE_LIMIT (not SCHEMA_NONCOMPLIANCE/EMPTY)", () =>
   withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {

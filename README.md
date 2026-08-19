@@ -112,6 +112,9 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows pause|resume|retry|stop|rm <id>
 /workflows run <prompt>     force a dynamic workflow from <prompt> on demand;
                             the run shows in the panel + /workflows.
+/workflows fork <task>      persist the active conversation branch and run <task> in the child
+/workflows continue <id> <instruction>
+                            continue a terminal fork run on its saved child session with a new run ID
 /workflows-progress compact|detailed|status
                             switch the live panel between the compact one-liner and the detailed
                             per-phase/per-agent view (with tokens, cost, and a live tok/s rate)
@@ -125,7 +128,7 @@ In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · 
 
 ## Storage
 
-Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; project-scoped run history, resume journals, and locks live under `~/.pi/workflows/projects/<project>/`. Older project-local `.pi/workflows/runs` data is still read as a fallback. Saved-workflow JSON is intentionally neither read nor mutated.
+Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; persistent fork sessions live under `~/.pi/workflows/sessions/`; project-scoped run history, resume journals, and locks live under `~/.pi/workflows/projects/<project>/`. Removing a run does not delete its child session. Older project-local `.pi/workflows/runs` data is still read as a fallback. Saved-workflow JSON is intentionally neither read nor mutated.
 
 ## Reference
 
@@ -158,7 +161,7 @@ The essentials:
 
 A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. The host `workflow({ resumeRunId: "...", reply: ... })` tool call validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. Workflows may pause at multiple sequential checkpoints; each reply continues the same run until the next checkpoint or completion. `/workflows resume` is for paused/interrupted runs; `/workflows retry` is for runs paused by retryable agent failures. Ordinary failed runs remain terminal.
 
-Subagent sessions are temporary by default. Use `sessionPath` only when a reviewer/worker should keep context across runs; use `forkFrom` when it should start from an existing Pi conversation. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle applies normally.
+Subagent sessions are temporary by default. Use `sessionPath` only when a reviewer/worker should keep context across runs; use `forkFrom` when it should start from an existing Pi conversation. Persistent-session writers are serialized across runs and processes, so a second writer waits until the current AgentSession finishes cleanup. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle applies normally.
 
 By default, workflows do not set a per-agent hard timeout. Use the `workflow` tool's `agentTimeoutMs` or per-agent `timeoutMs` only when you want an explicit time bound. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 

@@ -104,6 +104,7 @@ export function installResultDelivery(
   pi: ExtensionAPI,
   manager: WorkflowManager,
   sessionManager: DeliverySessionManager,
+  options: { isIdle?: () => boolean } = {},
 ): void {
   // Mutable holder on manager so shared across re-calls (e.g. session_start after /reload).
   const m = manager as unknown as {
@@ -112,12 +113,13 @@ export function installResultDelivery(
       pi: ExtensionAPI;
       sessionManager: DeliverySessionManager;
       sessionId: string;
+      isIdle: () => boolean;
       queuedDeliveryIds: Set<string>;
     };
   };
   const sessionId = sessionManager.getSessionId();
 
-  const reconcile = () => {
+  const reconcile = (options: { noTriggerOnly?: boolean } = {}) => {
     const holder = m.__holder;
     if (!holder) return;
 
@@ -135,10 +137,27 @@ export function installResultDelivery(
     }
 
     for (const delivery of pending) {
+      if (options.noTriggerOnly && delivery.deliveryMode !== "no-trigger") continue;
       if (deliveredIds.has(delivery.deliveryId)) {
         manager.markTerminalDeliveryDelivered(delivery.runId, delivery.deliveryId);
         holder.queuedDeliveryIds.delete(delivery.deliveryId);
         continue;
+      }
+      if (delivery.deliveryMode === "no-trigger") {
+        try {
+          if (!holder.isIdle()) continue;
+        } catch {
+          // A replaced Pi session invalidates its old ExtensionContext. Leave the
+          // durable record pending for reconciliation when that session is opened again.
+          continue;
+        }
+        if (delivery.parentLeafId !== null && delivery.parentLeafId !== undefined) {
+          try {
+            if (!holder.sessionManager.getBranch().some((entry) => entry.id === delivery.parentLeafId)) continue;
+          } catch {
+            continue;
+          }
+        }
       }
       if (holder.queuedDeliveryIds.has(delivery.deliveryId)) continue;
 
@@ -151,7 +170,9 @@ export function installResultDelivery(
             display: true,
             details: { runId: delivery.runId, deliveryId: delivery.deliveryId },
           },
-          { triggerTurn: true, deliverAs: "followUp" },
+          delivery.deliveryMode === "no-trigger"
+            ? { triggerTurn: false }
+            : { triggerTurn: true, deliverAs: "followUp" },
         );
       } catch {
         holder.queuedDeliveryIds.delete(delivery.deliveryId);
@@ -167,12 +188,19 @@ export function installResultDelivery(
       m.__holder.pi = pi;
       m.__holder.sessionManager = sessionManager;
       m.__holder.sessionId = sessionId;
+      m.__holder.isIdle = options.isIdle ?? (() => true);
     }
     reconcile();
     return;
   }
   m.__deliveryInstalled = true;
-  m.__holder = { pi, sessionManager, sessionId, queuedDeliveryIds: new Set() };
+  m.__holder = {
+    pi,
+    sessionManager,
+    sessionId,
+    isIdle: options.isIdle ?? (() => true),
+    queuedDeliveryIds: new Set(),
+  };
 
   const deliverTransient = (runId: string, content: string) => {
     if (!manager.isRunInCurrentSession(runId)) return;
@@ -191,13 +219,16 @@ export function installResultDelivery(
     `${prompt}\n\n` +
     `The run stays paused until a reply continues the same run with workflow({resumeRunId: "${runId}", reply}).`;
 
-  manager.on("complete", reconcile);
-  manager.on("error", reconcile);
-  manager.on("stopped", reconcile);
+  manager.on("complete", () => reconcile());
+  manager.on("error", () => reconcile());
+  manager.on("stopped", () => reconcile());
   pi.on("agent_settled", () => {
     m.__holder?.queuedDeliveryIds.clear();
     reconcile();
   });
+  // Tree navigation happens before the next manual turn. Reconcile here so a
+  // branch-affine result is already in model context for that first turn.
+  pi.on("session_tree", () => reconcile({ noTriggerOnly: true }));
 
   // Durable checkpoints and provider limits both pause without failing. Deliver
   // the reason to the parent conversation so it can ask the user or explain resume.

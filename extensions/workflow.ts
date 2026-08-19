@@ -73,7 +73,7 @@ export default function extension(pi: ExtensionAPI) {
     manager.setSessionId(ctx.sessionManager.getSessionId());
     // Deliver terminal results through the run outbox and reconcile them against
     // the current session's append-only entries after restarts and settled turns.
-    installResultDelivery(pi, manager, ctx.sessionManager);
+    installResultDelivery(pi, manager, ctx.sessionManager, { isIdle: () => ctx.isIdle() });
     // Live "workflows running" panel below the input.
     installTaskPanel(pi, manager, ctx.ui, { loadSettings: () => loadWorkflowSettings({ cwd }) });
   });

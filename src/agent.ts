@@ -27,6 +27,7 @@ import {
 } from "./errors.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { createReadOnlyBashSession } from "./read-only-bash.js";
+import { acquireSessionWriterLease } from "./session-writer-lease.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 import { resolveWorkflowSessionPath } from "./workflow-paths.js";
 
@@ -489,10 +490,11 @@ export interface SubagentSessionSpec {
  *   - both, path exists    → validation error: refusing to clobber an existing
  *                            session with a fork (delete it or drop one arg)
  */
-export function resolveSubagentSession(
+export async function resolveSubagentSession(
   spec: SubagentSessionSpec,
   cwd: string,
-): { sessionManager: SessionManager; cleanup: () => void } {
+  signal?: AbortSignal,
+): Promise<{ sessionManager: SessionManager; cleanup: () => void }> {
   const noop = () => {};
   const target = spec.sessionPath ? resolveWorkflowSessionPath(spec.sessionPath) : undefined;
 
@@ -504,15 +506,17 @@ export function resolveSubagentSession(
   }
   if (!target) throw new Error("unreachable");
 
-  if (spec.forkFrom && existsSync(target)) {
-    throw new WorkflowError(
-      `Validation: sessionPath "${target}" already exists — cannot fork "${spec.forkFrom}" into an existing session. Continue it without forkFrom, or pick a new sessionPath.`,
-      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-      { recoverable: false },
-    );
-  }
-
+  const lease = await acquireSessionWriterLease(target, signal);
+  const cleanup = () => lease.release();
   try {
+    if (spec.forkFrom && existsSync(target)) {
+      throw new WorkflowError(
+        `Validation: sessionPath "${target}" already exists — cannot fork "${spec.forkFrom}" into an existing session. Continue it without forkFrom, or pick a new sessionPath.`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+
     mkdirSync(dirname(target), { recursive: true });
     if (spec.forkFrom) {
       // Fork writes a generated filename; move it onto the requested path.
@@ -520,18 +524,19 @@ export function resolveSubagentSession(
       const generated = forked.getSessionFile();
       if (generated && generated !== target) renameSync(generated, target);
       forked.setSessionFile(target);
-      return { sessionManager: forked, cleanup: noop };
+      return { sessionManager: forked, cleanup };
     }
     if (existsSync(target)) {
       // Continue the existing persisted session in the run's cwd.
-      return { sessionManager: SessionManager.open(target, undefined, cwd), cleanup: noop };
+      return { sessionManager: SessionManager.open(target, undefined, cwd), cleanup };
     }
     // New persisted session at the exact requested path (the SDK's --session flow:
     // create in the parent dir, then pin the explicit file path).
     const manager = SessionManager.create(cwd, dirname(target));
     manager.setSessionFile(target);
-    return { sessionManager: manager, cleanup: noop };
+    return { sessionManager: manager, cleanup };
   } catch (error) {
+    cleanup();
     if (error instanceof WorkflowError) throw error;
     throw new WorkflowError(
       `Cannot use sessionPath "${target}": ${error instanceof Error ? error.message : error}`,
@@ -584,6 +589,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * a warning is logged. When omitted, the session default applies.
    */
   model?: string;
+  /** Restore the model recorded in an existing session instead of applying default workflow routing. */
+  restoreSessionModel?: boolean;
   /**
    * Continue the same subagent session on this model when the primary model is
    * unavailable, unauthenticated, or reaches a provider usage limit. This is a
@@ -752,7 +759,7 @@ export class WorkflowAgent {
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = resolveAgentModelSpec(options, this.mainModel);
+    const modelSpec = options.restoreSessionModel ? undefined : resolveAgentModelSpec(options, this.mainModel);
 
     const fallbackSpec = options.fallbackModel?.trim();
     if (fallbackSpec && !modelSpec) {
@@ -799,7 +806,34 @@ export class WorkflowAgent {
     this.settingsManager ??= SettingsManager.create(this.cwd, agentDir);
     // Session source/persistence matrix: temp in-memory by default; forkFrom
     // inherits another session's context; sessionPath persists/continues one.
-    const forked = resolveSubagentSession({ forkFrom: options.forkFrom, sessionPath: options.sessionPath }, runCwd);
+    const forked = await resolveSubagentSession(
+      { forkFrom: options.forkFrom, sessionPath: options.sessionPath },
+      runCwd,
+      options.signal,
+    ).catch((error) => {
+      readOnlyBash?.cleanup();
+      throw error;
+    });
+    let restoredThinkingLevel: CreateAgentSessionOptions["thinkingLevel"];
+    try {
+      if (options.restoreSessionModel) {
+        const saved = forked.sessionManager.buildSessionContext();
+        const savedModel = saved.model
+          ? this.resolveModel(`${saved.model.provider}/${saved.model.modelId}`, options.modelRegistry)
+          : undefined;
+        if (savedModel && this.modelIsAvailable(savedModel, options.modelRegistry)) {
+          resolvedModel = savedModel;
+          options.onModelResolved?.(`${savedModel.provider}/${savedModel.id}`);
+        } else if (saved.model) {
+          options.onModelFallback?.(`${saved.model.provider}/${saved.model.modelId}`);
+        }
+        restoredThinkingLevel = saved.thinkingLevel as CreateAgentSessionOptions["thinkingLevel"];
+      }
+    } catch (error) {
+      readOnlyBash?.cleanup();
+      forked.cleanup();
+      throw error;
+    }
     const session = await (async () => {
       let createdSession: AgentSession | undefined;
       try {
@@ -819,7 +853,9 @@ export class WorkflowAgent {
           ...(resolvedModel ? { model: resolvedModel } : {}),
           // The SDK maps this level through the model's own thinking-level map
           // and clamps it to what that model supports.
-          ...(options.thinking ? { thinkingLevel: options.thinking } : {}),
+          ...(options.thinking || restoredThinkingLevel
+            ? { thinkingLevel: options.thinking ?? restoredThinkingLevel }
+            : {}),
           ...(options.readOnly ? { tools: readOnlyToolNames } : {}),
           ...(options.allowSubagents ? {} : { excludeTools: WORKFLOW_TOOL_NAMES }),
         });

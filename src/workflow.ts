@@ -91,6 +91,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   agent?: Pick<WorkflowAgent, "run">;
   /** The session's main model (provider/id), shown in /workflows for default agents. */
   mainModel?: string;
+  /** Internal: persistent conversation commands restore the model recorded in sessionPath. */
+  restoreAgentSessionModel?: boolean;
   /**
    * Named subagent definitions for `agent({ agentType })`. Snapshotted once per
    * run for determinism. Defaults to scanning `.pi/agents` (project) + `~/.pi/agents`.
@@ -139,6 +141,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     prompt: string;
     model?: string;
     thinking?: AgentThinkingLevel;
+    sessionPath?: string;
   }) => void;
   onAgentEnd?: (event: {
     callId: string;
@@ -614,6 +617,7 @@ export async function runWorkflow<T = unknown>(
         prompt,
         model: displayModel,
         thinking: agentOptions.thinking,
+        sessionPath: agentOptions.sessionPath,
       });
       options.onAgentEnd?.({
         callId,
@@ -634,6 +638,7 @@ export async function runWorkflow<T = unknown>(
         prompt,
         model: displayModel,
         thinking: agentOptions.thinking,
+        sessionPath: agentOptions.sessionPath,
       });
       const replayed = new WorkflowError(settledError.message, settledError.code, {
         recoverable: settledError.recoverable,
@@ -693,6 +698,7 @@ export async function runWorkflow<T = unknown>(
         prompt,
         model: displayModel,
         thinking: agentOptions.thinking,
+        sessionPath: agentOptions.sessionPath,
       });
 
       // Each retry attempt reports cumulative snapshots from zero. Keep its
@@ -750,6 +756,7 @@ export async function runWorkflow<T = unknown>(
               signal: attemptController.signal,
               instructions: buildAgentInstructions(meta, assignedPhase, agentOptions, agentDef),
               model: modelSpec,
+              restoreSessionModel: options.restoreAgentSessionModel,
               fallbackModel: agentOptions.fallbackModel,
               tier: agentOptions.tier,
               thinking: agentOptions.thinking,

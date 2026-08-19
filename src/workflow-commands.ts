@@ -19,9 +19,11 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | retry <id> | rm <id>";
+  "Usage: /workflows [list] | run <prompt> | fork <task> | continue <run-id> <instruction> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | retry <id> | rm <id>";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
+const FORK_USAGE = "Usage: /workflows fork <task>";
+const CONTINUE_USAGE = "Usage: /workflows continue <run-id> <instruction>";
 
 /** The exact name of the workflow tool that `/workflows run` forces. */
 export const WORKFLOW_TOOL_NAME = "workflow";
@@ -111,6 +113,7 @@ function renderPersistedStatus(run: PersistedRunState): string {
   }
   if (run.tokenUsage) lines.push(`  tokens: ${run.tokenUsage.total.toLocaleString()}`);
   if (run.durationMs) lines.push(`  duration: ${(run.durationMs / 1000).toFixed(1)}s`);
+  if (run.conversationFork) lines.push(`  child session: ${run.conversationFork.childSessionPath}`);
   return lines.join("\n");
 }
 
@@ -126,7 +129,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowMana
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/retry <id> | rm <id>",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | fork <task> | continue <run-id> <instruction> | status/stop/pause/resume/retry <id> | rm <id>",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
@@ -165,6 +168,51 @@ export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowMana
           }
           return;
         }
+        case "fork": {
+          const task = args
+            .trim()
+            .slice(parts[0]?.length ?? 0)
+            .trim();
+          if (!task) {
+            ctx.ui.notify(FORK_USAGE, "warning");
+            return;
+          }
+          try {
+            await ctx.waitForIdle();
+            const started = await manager.startConversationFork({
+              task,
+              parentSession: ctx.sessionManager,
+              model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+              thinkingLevel: ctx.thinkingLevel,
+            });
+            ctx.ui.notify(`Started ${started.runId}\nChild session: ${started.sessionPath}`, "info");
+          } catch (error) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          }
+          return;
+        }
+        case "continue": {
+          const instruction = args
+            .trim()
+            .replace(/^\S+\s+\S+\s*/, "")
+            .trim();
+          if (!id || !instruction) {
+            ctx.ui.notify(CONTINUE_USAGE, "warning");
+            return;
+          }
+          try {
+            await ctx.waitForIdle();
+            const started = manager.continueConversationFork({
+              sourceRunId: id,
+              instruction,
+              parentSession: ctx.sessionManager,
+            });
+            ctx.ui.notify(`Started ${started.runId}\nChild session: ${started.sessionPath}`, "info");
+          } catch (error) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          }
+          return;
+        }
         case "ui":
         case "list": {
           // Interactive navigator when a UI is available; plain text otherwise
@@ -194,12 +242,23 @@ export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowMana
           // A running run streams live progress to the status bar and prints the
           // final snapshot when it finishes — no need to re-run the command.
           if (watchRun(manager, pi, ctx, id)) {
-            ctx.ui.notify(`Watching ${id} — live progress in the status bar; result prints when it finishes.`, "info");
+            const sessionPath = manager.getRun(id)?.conversationFork?.childSessionPath;
+            ctx.ui.notify(
+              `Watching ${id} — live progress in the status bar; result prints when it finishes.${
+                sessionPath ? `\nChild session: ${sessionPath}` : ""
+              }`,
+              "info",
+            );
             return;
           }
           const live = manager.getSnapshot(id);
           if (live) {
-            await print(renderWorkflowText(recomputeWorkflowSnapshot(live), false));
+            const sessionPath = manager.getRun(id)?.conversationFork?.childSessionPath;
+            await print(
+              `${renderWorkflowText(recomputeWorkflowSnapshot(live), false)}${
+                sessionPath ? `\nChild session: ${sessionPath}` : ""
+              }`,
+            );
             return;
           }
           const run = manager.listRuns().find((r) => r.runId === id);

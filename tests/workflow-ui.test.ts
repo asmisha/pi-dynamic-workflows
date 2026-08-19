@@ -23,6 +23,7 @@ function fakeManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
         resultPreview: "found 2",
         tokens: 100,
         model: "fast-llm/model",
+        sessionPath: "/tmp/workflow-child.jsonl",
       },
       {
         id: 2,
@@ -412,6 +413,7 @@ test("renderNavigator shows agent detail view", () => {
   assert.match(text, /Status:/);
   assert.match(text, /Model:/);
   assert.match(text, /model/); // shortModel strips provider prefix
+  assert.match(text, /Session: \/tmp\/workflow-child\.jsonl/);
   assert.match(text, /j\/k scroll/); // detail view footer
 });
 

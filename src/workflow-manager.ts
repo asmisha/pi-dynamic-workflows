@@ -3,8 +3,16 @@
  */
 
 import { EventEmitter } from "node:events";
+import { existsSync, unlinkSync } from "node:fs";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
+import {
+  buildConversationForkScript,
+  type ConversationForkState,
+  conversationForkDeliveryText,
+  type ParentSessionSnapshotSource,
+  snapshotActiveConversationBranch,
+} from "./conversation-fork.js";
 import { preview, resolveWorkflowFailureLocation, shorten, type WorkflowSnapshot } from "./display.js";
 import { errorStack, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import {
@@ -28,6 +36,7 @@ import {
   type WorkflowModuleDefinition,
   type WorkflowRunResult,
 } from "./workflow.js";
+import { resolveWorkflowSessionPath } from "./workflow-paths.js";
 
 /**
  * Display name for a run: meta.name plus the launcher-supplied `args.name`
@@ -82,10 +91,11 @@ function appendTerminalDelivery(
   status: "completed" | "failed" | "aborted",
   sessionId: string | undefined,
   content: string,
+  options: Pick<TerminalDelivery, "deliveryMode" | "parentLeafId"> = {},
 ): TerminalDelivery[] {
   const deliveryId = terminalDeliveryId(runId, status);
   if (deliveries?.some((delivery) => delivery.deliveryId === deliveryId)) return deliveries;
-  return [...(deliveries ?? []), { deliveryId, sessionId, content, state: "pending" }];
+  return [...(deliveries ?? []), { deliveryId, sessionId, content, state: "pending", ...options }];
 }
 
 function retryableAgentFailureState(
@@ -138,6 +148,8 @@ export interface ManagedRun {
   journal: JournalEntry[];
   /** Durable outbox records created before terminal events are emitted. */
   terminalDeliveries?: TerminalDelivery[];
+  /** Command-started persistent conversation fork/continuation metadata. */
+  conversationFork?: ConversationForkState;
   /** Cross-process execution lease for this run, when it is actively executing. */
   lease?: RunLease;
   /** Durable checkpoint currently awaiting a reply from the parent conversation. */
@@ -170,6 +182,8 @@ export interface ExecOptions {
   resumeJournal?: Map<number, JournalEntry>;
   /** Retry these failed structural agent calls while replaying successful siblings. */
   retryFailedCallIds?: Set<string>;
+  /** Command-started persistent conversation metadata for this execution. */
+  conversationFork?: ConversationForkState;
   /** Cumulative token usage already recorded for the replayed prefix. */
   initialTokenUsage?: PersistedRunState["tokenUsage"];
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
@@ -186,6 +200,19 @@ export interface ExecOptions {
 
 export interface PendingTerminalDelivery extends TerminalDelivery {
   runId: string;
+}
+
+export interface StartConversationForkOptions {
+  task: string;
+  parentSession: ParentSessionSnapshotSource;
+  model?: { provider: string; id: string };
+  thinkingLevel?: string;
+}
+
+export interface ContinueConversationForkOptions {
+  sourceRunId: string;
+  instruction: string;
+  parentSession: Pick<ParentSessionSnapshotSource, "getLeafId" | "getSessionId">;
 }
 
 export interface WorkflowManagerOptions {
@@ -313,6 +340,84 @@ export class WorkflowManager extends EventEmitter {
     return this.modelRegistry;
   }
 
+  /** Start a persistent child conversation from the parent's active branch. */
+  async startConversationFork(options: StartConversationForkOptions): Promise<{
+    runId: string;
+    sessionPath: string;
+    promise: Promise<WorkflowRunResult>;
+  }> {
+    if (!this.ownsCurrentSession(options.parentSession.getSessionId())) {
+      throw new Error("Cannot fork a parent session that is not currently bound to this workflow manager");
+    }
+    const runId = generateRunId();
+    const sessionPath = resolveWorkflowSessionPath(`fork-${runId}`);
+    const conversationFork: ConversationForkState = {
+      command: "fork",
+      childSessionPath: sessionPath,
+      task: options.task,
+      parentLeafId: options.parentSession.getLeafId(),
+    };
+    await snapshotActiveConversationBranch(options.parentSession, sessionPath, {
+      cwd: this.cwd,
+      model: options.model,
+      thinkingLevel: options.thinkingLevel,
+    });
+    try {
+      const started = this.startInBackgroundWithId(
+        runId,
+        buildConversationForkScript(conversationFork),
+        { name: options.task.slice(0, 80) },
+        { conversationFork },
+      );
+      return { ...started, sessionPath };
+    } catch (error) {
+      try {
+        unlinkSync(sessionPath);
+      } catch {
+        // The command created this path and no run owns it when launch fails.
+      }
+      throw error;
+    }
+  }
+
+  /** Continue a terminal command-started run on its saved child session. */
+  continueConversationFork(options: ContinueConversationForkOptions): {
+    runId: string;
+    sessionPath: string;
+    promise: Promise<WorkflowRunResult>;
+  } {
+    if (!isValidRunId(options.sourceRunId)) {
+      throw new Error(`Invalid workflow run ID: ${options.sourceRunId}`);
+    }
+    const source = this.persistence.load(options.sourceRunId);
+    if (
+      !source?.conversationFork ||
+      !["completed", "failed", "aborted"].includes(source.status) ||
+      !this.ownsCurrentSession(source.sessionId) ||
+      options.parentSession.getSessionId() !== source.sessionId
+    ) {
+      throw new Error(`Run ${options.sourceRunId} is not a terminal conversation fork in this parent session`);
+    }
+    const sessionPath = source.conversationFork.childSessionPath;
+    if (!existsSync(sessionPath)) {
+      throw new Error(`Child session is unavailable: ${sessionPath}`);
+    }
+    const runId = generateRunId();
+    const conversationFork: ConversationForkState = {
+      command: "continue",
+      childSessionPath: sessionPath,
+      task: options.instruction,
+      parentLeafId: options.parentSession.getLeafId(),
+    };
+    const started = this.startInBackgroundWithId(
+      runId,
+      buildConversationForkScript(conversationFork),
+      { name: options.instruction.slice(0, 80) },
+      { conversationFork },
+    );
+    return { ...started, sessionPath };
+  }
+
   /**
    * Start a workflow in the background.
    * Returns immediately with a run ID; the workflow executes asynchronously.
@@ -322,7 +427,15 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     exec: ExecOptions = {},
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
-    const runId = generateRunId();
+    return this.startInBackgroundWithId(generateRunId(), script, args, exec);
+  }
+
+  private startInBackgroundWithId(
+    runId: string,
+    script: string,
+    args: unknown,
+    exec: ExecOptions,
+  ): { runId: string; promise: Promise<WorkflowRunResult> } {
     const controller = new AbortController();
     const parsed = exec.workflowModule ? { meta: exec.workflowModule.meta } : parseWorkflowScript(script);
     const lease = this.persistence.acquireRunLease(runId);
@@ -351,13 +464,13 @@ export class WorkflowManager extends EventEmitter {
       cwd: exec.cwd ?? this.cwd,
       executionOptions: this.resolveExecutionOptions(exec),
       journal: [],
+      conversationFork: exec.conversationFork,
       lease,
     };
 
     this.runs.set(runId, managed);
 
     try {
-      // Persist initial state
       this.persistence.save({
         runId,
         workflowName: managed.snapshot.name,
@@ -373,6 +486,7 @@ export class WorkflowManager extends EventEmitter {
         logs: [],
         startedAt: managed.startedAt.toISOString(),
         updatedAt: managed.startedAt.toISOString(),
+        conversationFork: managed.conversationFork,
       });
     } catch (err) {
       this.releaseRunLease(managed);
@@ -380,11 +494,6 @@ export class WorkflowManager extends EventEmitter {
       throw err;
     }
 
-    // Run workflow asynchronously.
-    // Attach a side-channel catch to prevent Node.js unhandled-rejection crashes
-    // when a workflow is aborted/paused/stopped — executeRun()'s catch block
-    // already records status/event/persist, but the promise still rejects.
-    // The original promise is returned so callers can await it in try/catch.
     const promise = this.executeRun(managed, script, args, exec);
     promise.catch(() => {});
 
@@ -472,7 +581,11 @@ export class WorkflowManager extends EventEmitter {
         artifactCwd: this.cwd,
         args,
         agent: this.agent,
-        mainModel: this.mainModel,
+        // Persistent conversation commands restore model/thinking from their
+        // child session. Supplying the parent's current main model here would
+        // overwrite that saved state on every later continuation.
+        mainModel: managed.conversationFork ? undefined : this.mainModel,
+        restoreAgentSessionModel: Boolean(managed.conversationFork),
         modelRegistry: this.modelRegistry,
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
@@ -523,6 +636,7 @@ export class WorkflowManager extends EventEmitter {
             status: "running",
             model: event.model,
             thinking: event.thinking,
+            sessionPath: event.sessionPath,
             startedAt: new Date().toISOString(),
           });
           this.emit("agentStart", { runId: managed.runId, ...event });
@@ -796,12 +910,23 @@ export class WorkflowManager extends EventEmitter {
     if (status !== "completed" && status !== "failed" && status !== "aborted") {
       throw new Error(`Cannot create a terminal delivery for ${status} run ${managed.runId}`);
     }
+    const conversation = managed.conversationFork;
+    const deliveryContent = conversation
+      ? conversationForkDeliveryText(
+          managed.runId,
+          status,
+          conversation,
+          managed.result?.result,
+          status === "failed" ? managed.error?.message : undefined,
+        )
+      : content;
     managed.terminalDeliveries = appendTerminalDelivery(
       managed.terminalDeliveries,
       managed.runId,
       status,
       managed.sessionId,
-      content,
+      deliveryContent,
+      conversation ? { deliveryMode: "no-trigger", parentLeafId: conversation.parentLeafId } : {},
     );
     return terminalDeliveryId(managed.runId, status);
   }
@@ -921,6 +1046,7 @@ export class WorkflowManager extends EventEmitter {
           completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
           durationMs: managed.result?.durationMs,
           terminalDeliveries: managed.terminalDeliveries,
+          conversationFork: managed.conversationFork,
           // Skip the .bak sidecar while the run is hot; final states keep the backup.
         },
         { backup: managed.status !== "running" },
@@ -1068,6 +1194,7 @@ export class WorkflowManager extends EventEmitter {
       executionOptions: persisted.executionOptions,
       journal,
       terminalDeliveries: persisted.terminalDeliveries,
+      conversationFork: persisted.conversationFork,
       retryState: persisted.retryState,
       activeRetryCallIds:
         retryFailedCallIds ?? (persisted.activeRetryCallIds ? new Set(persisted.activeRetryCallIds) : undefined),
@@ -1175,6 +1302,7 @@ export class WorkflowManager extends EventEmitter {
       const latest = this.persistence.load(runId) ?? persisted;
       if (latest.status !== "running" && latest.status !== "paused") return false;
       const deliveryId = notifyParent ? terminalDeliveryId(runId, "aborted") : undefined;
+      const conversation = latest.conversationFork;
       this.persistence.save({
         ...latest,
         status: "aborted",
@@ -1190,7 +1318,10 @@ export class WorkflowManager extends EventEmitter {
                 runId,
                 "aborted",
                 latest.sessionId,
-                stoppedDeliveryText(runId),
+                conversation
+                  ? conversationForkDeliveryText(runId, "aborted", conversation)
+                  : stoppedDeliveryText(runId),
+                conversation ? { deliveryMode: "no-trigger", parentLeafId: conversation.parentLeafId } : {},
               ),
             }
           : {}),
