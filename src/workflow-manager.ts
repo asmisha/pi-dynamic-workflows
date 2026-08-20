@@ -10,6 +10,7 @@ import {
   buildConversationForkScript,
   type ConversationForkState,
   conversationForkDeliveryText,
+  conversationForkPausedDeliveryText,
   type ParentSessionSnapshotSource,
   snapshotActiveConversationBranch,
 } from "./conversation-fork.js";
@@ -96,6 +97,20 @@ function appendTerminalDelivery(
   const deliveryId = terminalDeliveryId(runId, status);
   if (deliveries?.some((delivery) => delivery.deliveryId === deliveryId)) return deliveries;
   return [...(deliveries ?? []), { deliveryId, sessionId, content, state: "pending", ...options }];
+}
+
+/**
+ * A pause notice is only truthful while its run stays paused: drop undelivered
+ * ones when the run resumes or stops. Delivered records stay as history; each
+ * pause enqueues a fresh unique ID, so a later pause can notify again.
+ */
+function withoutPendingPauseNotices(
+  deliveries: TerminalDelivery[] | undefined,
+  runId: string,
+): TerminalDelivery[] | undefined {
+  return deliveries?.filter(
+    (delivery) => !(delivery.state === "pending" && delivery.deliveryId.startsWith(`${runId}:paused`)),
+  );
 }
 
 function retryableAgentFailureState(
@@ -862,6 +877,28 @@ export class WorkflowManager extends EventEmitter {
             ? this.prepareTerminalDelivery(managed, stoppedDeliveryText(managed.runId))
             : undefined;
 
+      // A command fork must never trigger a parent turn, so its usage-limit pause
+      // notice goes through the durable no-trigger outbox instead of the transient
+      // trigger-turn advisory used by tool-started runs.
+      if (usageLimitPaused && managed.conversationFork) {
+        managed.terminalDeliveries = [
+          ...(managed.terminalDeliveries ?? []),
+          {
+            deliveryId: `${managed.runId}:paused:${Date.now()}`,
+            sessionId: managed.sessionId,
+            content: conversationForkPausedDeliveryText(
+              managed.runId,
+              managed.conversationFork,
+              workflowError.message,
+              workflowError.resetHint,
+            ),
+            state: "pending",
+            deliveryMode: "no-trigger",
+            parentLeafId: managed.conversationFork.parentLeafId,
+          },
+        ];
+      }
+
       // Persist the first terminal error and its delivery outbox before emitting
       // the terminal event. Failed fan-outs retain their lease while surviving
       // runtime-owned siblings drain, preventing another process from racing late
@@ -1193,7 +1230,7 @@ export class WorkflowManager extends EventEmitter {
       cwd: persisted.cwd ?? this.cwd,
       executionOptions: persisted.executionOptions,
       journal,
-      terminalDeliveries: persisted.terminalDeliveries,
+      terminalDeliveries: withoutPendingPauseNotices(persisted.terminalDeliveries, persisted.runId),
       conversationFork: persisted.conversationFork,
       retryState: persisted.retryState,
       activeRetryCallIds:
@@ -1277,6 +1314,7 @@ export class WorkflowManager extends EventEmitter {
       managed.controller.abort();
       managed.draining = false;
       managed.status = "aborted";
+      managed.terminalDeliveries = withoutPendingPauseNotices(managed.terminalDeliveries, runId);
       const deliveryId = notifyParent ? this.prepareTerminalDelivery(managed, stoppedDeliveryText(runId)) : undefined;
       // Same contract as pause(): suppress late writes only after the terminal
       // state and delivery outbox are durable. If persistence fails, retain the
@@ -1303,6 +1341,7 @@ export class WorkflowManager extends EventEmitter {
       if (latest.status !== "running" && latest.status !== "paused") return false;
       const deliveryId = notifyParent ? terminalDeliveryId(runId, "aborted") : undefined;
       const conversation = latest.conversationFork;
+      const baseDeliveries = withoutPendingPauseNotices(latest.terminalDeliveries, runId);
       this.persistence.save({
         ...latest,
         status: "aborted",
@@ -1311,20 +1350,16 @@ export class WorkflowManager extends EventEmitter {
         resetHint: undefined,
         retryState: undefined,
         activeRetryCallIds: undefined,
-        ...(notifyParent
-          ? {
-              terminalDeliveries: appendTerminalDelivery(
-                latest.terminalDeliveries,
-                runId,
-                "aborted",
-                latest.sessionId,
-                conversation
-                  ? conversationForkDeliveryText(runId, "aborted", conversation)
-                  : stoppedDeliveryText(runId),
-                conversation ? { deliveryMode: "no-trigger", parentLeafId: conversation.parentLeafId } : {},
-              ),
-            }
-          : {}),
+        terminalDeliveries: notifyParent
+          ? appendTerminalDelivery(
+              baseDeliveries,
+              runId,
+              "aborted",
+              latest.sessionId,
+              conversation ? conversationForkDeliveryText(runId, "aborted", conversation) : stoppedDeliveryText(runId),
+              conversation ? { deliveryMode: "no-trigger", parentLeafId: conversation.parentLeafId } : {},
+            )
+          : baseDeliveries,
       });
       this.emit("stopped", { runId, deliveryId });
       return true;

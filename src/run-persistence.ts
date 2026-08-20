@@ -126,7 +126,7 @@ export interface PersistedRunState {
   };
   /** Cached runtime call states for resume/retry, keyed by deterministic call index/callId. */
   journal?: JournalEntry[];
-  /** Durable outbox records for terminal notifications. */
+  /** Durable outbox records for terminal notifications and fork pause notices. */
   terminalDeliveries?: TerminalDelivery[];
   /** Command-started persistent conversation fork/continuation metadata. */
   conversationFork?: ConversationForkState;

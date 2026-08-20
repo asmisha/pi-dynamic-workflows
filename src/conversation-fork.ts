@@ -99,6 +99,23 @@ function formatResult(result: unknown): string | undefined {
   }
 }
 
+/** Usage-limit pause notice for a command-started fork/continuation run. */
+export function conversationForkPausedDeliveryText(
+  runId: string,
+  state: ConversationForkState,
+  cause: string | undefined,
+  resetHint: string | undefined,
+): string {
+  const label = state.command === "fork" ? "Conversation fork" : "Conversation continuation";
+  const when = resetHint ? ` (${resetHint})` : "";
+  return [
+    `⏸ ${label} ${runId} paused: ${cause ?? "provider usage limit reached"}${when}.`,
+    `Task: ${state.task}`,
+    `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
+    `Child session: ${state.childSessionPath}`,
+  ].join("\n\n");
+}
+
 export function conversationForkDeliveryText(
   runId: string,
   status: Extract<RunStatus, "completed" | "failed" | "aborted">,

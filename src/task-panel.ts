@@ -247,7 +247,14 @@ export function installResultDelivery(
       resetHint?: string;
       checkpoint?: { prompt: string };
     }) => {
-      if (!manager.getRun(runId) || !manager.isRunInCurrentSession(runId)) return;
+      const run = manager.getRun(runId);
+      if (!run || !manager.isRunInCurrentSession(runId)) return;
+      if (run.conversationFork) {
+        // Command forks never trigger a parent turn: a usage-limit pause was
+        // already enqueued as a durable no-trigger record before `paused` fired.
+        reconcile({ noTriggerOnly: true });
+        return;
+      }
       if (reason === "human_input" && checkpoint) {
         deliverTransient(runId, checkpointText(runId, checkpoint.prompt));
         return;

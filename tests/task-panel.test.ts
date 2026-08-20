@@ -540,6 +540,37 @@ describe("installResultDelivery", () => {
     assert.doesNotMatch(pi._calls[0].content, /failed/);
   });
 
+  it("a command fork's usage-limit pause delivers only its durable no-trigger record", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        conversationFork: {
+          command: "fork",
+          childSessionPath: "/tmp/child.jsonl",
+          task: "background task",
+          parentLeafId: null,
+        },
+      }),
+    );
+    mod.installResultDelivery(pi, manager, createMockSessionManager());
+    manager._queue("⏸ Conversation fork test-run-1 paused", {
+      deliveryId: "test-run-1:paused:1",
+      deliveryMode: "no-trigger",
+      parentLeafId: null,
+    });
+
+    manager.emit("paused", {
+      runId: "test-run-1",
+      reason: "usage_limit",
+      error: { message: "Codex usage limit reached (plus plan)." },
+      resetHint: "Resets in ~3h",
+    });
+
+    assert.equal(pi._calls.length, 1, "only the durable outbox record is delivered");
+    assert.equal(pi._calls[0].content, "⏸ Conversation fork test-run-1 paused");
+    assert.deepEqual(pi._options[0], { triggerTurn: false }, "a fork pause never triggers a parent turn");
+  });
+
   it("delivers a retryable agent-failure pause without treating it as terminal", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());

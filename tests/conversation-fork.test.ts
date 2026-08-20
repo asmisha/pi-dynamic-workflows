@@ -220,6 +220,121 @@ test("command-started fork failures and stops persist no-trigger parent results"
   }
 });
 
+test("a fork usage-limit pause notifies durably without a parent turn and clears on resume", async () => {
+  const dirs = tempDirs();
+  try {
+    await withFakeHomeAsync(dirs.home, async () => {
+      const parent = SessionManager.create(dirs.cwd, join(dirs.cwd, "pause-parent"));
+      appendUser(parent, "pause parent context");
+      let calls = 0;
+      const manager = new WorkflowManager({
+        cwd: dirs.cwd,
+        sessionId: parent.getSessionId(),
+        agent: {
+          async run() {
+            calls++;
+            if (calls === 1) {
+              throw new WorkflowError("Codex usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+                recoverable: false,
+                resetHint: "Resets in ~3h",
+              });
+            }
+            return "recovered result";
+          },
+        },
+      });
+      const sent: Array<{ content: string; options: unknown }> = [];
+      const pi = {
+        on: () => {},
+        sendMessage: (message: { content?: string }, options: unknown) => {
+          sent.push({ content: message.content ?? "", options });
+        },
+      } as unknown as ExtensionAPI;
+      installResultDelivery(pi, manager, parent, { isIdle: () => true });
+
+      const fork = await manager.startConversationFork({ task: "survive the limit", parentSession: parent });
+      await assert.rejects(fork.promise);
+
+      const paused = manager.getPersistence().load(fork.runId);
+      assert.equal(paused?.status, "paused");
+      assert.equal(paused?.pauseReason, "usage_limit");
+      const pauseNotice = paused?.terminalDeliveries?.[0];
+      assert.ok(pauseNotice?.deliveryId.startsWith(`${fork.runId}:paused`));
+      assert.equal(pauseNotice?.deliveryMode, "no-trigger");
+      assert.equal(pauseNotice?.parentLeafId, parent.getLeafId());
+      assert.match(pauseNotice?.content ?? "", /Codex usage limit reached/);
+      assert.match(pauseNotice?.content ?? "", /Resets in ~3h/);
+      assert.match(pauseNotice?.content ?? "", /survive the limit/);
+      assert.match(pauseNotice?.content ?? "", new RegExp(`/workflows resume ${fork.runId}`));
+      assert.match(pauseNotice?.content ?? "", /Child session:/);
+
+      assert.equal(sent.length, 1, "the pause notice is delivered once");
+      assert.equal(sent[0].content, pauseNotice?.content);
+      assert.deepEqual(sent[0].options, { triggerTurn: false }, "a fork pause must not trigger a parent turn");
+
+      assert.equal(await manager.resume(fork.runId), true);
+      const deadline = Date.now() + 3000;
+      while (manager.getPersistence().load(fork.runId)?.status !== "completed" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const completed = manager.getPersistence().load(fork.runId);
+      assert.equal(completed?.status, "completed");
+      assert.deepEqual(
+        completed?.terminalDeliveries?.map((delivery) => delivery.deliveryId),
+        [`${fork.runId}:completed`],
+        "resume clears the stale pause notice",
+      );
+    });
+  } finally {
+    dirs.cleanup();
+  }
+});
+
+test("stopping a usage-limit-paused fork drops its pending pause notice", async () => {
+  const dirs = tempDirs();
+  try {
+    await withFakeHomeAsync(dirs.home, async () => {
+      const parent = SessionManager.create(dirs.cwd, join(dirs.cwd, "pause-stop-parent"));
+      appendUser(parent, "pause stop parent context");
+      const limitAgent = {
+        async run(): Promise<string> {
+          throw new WorkflowError("usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+            resetHint: "Resets in ~1h",
+          });
+        },
+      };
+
+      // In-memory stop of an acknowledged command: no notice of any kind remains.
+      const manager = new WorkflowManager({ cwd: dirs.cwd, sessionId: parent.getSessionId(), agent: limitAgent });
+      const acknowledged = await manager.startConversationFork({ task: "stop me quietly", parentSession: parent });
+      await assert.rejects(acknowledged.promise);
+      assert.equal(manager.stop(acknowledged.runId, { notifyParent: false }), true);
+      const quiet = manager.getPersistence().load(acknowledged.runId);
+      assert.equal(quiet?.status, "aborted");
+      assert.deepEqual(quiet?.terminalDeliveries ?? [], []);
+
+      // Cross-restart stop with notification: the pause notice is replaced by the
+      // aborted fork notice, never delivered alongside it.
+      const second = await manager.startConversationFork({ task: "stop me after restart", parentSession: parent });
+      await assert.rejects(second.promise);
+      const restarted = new WorkflowManager({ cwd: dirs.cwd, sessionId: parent.getSessionId() });
+      assert.equal(restarted.getRun(second.runId), undefined, "the restarted manager has no in-memory run");
+      assert.equal(restarted.stop(second.runId), true);
+      const stopped = restarted.getPersistence().load(second.runId);
+      assert.equal(stopped?.status, "aborted");
+      assert.deepEqual(
+        stopped?.terminalDeliveries?.map((delivery) => delivery.deliveryId),
+        [`${second.runId}:aborted`],
+      );
+      assert.equal(stopped?.terminalDeliveries?.[0]?.deliveryMode, "no-trigger");
+      assert.match(stopped?.terminalDeliveries?.[0]?.content ?? "", /stop me after restart/);
+    });
+  } finally {
+    dirs.cleanup();
+  }
+});
+
 test("/workflows fork and continue use one persistent transcript, new run IDs, and no parent turn", async () => {
   const dirs = tempDirs();
   try {
