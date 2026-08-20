@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { linkSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 interface SessionWriterLockFile {
   sessionPath: string;
@@ -15,12 +15,26 @@ export interface SessionWriterLease {
 }
 
 const RETRY_MS = 25;
-const OWNER_FILE = "owner.lock";
-const RECOVERY_PREFIX = "recovery-";
+const GENERATION_PATTERN = /^owner-(\d+)\.lock$/;
 
 function lockDirectory(): string {
   const owner = typeof process.getuid === "function" ? process.getuid() : (process.env.USER ?? "default");
   return join(tmpdir(), `pi-dynamic-workflows-${owner}`, "session-locks");
+}
+
+/** Resolve symlink and relative-path aliases so one session file maps to one lock scope. */
+function canonicalSessionPath(rawSessionPath: string): string {
+  const resolved = resolve(rawSessionPath);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    // The session file may not exist yet; canonicalize its directory instead.
+    try {
+      return join(realpathSync(dirname(resolved)), basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
 }
 
 function lockScope(sessionPath: string): string {
@@ -114,32 +128,15 @@ function releaseOwnedLock(path: string, token: string): void {
   }
 }
 
-/**
- * Recovery markers prevent a stale-owner cleanup from racing a new owner into
- * the same fixed lock path. Dead markers are safe to remove because their paths
- * are unique and never reused.
- */
-function recoveryInProgress(scope: string): boolean {
-  let busy = false;
+function currentGeneration(scope: string): { generation: number; path: string } | undefined {
+  let latest: { generation: number; path: string } | undefined;
   for (const name of readdirSync(scope)) {
-    if (!name.startsWith(RECOVERY_PREFIX) || !name.endsWith(".lock")) continue;
-    const path = join(scope, name);
-    const marker = readLock(path);
-    if (!marker) {
-      busy = true;
-      continue;
-    }
-    if (pidIsAlive(marker.pid)) {
-      busy = true;
-      continue;
-    }
-    try {
-      removeFile(path);
-    } catch {
-      busy = true;
-    }
+    const match = GENERATION_PATTERN.exec(name);
+    if (!match) continue;
+    const generation = Number(match[1]);
+    if (!latest || generation > latest.generation) latest = { generation, path: join(scope, name) };
   }
-  return busy;
+  return latest;
 }
 
 function lockPayload(sessionPath: string, token: string): SessionWriterLockFile {
@@ -154,64 +151,51 @@ function lockPayload(sessionPath: string, token: string): SessionWriterLockFile 
 /**
  * Acquire exclusive cross-process ownership of a persistent Pi session file.
  * Contenders wait until the current owner releases after its AgentSession cleanup.
+ *
+ * The session is owned by whichever process created the highest-numbered
+ * `owner-<n>.lock` generation in the session's lock scope. Every claim — first
+ * acquisition or succession after a released or crashed owner — is an exclusive
+ * create of the next generation name, so the filesystem picks exactly one winner,
+ * and no process ever unlinks a file it did not create: a live owner cannot lose
+ * its lock. Generations left by crashed owners stay in place as tmpdir litter
+ * rather than becoming recovery work.
  */
 export async function acquireSessionWriterLease(
   rawSessionPath: string,
   signal?: AbortSignal,
 ): Promise<SessionWriterLease> {
-  const sessionPath = resolve(rawSessionPath);
+  const sessionPath = canonicalSessionPath(rawSessionPath);
   const scope = lockScope(sessionPath);
-  const ownerPath = join(scope, OWNER_FILE);
   mkdirSync(scope, { recursive: true, mode: 0o700 });
 
   while (true) {
     if (signal?.aborted) throw abortError();
-    if (recoveryInProgress(scope)) {
-      await waitToRetry(signal);
-      continue;
-    }
 
-    const token = `${process.pid}-${randomUUID()}`;
-    if (publishLock(ownerPath, lockPayload(sessionPath, token))) {
-      // A stale-owner recovery may have started after the pre-check. Never open
-      // the session until every such cleanup has finished.
-      if (recoveryInProgress(scope)) {
-        releaseOwnedLock(ownerPath, token);
+    const latest = currentGeneration(scope);
+    if (latest) {
+      const owner = readLock(latest.path);
+      // An unreadable owner lock is treated as live: never risk a second writer.
+      if (!owner || pidIsAlive(owner.pid)) {
         await waitToRetry(signal);
         continue;
       }
-      if (signal?.aborted) {
-        releaseOwnedLock(ownerPath, token);
-        throw abortError();
-      }
-
-      let released = false;
-      return {
-        release() {
-          if (released) return;
-          released = true;
-          releaseOwnedLock(ownerPath, token);
-        },
-      };
     }
 
-    const existing = readLock(ownerPath);
-    if (existing && !pidIsAlive(existing.pid)) {
-      const recoveryToken = `${process.pid}-${randomUUID()}`;
-      const recoveryPath = join(scope, `${RECOVERY_PREFIX}${recoveryToken}.lock`);
-      if (publishLock(recoveryPath, lockPayload(sessionPath, recoveryToken))) {
-        try {
-          const current = readLock(ownerPath);
-          if (current?.token === existing.token && !pidIsAlive(current.pid)) removeFile(ownerPath);
-        } finally {
-          removeFile(recoveryPath);
-        }
-        continue;
-      }
-    }
+    const generationPath = join(scope, `owner-${(latest?.generation ?? 0) + 1}.lock`);
+    const token = `${process.pid}-${randomUUID()}`;
+    if (!publishLock(generationPath, lockPayload(sessionPath, token))) continue;
 
-    // An unreadable owner may still be in use by an older process publishing
-    // non-atomically. Treat it as owned rather than risking a second writer.
-    await waitToRetry(signal);
+    if (signal?.aborted) {
+      releaseOwnedLock(generationPath, token);
+      throw abortError();
+    }
+    let released = false;
+    return {
+      release() {
+        if (released) return;
+        released = true;
+        releaseOwnedLock(generationPath, token);
+      },
+    };
   }
 }

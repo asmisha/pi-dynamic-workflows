@@ -273,6 +273,14 @@ test("a fork usage-limit pause notifies durably without a parent turn and clears
       assert.deepEqual(sent[0].options, { triggerTurn: false }, "a fork pause must not trigger a parent turn");
 
       assert.equal(await manager.resume(fork.runId), true);
+      const resumedOnDisk = manager.getPersistence().load(fork.runId);
+      assert.equal(
+        resumedOnDisk?.terminalDeliveries?.some(
+          (delivery) => delivery.state === "pending" && delivery.deliveryId.startsWith(`${fork.runId}:paused`),
+        ),
+        false,
+        "resume durably clears the pause notice before the resumed run's first debounced persist",
+      );
       const deadline = Date.now() + 3000;
       while (manager.getPersistence().load(fork.runId)?.status !== "completed" && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 10));

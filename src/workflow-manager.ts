@@ -1142,8 +1142,22 @@ export class WorkflowManager extends EventEmitter {
     }
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
-    this.startResumedRun(persisted, lease, persisted.journal ?? []);
-    return true;
+    try {
+      // Persist the cleared pause notice before execution starts: the resumed
+      // run's own first persist is debounced, and a reconcile inside that window
+      // must not deliver a stale "paused" notice for a run that already resumed.
+      const resumedState: PersistedRunState = {
+        ...persisted,
+        terminalDeliveries: withoutPendingPauseNotices(persisted.terminalDeliveries, runId),
+        updatedAt: new Date().toISOString(),
+      };
+      this.persistence.save(resumedState);
+      this.startResumedRun(resumedState, lease, resumedState.journal ?? []);
+      return true;
+    } catch (error) {
+      this.persistence.releaseRunLease(lease);
+      throw error;
+    }
   }
 
   /** Supply the current pending checkpoint reply and continue the same persisted run. */
@@ -1191,6 +1205,7 @@ export class WorkflowManager extends EventEmitter {
         pauseReason: undefined,
         resetHint: undefined,
         retryState: undefined,
+        terminalDeliveries: withoutPendingPauseNotices(latest.terminalDeliveries, runId),
         updatedAt: new Date().toISOString(),
       };
       this.persistence.save(resumedState);
@@ -1281,6 +1296,7 @@ export class WorkflowManager extends EventEmitter {
         retryState: undefined,
         activeRetryCallIds: [...retryFailedCallIds],
         resetHint: undefined,
+        terminalDeliveries: withoutPendingPauseNotices(latest.terminalDeliveries, runId),
         updatedAt: new Date().toISOString(),
       };
       this.persistence.save(resumedState);

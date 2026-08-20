@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
@@ -1001,7 +1011,7 @@ test("an unreadable live session-writer lock is never stolen", async () => {
       }
       try {
         const value = JSON.parse(readFileSync(path, "utf8")) as { sessionPath?: string; pid?: number };
-        if (value.sessionPath === resolve(target) && value.pid === process.pid) return path;
+        if (value.sessionPath === join(realpathSync(root), "shared.jsonl") && value.pid === process.pid) return path;
       } catch {
         // Other lock users may be publishing or removing unrelated files.
       }
@@ -1029,6 +1039,35 @@ test("an unreadable live session-writer lock is never stolen", async () => {
   } finally {
     first.release();
     if (ownedLock) rmSync(ownedLock, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("aliased spellings of one session path share a single writer lease", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-alias-writer-"));
+  try {
+    const realDir = join(root, "sessions");
+    const aliasDir = join(root, "alias");
+    mkdirSync(realDir);
+    symlinkSync(realDir, aliasDir);
+
+    const owner = await acquireSessionWriterLease(join(aliasDir, "shared.jsonl"));
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 75);
+      try {
+        await assert.rejects(
+          acquireSessionWriterLease(join(realDir, "shared.jsonl"), controller.signal).then((lease) => lease.release()),
+          (error: unknown) => (error as Error).name === "AbortError",
+          "a symlinked spelling must contend for the same session lock",
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+    } finally {
+      owner.release();
+    }
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
