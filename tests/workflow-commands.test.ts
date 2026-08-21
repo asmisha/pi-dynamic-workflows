@@ -26,12 +26,12 @@ function harness(
   const notified: Array<{ message: string; type?: string }> = [];
   const calls: string[] = [];
   const activeTools = [...initialTools];
-  let handler: Handler | undefined;
+  const handlers = new Map<string, Handler>();
 
   const pi: Partial<ExtensionAPI> = {
     getCommands: () => [],
-    registerCommand: (_name: string, opts: { handler: Handler }) => {
-      handler = opts.handler;
+    registerCommand: (name: string, opts: { handler: Handler }) => {
+      handlers.set(name, opts.handler);
     },
     sendMessage:
       sendMessageImpl ??
@@ -73,12 +73,19 @@ function harness(
   };
 
   registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager, commandOptions);
-  const ctx = { ui: { notify: (message: string, type?: string) => notified.push({ message, type }) } };
-  const run = (args: string) => {
-    if (!handler) throw new Error("command not registered");
+  const ctx = {
+    ui: { notify: (message: string, type?: string) => notified.push({ message, type }) },
+    waitForIdle: async () => {},
+    sessionManager: {},
+  };
+  const runCommand = (name: string, args: string) => {
+    const handler = handlers.get(name);
+    if (!handler) throw new Error(`command ${name} not registered`);
     return handler(args, ctx);
   };
-  return { run, printed, sent, notified, calls, activeTools };
+  const run = (args: string) => runCommand("workflows", args);
+  const runSubtask = (args: string) => runCommand("subtask", args);
+  return { run, runSubtask, printed, sent, notified, calls, activeTools };
 }
 
 test("/workflows list shows empty hint when no runs", async () => {
@@ -175,15 +182,72 @@ test("/workflows status without id warns", async () => {
 });
 
 test("registerWorkflowCommands is idempotent (skips when already registered)", () => {
-  let registrations = 0;
+  const registered: string[] = [];
   const pi: Partial<ExtensionAPI> = {
-    getCommands: () => [{ name: "workflows" }],
-    registerCommand: () => {
-      registrations++;
+    getCommands: () => [{ name: "workflows" }, { name: "subtask" }],
+    registerCommand: (name: string) => {
+      registered.push(name);
     },
   };
   registerWorkflowCommands(pi as unknown as ExtensionAPI, {} as unknown as WorkflowManager);
-  assert.equal(registrations, 0);
+  assert.deepEqual(registered, []);
+});
+
+test("registerWorkflowCommands registers each missing command independently", () => {
+  const registered: string[] = [];
+  const pi: Partial<ExtensionAPI> = {
+    getCommands: () => [{ name: "workflows" }],
+    registerCommand: (name: string) => {
+      registered.push(name);
+    },
+  };
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, {} as unknown as WorkflowManager);
+  assert.deepEqual(registered, ["subtask"]);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// /subtask — background conversation fork
+// ═══════════════════════════════════════════════════════════════════════
+
+test("/subtask without a task warns usage", async () => {
+  const h = harness();
+  await h.runSubtask("   ");
+  assert.equal(h.notified.length, 1);
+  assert.equal(h.notified[0].type, "warning");
+  assert.match(h.notified[0].message, /Usage: \/subtask <task>/);
+});
+
+test("/subtask <task> starts a conversation fork and reports the child session", async () => {
+  const forks: Array<{ task: string }> = [];
+  const h = harness({
+    startConversationFork: async (options: { task: string }) => {
+      forks.push(options);
+      return { runId: "fork-run-1", sessionPath: "/tmp/sessions/fork-run-1.jsonl", promise: Promise.resolve() };
+    },
+  });
+  await h.runSubtask("summarize the auth module");
+  assert.deepEqual(
+    forks.map((f) => f.task),
+    ["summarize the auth module"],
+  );
+  const started = h.notified.find((n) => n.message.includes("Started fork-run-1"));
+  assert.ok(started, "should notify the started run");
+  assert.equal(started?.type, "info");
+  assert.match(started?.message ?? "", /Child session: \/tmp\/sessions\/fork-run-1\.jsonl/);
+});
+
+test("/subtask surfaces a fork startup failure as an error notice", async () => {
+  const h = harness({
+    startConversationFork: async () => {
+      throw new Error("parent session has no active branch");
+    },
+  });
+  await h.runSubtask("do the thing");
+  assert.deepEqual(
+    h.notified.map((n) => n.type),
+    ["error"],
+  );
+  assert.match(h.notified[0].message, /parent session has no active branch/);
 });
 
 test("/workflows status watches a running run: live status bar + prints on completion", async () => {
@@ -205,17 +269,18 @@ test("/workflows status watches a running run: live status bar + prints on compl
 
   const statusLine: Array<string | undefined> = [];
   const printed: string[] = [];
-  let handler: ((a: string, c: any) => Promise<void>) | undefined;
+  const handlers = new Map<string, (a: string, c: any) => Promise<void>>();
   const pi: any = {
     getCommands: () => [],
-    registerCommand: (_n: string, o: any) => {
-      handler = o.handler;
+    registerCommand: (n: string, o: any) => {
+      handlers.set(n, o.handler);
     },
     sendMessage: async (m: any) => printed.push(m.content),
   };
   registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
   const ctx = { ui: { notify: () => {}, setStatus: (_k: string, t?: string) => statusLine.push(t) } };
 
+  const handler = handlers.get("workflows");
   assert.ok(handler, "handler should exist");
   await handler("status run-1", ctx);
   assert.ok(

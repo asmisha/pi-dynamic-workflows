@@ -19,10 +19,10 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | fork <task> | continue <run-id> <instruction> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | retry <id> | rm <id>";
+  "Usage: /workflows [list] | run <prompt> | continue <run-id> <instruction> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | retry <id> | rm <id>";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
-const FORK_USAGE = "Usage: /workflows fork <task>";
+const SUBTASK_USAGE = "Usage: /subtask <task>";
 const CONTINUE_USAGE = "Usage: /workflows continue <run-id> <instruction>";
 
 /** The exact name of the workflow tool that `/workflows run` forces. */
@@ -117,19 +117,54 @@ function renderPersistedStatus(run: PersistedRunState): string {
   return lines.join("\n");
 }
 
-/** Register the `/workflows` command against the shared manager. Idempotent. */
-
-export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowManager): void {
+function commandTaken(pi: ExtensionAPI, name: string): boolean {
   try {
-    const taken = (pi.getCommands?.() ?? []).some((c: { name: string }) => c.name === "workflows");
-    if (taken) return;
+    return (pi.getCommands?.() ?? []).some((c: { name: string }) => c.name === name);
   } catch {
-    // getCommands may be unavailable in some hosts; fall through and try to register.
+    // getCommands may be unavailable in some hosts; try to register anyway.
+    return false;
   }
+}
+
+/** Register the `/workflows` and `/subtask` commands against the shared manager. Idempotent. */
+export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowManager): void {
+  registerWorkflowsCommand(pi, manager);
+  registerSubtaskCommand(pi, manager);
+}
+
+function registerSubtaskCommand(pi: ExtensionAPI, manager: WorkflowManager): void {
+  if (commandTaken(pi, "subtask")) return;
+
+  pi.registerCommand("subtask", {
+    description: "Run <task> in the background on a persistent fork of the current conversation",
+    async handler(args: string, ctx: ExtensionCommandContext) {
+      const task = args.trim();
+      if (!task) {
+        ctx.ui.notify(SUBTASK_USAGE, "warning");
+        return;
+      }
+      try {
+        await ctx.waitForIdle();
+        const started = await manager.startConversationFork({
+          task,
+          parentSession: ctx.sessionManager,
+          model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+          thinkingLevel: ctx.thinkingLevel,
+        });
+        ctx.ui.notify(`Started ${started.runId}\nChild session: ${started.sessionPath}`, "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    },
+  });
+}
+
+function registerWorkflowsCommand(pi: ExtensionAPI, manager: WorkflowManager): void {
+  if (commandTaken(pi, "workflows")) return;
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | fork <task> | continue <run-id> <instruction> | status/stop/pause/resume/retry <id> | rm <id>",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | continue <run-id> <instruction> | status/stop/pause/resume/retry <id> | rm <id>",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
@@ -165,29 +200,6 @@ export function registerWorkflowCommands(pi: ExtensionAPI, manager: WorkflowMana
             );
           } catch {
             ctx.ui.notify("Could not start the workflow turn.", "error");
-          }
-          return;
-        }
-        case "fork": {
-          const task = args
-            .trim()
-            .slice(parts[0]?.length ?? 0)
-            .trim();
-          if (!task) {
-            ctx.ui.notify(FORK_USAGE, "warning");
-            return;
-          }
-          try {
-            await ctx.waitForIdle();
-            const started = await manager.startConversationFork({
-              task,
-              parentSession: ctx.sessionManager,
-              model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
-              thinkingLevel: ctx.thinkingLevel,
-            });
-            ctx.ui.notify(`Started ${started.runId}\nChild session: ${started.sessionPath}`, "info");
-          } catch (error) {
-            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
           }
           return;
         }

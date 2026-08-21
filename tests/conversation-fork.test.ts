@@ -343,7 +343,7 @@ test("stopping a usage-limit-paused fork drops its pending pause notice", async 
   }
 });
 
-test("/workflows fork and continue use one persistent transcript, new run IDs, and no parent turn", async () => {
+test("/subtask and /workflows continue use one persistent transcript, new run IDs, and no parent turn", async () => {
   const dirs = tempDirs();
   try {
     await withFakeHomeAsync(dirs.home, async () => {
@@ -390,19 +390,22 @@ test("/workflows fork and continue use one persistent transcript, new run IDs, a
 
       manager.setMainModel("parent-provider/parent-model");
 
-      let handler: ((args: string, ctx: any) => Promise<void>) | undefined;
+      const handlers = new Map<string, (args: string, ctx: any) => Promise<void>>();
       const sent: Array<{ message: unknown; options: unknown }> = [];
       const notices: Array<{ message: string; type?: string }> = [];
       const pi = {
         getCommands: () => [],
-        registerCommand: (_name: string, command: { handler: typeof handler }) => {
-          handler = command.handler;
+        registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => {
+          handlers.set(name, command.handler);
         },
         sendMessage: (message: unknown, options: unknown) => {
           sent.push({ message, options });
         },
       } as unknown as ExtensionAPI;
       registerWorkflowCommands(pi, manager);
+      const subtask = handlers.get("subtask");
+      const handler = handlers.get("workflows");
+      assert.ok(subtask);
       assert.ok(handler);
       const ctx = {
         sessionManager: parent,
@@ -412,7 +415,7 @@ test("/workflows fork and continue use one persistent transcript, new run IDs, a
         ui: { notify: (message: string, type?: string) => notices.push({ message, type }) },
       };
 
-      await handler("fork implement the explicit child task", ctx);
+      await subtask("implement the explicit child task", ctx);
       assert.equal(sent.length, 0, "the command must not send a parent message or trigger a parent LLM turn");
       const forkRun = manager.listRuns()[0];
       assert.ok(forkRun?.conversationFork);

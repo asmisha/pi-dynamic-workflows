@@ -112,7 +112,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows pause|resume|retry|stop|rm <id>
 /workflows run <prompt>     force a dynamic workflow from <prompt> on demand;
                             the run shows in the panel + /workflows.
-/workflows fork <task>      persist the active conversation branch and run <task> in the child
+/subtask <task>             persist the active conversation branch and run <task> in the child
 /workflows continue <id> <instruction>
                             continue a terminal fork run on its saved child session with a new run ID
 /workflows-progress compact|detailed|status
