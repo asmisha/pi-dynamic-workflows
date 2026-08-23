@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,6 +57,29 @@ test("read-only bash supports Git reads and isolated temporary writes", macOnly,
     }
   } finally {
     rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("read-only bash persists shared /tmp artifacts that outlive the agent", macOnly, async () => {
+  const repo = mkdtempSync(join(tmpdir(), "readonly-bash-artifacts-"));
+  const shared = join("/tmp", `readonly-bash-artifacts-${process.pid}-${Date.now()}`);
+  try {
+    const sandbox = createReadOnlyBashSession(repo);
+    assert.ok(sandbox.tool);
+    try {
+      // The incident shape: an agent creates a run-scoped directory under the
+      // shared /tmp and writes a report other agents and the host read later.
+      await runBash(
+        sandbox.tool,
+        `mkdir -p ${JSON.stringify(shared)} && printf "full report" > ${JSON.stringify(join(shared, "report.md"))}`,
+      );
+    } finally {
+      sandbox.cleanup();
+    }
+    assert.equal(readFileSync(join(shared, "report.md"), "utf8"), "full report");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(shared, { recursive: true, force: true });
   }
 });
 

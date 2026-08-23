@@ -48,13 +48,16 @@ function createSandboxPaths(): SandboxPaths {
       "(allow process-fork)",
       "(allow sysctl-read)",
       "(allow mach-lookup)",
-      // The guarantee is "no writes", not isolation: reads and network stay open
-      // so remote-log commands (ssh, curl, kubectl) and the toolchain work with
-      // the user's real HOME. Writes are confined to /dev/null and the per-agent
-      // sandbox directory (which backs $TMPDIR).
+      // The guarantee is "no durable host writes", not isolation: reads and
+      // network stay open so remote-log commands (ssh, curl, kubectl) and the
+      // toolchain work with the user's real HOME. Writes are confined to
+      // /dev/null, the per-agent sandbox directory (which backs $TMPDIR), and
+      // the shared /tmp so agents can persist temporary artifacts that other
+      // agents or the host read after this agent finishes.
       "(allow network*)",
       "(allow file-read*)",
       '(allow file-write* (literal "/dev/null"))',
+      '(allow file-write* (subpath "/private/tmp"))',
       `(allow file-write* (subpath ${JSON.stringify(root)}))`,
       "",
     ].join("\n"),
@@ -64,9 +67,10 @@ function createSandboxPaths(): SandboxPaths {
 
 /**
  * Build a bash tool whose child process can read the filesystem and reach the
- * network, but can write only to /dev/null and its per-agent scratch directory,
- * and is always time-bounded. Unsupported platforms fail closed by returning no
- * tool instead of exposing Pi's unrestricted built-in bash.
+ * network, but can write only to /dev/null, the shared /tmp, and its per-agent
+ * scratch directory, and is always time-bounded. Unsupported platforms fail
+ * closed by returning no tool instead of exposing Pi's unrestricted built-in
+ * bash.
  */
 export function createReadOnlyBashSession(
   cwd: string,
@@ -103,7 +107,7 @@ export function createReadOnlyBashSession(
     },
   };
   const tool = createBashToolDefinition(cwd, { operations });
-  tool.description = `${tool.description} Reads and network access work normally (ssh, curl, remote logs), but all writes outside $TMPDIR are blocked: the repository, $HOME, and the rest of the host are not writable, so commands that must persist files will fail. A command without its own timeout is killed after ${defaultTimeoutSeconds} seconds.`;
+  tool.description = `${tool.description} Reads and network access work normally (ssh, curl, remote logs), but writes are confined to /tmp and $TMPDIR: the repository, $HOME, and the rest of the host are not writable. $TMPDIR is a private scratch directory deleted when this agent finishes; write files that must outlive this agent or be shared with other agents under /tmp. A command without its own timeout is killed after ${defaultTimeoutSeconds} seconds.`;
 
   return {
     tool: tool as unknown as ToolDefinition,
