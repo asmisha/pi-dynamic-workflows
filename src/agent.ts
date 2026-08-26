@@ -710,6 +710,89 @@ export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef 
   ? Static<TSchemaDef>
   : string;
 
+const EXACT_MODEL_SPEC = /^[a-z0-9][a-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+
+/** Whether a model route is an unambiguous `provider/modelId` spec. */
+export function isExactModelSpec(value: unknown): value is string {
+  return typeof value === "string" && EXACT_MODEL_SPEC.test(value);
+}
+
+interface AgentModelRoute {
+  modelSpec?: string;
+  fallbackSpec?: string;
+  model?: Model<any>;
+  fallbackModel?: Model<any>;
+  usedFallback: boolean;
+}
+
+function resolveModelFromRegistry(spec: string, registry?: ModelRegistry): Model<any> | undefined {
+  if (!registry) return undefined;
+  const slash = spec.indexOf("/");
+  if (slash > 0) return registry.find(spec.slice(0, slash), spec.slice(slash + 1));
+  return (
+    registry.getAvailable().find((model) => model.id === spec) ?? registry.getAll().find((model) => model.id === spec)
+  );
+}
+
+function modelIsAvailableInRegistry(model: Model<any>, registry?: ModelRegistry): boolean {
+  return (
+    registry?.getAvailable().some((candidate) => candidate.provider === model.provider && candidate.id === model.id) ??
+    false
+  );
+}
+
+function unavailableModelError(spec: string, registry: ModelRegistry | undefined, label?: string): WorkflowError {
+  const catalogError = registry?.getError();
+  return new WorkflowError(
+    `Model "${spec}" is unavailable or unauthenticated${catalogError ? `: ${catalogError}` : ""}`,
+    WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+    { recoverable: false, agentLabel: label },
+  );
+}
+
+function resolveAgentModelRoute(
+  options: AgentRunOptions<any>,
+  mainModel: string | undefined,
+  registry: ModelRegistry | undefined,
+  requireAvailable: boolean,
+): AgentModelRoute {
+  const modelSpec = options.restoreSessionModel ? undefined : resolveAgentModelSpec(options, mainModel);
+  const fallbackSpec = options.fallbackModel?.trim();
+  if (fallbackSpec && !modelSpec) {
+    throw new WorkflowError("fallbackModel requires a primary model", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+      recoverable: false,
+      agentLabel: options.label,
+    });
+  }
+
+  const fallbackModel = fallbackSpec ? resolveModelFromRegistry(fallbackSpec, registry) : undefined;
+  if (fallbackSpec && (!fallbackModel || !modelIsAvailableInRegistry(fallbackModel, registry))) {
+    throw new WorkflowError(
+      `Fallback model "${fallbackSpec}" is unavailable or unauthenticated`,
+      WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      { recoverable: false, agentLabel: options.label },
+    );
+  }
+  if (!modelSpec) return { fallbackSpec, fallbackModel, usedFallback: false };
+
+  const primaryModel = resolveModelFromRegistry(modelSpec, registry);
+  const primaryIsAvailable = Boolean(primaryModel && modelIsAvailableInRegistry(primaryModel, registry));
+  if (primaryModel && (primaryIsAvailable || (!requireAvailable && !fallbackSpec))) {
+    options.onModelResolved?.(`${primaryModel.provider}/${primaryModel.id}`);
+    return { modelSpec, fallbackSpec, model: primaryModel, fallbackModel, usedFallback: false };
+  }
+  if (fallbackModel && fallbackSpec) {
+    options.onModelFallback?.(modelSpec, fallbackSpec, "primary model is unavailable or unauthenticated");
+    options.onModelResolved?.(`${fallbackModel.provider}/${fallbackModel.id}`);
+    return { modelSpec, fallbackSpec, model: fallbackModel, fallbackModel, usedFallback: true };
+  }
+  if (requireAvailable) throw unavailableModelError(modelSpec, registry, options.label);
+
+  console.warn(`[workflow] model "${modelSpec}" not found; using session default`);
+  options.onModelFallback?.(modelSpec);
+  return { modelSpec, fallbackSpec, usedFallback: false };
+}
+
 export class WorkflowAgent {
   private readonly cwd: string;
   private readonly baseTools: ToolDefinition[];
@@ -718,7 +801,6 @@ export class WorkflowAgent {
   private readonly mainModel?: string;
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
-  /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
   /** Lazily built once per agent instance (one per run) instead of per subagent. */
   private settingsManager?: SettingsManager;
 
@@ -729,6 +811,7 @@ export class WorkflowAgent {
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
     this.sharedRegistry = options.modelRegistry;
+    this.settingsManager = this.sessionOptions.settingsManager;
   }
 
   /**
@@ -753,21 +836,11 @@ export class WorkflowAgent {
    * Returns undefined when nothing matches.
    */
   private resolveModel(spec: string, perRunRegistry?: ModelRegistry): Model<any> | undefined {
-    const registry = this.getRegistry(perRunRegistry);
-    if (!registry) return undefined;
-    const slash = spec.indexOf("/");
-    if (slash > 0) {
-      return registry.find(spec.slice(0, slash), spec.slice(slash + 1));
-    }
-    return registry.getAvailable().find((m) => m.id === spec) ?? registry.getAll().find((m) => m.id === spec);
+    return resolveModelFromRegistry(spec, this.getRegistry(perRunRegistry));
   }
 
   private modelIsAvailable(model: Model<any>, perRunRegistry?: ModelRegistry): boolean {
-    return (
-      this.getRegistry(perRunRegistry)
-        ?.getAvailable()
-        .some((candidate) => candidate.provider === model.provider && candidate.id === model.id) ?? false
-    );
+    return modelIsAvailableInRegistry(model, this.getRegistry(perRunRegistry));
   }
 
   async run<TSchemaDef extends TSchema | undefined = undefined>(
@@ -776,7 +849,7 @@ export class WorkflowAgent {
   ): Promise<AgentRunResult<TSchemaDef>> {
     const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
     // Per-call cwd (e.g. a worktree) needs coding tools bound to that directory,
-    // since tools capture their cwd at construction and can't be relocated.
+    // since tools and resource loaders capture their cwd and can't be relocated.
     const runCwd = options.cwd ?? this.cwd;
     const readOnlyBash = options.readOnly ? createReadOnlyBashSession(runCwd) : undefined;
     const baseTools = runCwd === this.cwd ? this.baseTools : createCodingTools(runCwd);
@@ -802,48 +875,11 @@ export class WorkflowAgent {
       Boolean(options.schema),
     );
 
-    // Resolve the model spec (explicit model > tier > session default). This
-    // composes with phase-based routing in workflow.ts, which only supplies
-    // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = options.restoreSessionModel ? undefined : resolveAgentModelSpec(options, this.mainModel);
-
-    const fallbackSpec = options.fallbackModel?.trim();
-    if (fallbackSpec && !modelSpec) {
-      throw new WorkflowError("fallbackModel requires a primary model", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
-        recoverable: false,
-        agentLabel: options.label,
-      });
-    }
-
-    // An explicit fallback makes model availability a fail-closed route: use the
-    // fallback immediately when the primary lacks auth, and reject a fallback
-    // that cannot itself run. Without one, preserve the existing session-default
-    // behavior for unresolved model specs.
-    let resolvedModel: Model<any> | undefined;
-    let resolvedFallbackModel: Model<any> | undefined;
-    if (fallbackSpec) {
-      resolvedFallbackModel = this.resolveModel(fallbackSpec, options.modelRegistry);
-      if (!resolvedFallbackModel || !this.modelIsAvailable(resolvedFallbackModel, options.modelRegistry)) {
-        throw new WorkflowError(
-          `Fallback model "${fallbackSpec}" is unavailable or unauthenticated`,
-          WorkflowErrorCode.AGENT_EXECUTION_ERROR,
-          { recoverable: false, agentLabel: options.label },
-        );
-      }
-    }
-    if (modelSpec) {
-      resolvedModel = this.resolveModel(modelSpec, options.modelRegistry);
-      if (resolvedModel && (!fallbackSpec || this.modelIsAvailable(resolvedModel, options.modelRegistry))) {
-        options.onModelResolved?.(`${resolvedModel.provider}/${resolvedModel.id}`);
-      } else if (resolvedFallbackModel && fallbackSpec) {
-        resolvedModel = resolvedFallbackModel;
-        options.onModelFallback?.(modelSpec, fallbackSpec, "primary model is unavailable or unauthenticated");
-        options.onModelResolved?.(`${resolvedFallbackModel.provider}/${resolvedFallbackModel.id}`);
-      } else {
-        console.warn(`[workflow] model "${modelSpec}" not found; using session default`);
-        options.onModelFallback?.(modelSpec);
-      }
-    }
+    const modelRoute = resolveAgentModelRoute(options, this.mainModel, this.getRegistry(options.modelRegistry), false);
+    const modelSpec = modelRoute.modelSpec;
+    const fallbackSpec = modelRoute.fallbackSpec;
+    let resolvedModel = modelRoute.model;
+    const resolvedFallbackModel = modelRoute.fallbackModel;
 
     const agentDir = getAgentDir();
     // Use a real SettingsManager to inherit the user's default provider/model,
@@ -1112,4 +1148,53 @@ export class WorkflowAgent {
 
     return parts.join("\n\n");
   }
+}
+
+/** Validate one explicit route with the same resolver used by WorkflowAgent. */
+export function assertAgentModelAvailable(spec: string, registry: ModelRegistry): void {
+  resolveAgentModelRoute({ model: spec }, undefined, registry, true);
+}
+
+/** Apply WorkflowAgent's fail-closed route policy to an injected runner. */
+export function createFailClosedModelAgent(
+  agent: Pick<WorkflowAgent, "run">,
+  mainModel: string | undefined,
+  registry: ModelRegistry,
+): Pick<WorkflowAgent, "run"> {
+  return {
+    async run<TSchemaDef extends TSchema | undefined = undefined>(
+      prompt: string,
+      options: AgentRunOptions<TSchemaDef> = {},
+    ): Promise<AgentRunResult<TSchemaDef>> {
+      const fallbackSpec = options.fallbackModel?.trim();
+      if (fallbackSpec && !isExactModelSpec(fallbackSpec)) {
+        throw new WorkflowError(
+          `Fallback model "${fallbackSpec}" must be an exact provider/modelId`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false, agentLabel: options.label },
+        );
+      }
+      const route = resolveAgentModelRoute(
+        { ...options, onModelFallback: undefined, onModelResolved: undefined },
+        mainModel,
+        options.modelRegistry ?? registry,
+        true,
+      );
+      if (!route.model) return agent.run(prompt, options);
+
+      const selectedModel = `${route.model.provider}/${route.model.id}`;
+      const fallbackModel =
+        !route.usedFallback && route.fallbackModel
+          ? `${route.fallbackModel.provider}/${route.fallbackModel.id}`
+          : undefined;
+      if (route.usedFallback && route.modelSpec && route.fallbackSpec) {
+        options.onModelFallback?.(
+          route.modelSpec,
+          route.fallbackSpec,
+          "primary model is unavailable or unauthenticated",
+        );
+      }
+      return agent.run(prompt, { ...options, model: selectedModel, fallbackModel });
+    },
+  };
 }

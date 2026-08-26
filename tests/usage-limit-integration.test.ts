@@ -13,7 +13,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import {
   DefaultResourceLoader,
   defineTool,
@@ -28,31 +27,9 @@ import { WorkflowErrorCode } from "../src/errors.js";
 import { runWorkflow } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { loadFaux } from "./helpers/load-faux.js";
 
 const USAGE_LIMIT_MSG = "Codex usage limit reached (plus plan). Resets in ~3h.";
-
-/**
- * Load the faux provider from the SAME pi-ai instance that pi-coding-agent's
- * createAgentSession dispatches through. pi-coding-agent ships its own nested
- * pi-ai copy; registering on a different instance would be invisible to the
- * session ("No API provider registered"). Prefer the nested copy when present,
- * else fall back to the bare specifier — which, when npm has deduped to a single
- * copy, resolves to that same shared instance. Robust to both layouts.
- */
-async function loadFaux(): Promise<typeof import("@earendil-works/pi-ai/compat")> {
-  // The faux-provider helpers live in the compat entrypoint, which is also what
-  // Pi's extension loader resolves the bare specifier to.
-  const nested = fileURLToPath(
-    new URL(
-      "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/compat.js",
-      import.meta.url,
-    ),
-  );
-  const entry = existsSync(nested)
-    ? nested
-    : fileURLToPath(new URL("../node_modules/@earendil-works/pi-ai/dist/compat.js", import.meta.url));
-  return import(entry) as Promise<typeof import("@earendil-works/pi-ai/compat")>;
-}
 
 /**
  * Run `fn` with isolated Pi settings and a dummy provider key so

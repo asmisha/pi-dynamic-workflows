@@ -23,6 +23,120 @@ pi install npm:@quintinshaw/pi-dynamic-workflows
 
 Then `/reload` in Pi. You get the `workflow` tool plus the `/workflows` management commands.
 
+### Use from Node
+
+For a Node ESM application, install the library and its Pi SDK peers:
+
+```bash
+npm install @quintinshaw/pi-dynamic-workflows \
+  @earendil-works/pi-coding-agent @earendil-works/pi-tui typebox
+```
+
+The object form of `runWorkflow` is the stable one-shot Node API. It loads Pi's agent directory, settings, model catalog, and authentication, then waits for the workflow's real terminal `WorkflowRunResult`:
+
+```js
+// run-audit.mjs
+import { runWorkflow } from '@quintinshaw/pi-dynamic-workflows'
+
+const controller = new AbortController()
+
+const completed = await runWorkflow({
+  script: `export const meta = {
+    name: 'node_audit',
+    description: 'Audit targets supplied by the caller',
+  }
+  const findings = await parallel(args.targets.map((target) =>
+    () => agent('Audit ' + target, { tier: 'small', readOnly: true })
+  ))
+  return { findings, project: cwd }`,
+  args: { targets: ['src/auth.ts', 'src/routes.ts'] },
+  cwd: process.cwd(),
+  mainModel: 'anthropic/claude-sonnet-4-5',
+  signal: controller.signal,
+  persistLogs: false,
+})
+
+console.log(completed.result)
+console.log(completed.agentCount, completed.tokenUsage, completed.durationMs)
+```
+
+Reusable workflows can be trusted native ESM. Relative `scriptPath` values resolve from `cwd` (or `process.cwd()` when `cwd` is omitted), and imports inside the module resolve normally from the module file:
+
+```js
+// workflows/review.mjs
+import { summarize } from './summarize.mjs'
+
+export const meta = { name: 'node_review', description: 'Review one target' }
+
+export async function run({ agent, args, cwd }) {
+  const review = await agent(`Review ${args.target} under ${cwd}`, {
+    model: args.model,
+    readOnly: true,
+  })
+  return summarize(review)
+}
+```
+
+```js
+// workflows/summarize.mjs
+export function summarize(review) {
+  return { summary: review.trim() }
+}
+```
+
+```js
+// run-review.mjs
+import { runWorkflow } from '@quintinshaw/pi-dynamic-workflows'
+
+const completed = await runWorkflow({
+  scriptPath: './workflows/review.mjs',
+  args: { target: 'src/', model: 'openai/gpt-5.4' },
+  cwd: process.cwd(),
+})
+
+console.log(completed.result)
+```
+
+Pass exactly one of `script` or `scriptPath`.
+
+| Option | Semantics |
+| --- | --- |
+| `script` / `scriptPath` | Inline VM source, or a trusted native ESM entry point exporting `meta` and `run(context)`. Exactly one is required. |
+| `args` | Any caller-owned value exposed as `args` (or `context.args`) without interpretation. |
+| `cwd` | Base directory for path resolution and default agent/bash work. Relative values resolve from the calling process's current directory. This is also the Pi project trust boundary: setup loads that project's configured package sources and `.pi/extensions` (resolving/installing packages when needed) and executes extension code, so use only a trusted directory. |
+| `mainModel` | Exact `provider/modelId` used by untagged agents and as the fallback route for an unconfigured tier. |
+| `signal` | Run-level `AbortSignal`, forwarded to agent and bash work. Cancellation rejects with `WorkflowErrorCode.WORKFLOW_ABORTED`; trusted native JS is not forcibly preempted between runtime calls. |
+| `agentTimeoutMs` | Per-agent attempt timeout. `null` means no hard timeout. An individual `agent(..., { timeoutMs })` overrides it. This is not a whole-workflow deadline. |
+| `concurrency` / `agentRetries` | Run-level agent concurrency and recoverable retry limits; per-agent options still take precedence. |
+| `persistLogs`, `artifactCwd`, `runId` | Control one-shot log/bash artifacts and their run identity. Logs persist by default; this does not create managed run state. |
+| callbacks | The progress, phase, agent, usage, and log callbacks from `WorkflowRunOptions` observe the in-process run. |
+| `agent`, `agentRegistry`, `tools`, `instructions` | Advanced injection/customization boundaries for tests and embedded hosts. Ordinary callers do not need Pi SDK plumbing. |
+
+`WorkflowRunResult<T>` contains the validated workflow `meta`, returned `result`, collected `logs` and `phases`, `agentCount`, `durationMs`, `runId`, and cumulative `tokenUsage`/cost. The promise resolves only after the workflow and its awaited runtime-owned work finish; workflow, module-load, model, timeout, and abort errors reject it rather than being converted into a result.
+
+The object API resolves `PI_CODING_AGENT_DIR` or `~/.pi/agent`, reads `auth.json`, `models.json`, and effective settings through public `@earendil-works/pi-coding-agent` APIs, composes configured provider extensions, and creates one `ModelRuntime` plus one shared `ModelRegistry` per run. SDK catalog refreshes do not use the network during setup. The same runtime is passed to every subagent session in that run, while each concurrent session keeps isolated extension state. If `mainModel` is omitted, the configured default provider/model is used when both are present; tiers come from `~/.pi/workflows/model-tiers.json`. `mainModel`, a script's explicit `agent(..., { model })`, and `fallbackModel` use unambiguous `provider/modelId` specs. Existing phase/meta routes, agent-type definitions, and tier settings may also use a bare model id; the shared registry resolves it using the same available-first policy as `WorkflowAgent`. Every selected route, including configured routes, must exist and be authenticated. An unavailable route fails before that agent starts; only an explicit `fallbackModel` permits a different model.
+
+`AbortSignal` is checked during setup and around workflow runtime calls, and aborts active agent/bash work. Trusted native module code is not forcibly preempted while it is between runtime calls; if it creates other asynchronous work, that code must settle or observe a caller-supplied signal itself. `agentTimeoutMs` and per-agent `timeoutMs` bound individual agent attempts; `bash(..., { timeoutMs })` bounds one shell step. Inline code has no timers. There is deliberately no implicit whole-workflow timeout.
+
+Common failures are rejected directly: source-selection and inline validation errors, native ESM load/export errors, unavailable or unauthenticated models, classified `WorkflowError`s from agent/bash/checkpoint execution, and errors thrown by workflow code. A one-shot `checkpoint()` rejects with `CHECKPOINT_INPUT_REQUIRED` because this API has no reply/resume lifecycle.
+
+`runWorkflow({ ... })` is awaited one-shot execution: the calling process owns the run and must remain alive until the promise settles. It does **not** persist `WorkflowManager` state or provide durable resume, retry, pause, checkpoint replies, or terminal delivery. Use `WorkflowManager.startInBackground()` when the program needs those managed-run paths:
+
+```js
+import { WorkflowManager } from '@quintinshaw/pi-dynamic-workflows'
+
+const manager = new WorkflowManager({ cwd: process.cwd() })
+const { runId, promise } = manager.startInBackground(inlineScript, args)
+console.log('started', runId)
+
+// Await this when the Node process must stay alive for terminal completion.
+const completed = await promise
+```
+
+The manager starts asynchronously and persists run/journal state for its resume/retry APIs; its returned promise is still the terminal result for this process. The Pi extension's `workflow` tool is different again: it always launches through the manager in the background, ends the current Pi turn immediately, updates the live panel, and delivers completion or checkpoint events back to the parent conversation.
+
+The original low-level `runWorkflow(script, options)` signature remains supported for existing consumers and injected hosts. New standalone Node callers should use the object form so the package owns Pi runtime/model setup.
+
 ## Try it
 
 Ask in plain language:
