@@ -10,7 +10,13 @@ import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
 import type { AgentThinkingLevel, AgentUsage } from "./agent.js";
-import { AGENT_THINKING_LEVELS, isAgentThinkingLevel, WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
+import {
+  AGENT_THINKING_LEVELS,
+  isAgentThinkingLevel,
+  isExactModelSpec,
+  WorkflowAgent,
+  type WorkflowAgentOptions,
+} from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import {
   type AgentDefinition,
@@ -28,7 +34,6 @@ import { workflowProjectPaths } from "./workflow-paths.js";
 
 const AGENT_TIMEOUT_CLEANUP_GRACE_MS = 1000;
 const AGENT_TIERS = ["small", "medium", "big"] as const;
-const EXACT_MODEL_SPEC = /^[a-z0-9][a-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 
 export type AgentTier = (typeof AGENT_TIERS)[number];
 
@@ -547,10 +552,7 @@ export async function runWorkflow<T = unknown>(
         { recoverable: false, agentLabel: agentOptions.label },
       );
     }
-    if (
-      agentOptions.model !== undefined &&
-      (typeof agentOptions.model !== "string" || !EXACT_MODEL_SPEC.test(agentOptions.model))
-    ) {
+    if (agentOptions.model !== undefined && !isExactModelSpec(agentOptions.model)) {
       const tierHint =
         typeof agentOptions.model === "string" && AGENT_TIERS.includes(agentOptions.model as AgentTier)
           ? `; use opts.tier: "${agentOptions.model}"`
