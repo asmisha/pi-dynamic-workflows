@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { createAgentSessionServices, ModelRegistry, type SettingsManager } from "@earendil-works/pi-coding-agent";
 import { assertAgentModelAvailable, createFailClosedModelAgent, isExactModelSpec, WorkflowAgent } from "./agent.js";
-import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import {
   loadWorkflowModule,
   parseWorkflowScript,
@@ -117,7 +117,7 @@ export async function runWorkflow<T = unknown>(
   const agent = createFailClosedModelAgent(baseAgent, mainModel, modelRegistry);
 
   try {
-    const result = await runWorkflowScript<T>(script ?? "", {
+    return await runWorkflowScript<T>(script ?? "", {
       ...options,
       cwd,
       mainModel,
@@ -125,10 +125,16 @@ export async function runWorkflow<T = unknown>(
       agent,
       workflowModule,
     });
-    if (options.signal?.aborted) throw aborted();
-    return result;
   } catch (error) {
-    if (options.signal?.aborted) throw aborted();
-    throw error;
+    if (!options.signal?.aborted) throw error;
+    const wrapped = wrapError(error);
+    if (wrapped.code === WorkflowErrorCode.WORKFLOW_ABORTED) throw wrapped;
+    throw new WorkflowError(wrapped.message, WorkflowErrorCode.WORKFLOW_ABORTED, {
+      recoverable: true,
+      details: error,
+      agentLabel: wrapped.agentLabel,
+      resetHint: wrapped.resetHint,
+      callId: wrapped.callId,
+    });
   }
 }

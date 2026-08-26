@@ -628,8 +628,31 @@ return await agent('wait')`,
     controller.abort();
     await assert.rejects(
       () => running,
-      (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED,
+      (error: unknown) =>
+        error instanceof WorkflowError &&
+        error.code === WorkflowErrorCode.WORKFLOW_ABORTED &&
+        error.details instanceof Error &&
+        /agent observed abort/i.test(error.details.message),
     );
+
+    writeFileSync(
+      join(cwd, "complete-after-abort.mjs"),
+      `export const meta = { name: 'complete_after_abort', description: 'completion wins abort race' }
+export async function run({ args }) {
+  args.abort()
+  return 'completed-result'
+}
+`,
+    );
+    const completionController = new AbortController();
+    const completed = await runWorkflow({
+      scriptPath: "./complete-after-abort.mjs",
+      cwd,
+      signal: completionController.signal,
+      args: { abort: () => completionController.abort() },
+      persistLogs: false,
+    });
+    assert.equal(completed.result, "completed-result");
 
     await assert.rejects(
       () =>
