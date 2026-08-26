@@ -26,9 +26,12 @@ export interface AgentDefinition {
   name: string;
   /** One-line summary (for discoverability in the tool guideline). */
   description?: string;
-  /** Allowlist of coding-tool names the subagent may use. Undefined = all. */
+  /**
+   * Tool allowlist. Under read-only mode it is final across built-in and
+   * extension tools; otherwise it restricts coding tools. Undefined = all.
+   */
   tools?: string[];
-  /** Denylist of coding-tool names, applied after the allowlist. */
+  /** Tool denylist applied after the allowlist; under read-only mode it also covers extension tools. */
   disallowedTools?: string[];
   /** Model spec (`provider/modelId` or bare id) for this subagent. */
   model?: string;

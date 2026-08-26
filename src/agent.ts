@@ -60,6 +60,49 @@ const READ_ONLY_TOOL_NAMES = [
   "structured_output",
 ];
 
+/** Built-in or extension tool names whose coding contract permits repository-file mutation. */
+const READ_ONLY_MUTATING_TOOL_NAMES = new Set(["edit", "write", "apply_patch", "patch", "ast_grep_replace"]);
+
+/**
+ * Resolve the SDK's final read-only allowlist. A named agent policy replaces the
+ * ordinary fixed list so extension tools must be named explicitly. Repository
+ * mutators and workflow controls remain hard denials; structured output is a
+ * schema capability and is therefore added after the named allow/deny policy.
+ */
+function resolveReadOnlyToolNames(
+  allow: string[] | undefined,
+  deny: string[] | undefined,
+  sandboxedBashEnabled: boolean,
+  structuredOutputEnabled: boolean,
+): string[] {
+  const policyNames = allow?.length ? allow : READ_ONLY_TOOL_NAMES;
+  const allowedTools = applyToolPolicy(
+    policyNames.map((name) => ({ name })),
+    allow,
+    deny,
+  );
+  const workflowToolNames = new Set(WORKFLOW_TOOL_NAMES);
+  const seen = new Set<string>();
+  const names: string[] = [];
+
+  for (const { name } of allowedTools) {
+    if (
+      seen.has(name) ||
+      name === "structured_output" ||
+      READ_ONLY_MUTATING_TOOL_NAMES.has(name) ||
+      workflowToolNames.has(name) ||
+      (name === "bash" && !sandboxedBashEnabled)
+    ) {
+      continue;
+    }
+    seen.add(name);
+    names.push(name);
+  }
+
+  if (structuredOutputEnabled) names.push("structured_output");
+  return names;
+}
+
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
  * else the first balanced {...} or [...]. Best-effort (the schema check is the
@@ -635,13 +678,13 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    */
   sessionPath?: string;
   /**
-   * Restrict the subagent's coding tools to these names (an agentType
-   * definition's `tools` allowlist). Undefined = all coding tools. The
-   * structured_output tool is always added after this filter, so a schema
-   * still works under a restrictive allowlist.
+   * Restrict the subagent's tools to these names (an agentType definition's
+   * `tools` allowlist). Under read-only mode this is the final built-in and
+   * extension-tool allowlist after hard denials. The structured_output tool is
+   * always added afterward, so a schema still works under a restrictive policy.
    */
   toolNames?: string[];
-  /** Remove these coding-tool names after the allowlist (an agentType `disallowedTools` denylist). */
+  /** Remove these tool names after the allowlist (an agentType `disallowedTools` denylist). */
   disallowedToolNames?: string[];
   /** Allow this subagent to launch nested workflow runs; the workflow orchestration tools are excluded by default. */
   allowSubagents?: boolean;
@@ -752,8 +795,11 @@ export class WorkflowAgent {
     if (options.schema) {
       customTools.push(createStructuredOutputTool({ schema: options.schema, capture }) as unknown as ToolDefinition);
     }
-    const readOnlyToolNames = READ_ONLY_TOOL_NAMES.filter(
-      (name) => (name !== "bash" || sandboxedBashEnabled) && (name !== "structured_output" || options.schema),
+    const readOnlyToolNames = resolveReadOnlyToolNames(
+      options.toolNames,
+      options.disallowedToolNames,
+      sandboxedBashEnabled,
+      Boolean(options.schema),
     );
 
     // Resolve the model spec (explicit model > tier > session default). This

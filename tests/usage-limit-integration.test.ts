@@ -23,7 +23,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type AgentUsage, WorkflowAgent } from "../src/agent.js";
+import type { AgentRegistry } from "../src/agent-registry.js";
 import { WorkflowErrorCode } from "../src/errors.js";
+import { runWorkflow } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -431,6 +433,212 @@ test("onUsage alone receives one nonzero final snapshot from a real subagent ses
     });
   }));
 
+test("a resolved named read-only policy is final across built-in and extension tools", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage, fauxToolCall }) => {
+    let activeTools: string[] = [];
+    let executeCalls = 0;
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          for (const name of [
+            "grep",
+            "web_search",
+            "unlisted_extension",
+            "ast_grep_replace",
+            "workflow",
+            "workflow_status",
+          ]) {
+            pi.registerTool(
+              defineTool({
+                name,
+                description: `${name} test tool`,
+                parameters: Type.Object({}),
+                async execute() {
+                  return { content: [{ type: "text", text: "ok" }] };
+                },
+              }),
+            );
+          }
+          pi.registerTool(
+            defineTool({
+              name: "execute",
+              description: "execute test tool",
+              parameters: Type.Object({}),
+              async execute() {
+                executeCalls++;
+                return { content: [{ type: "text", text: "executed" }] };
+              },
+            }),
+          );
+          pi.on("session_start", () => {
+            activeTools = pi.getActiveTools();
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([
+      fauxAssistantMessage(fauxToolCall("execute", {}), { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("structured_output", { ok: true }), { stopReason: "toolUse" }),
+    ]);
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
+    const agentRegistry: AgentRegistry = new Map([
+      [
+        "market",
+        {
+          name: "market",
+          tools: ["read", "web_search", "execute"],
+          prompt: "Research the market without changing the repository.",
+          source: "project",
+        },
+      ],
+    ]);
+
+    const result = await runWorkflow(
+      `export const meta = { name: 'named_read_only', description: 'named read-only policy' }
+return await agent('research', {
+  label: 'market',
+  agentType: 'market',
+  readOnly: true,
+  schema: {
+    type: 'object',
+    properties: { ok: { type: 'boolean' } },
+    required: ['ok'],
+    additionalProperties: false,
+  },
+})`,
+      { agent, agentRegistry, persistLogs: false },
+    );
+
+    assert.deepEqual(result.result, { ok: true });
+    assert.equal(executeCalls, 1, "the named execute tool should be callable");
+    assert.deepEqual(
+      new Set(activeTools),
+      new Set(["read", "web_search", "execute", "structured_output"]),
+      `expected the named policy plus schema output to be final, got ${activeTools.join(", ")}`,
+    );
+  }));
+
+test("a named read-only denylist and hard denials cannot re-enable mutating or workflow tools", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
+    let activeTools: string[] = [];
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          for (const name of ["execute", "ast_grep_replace", "workflow"]) {
+            pi.registerTool(
+              defineTool({
+                name,
+                description: `${name} test tool`,
+                parameters: Type.Object({}),
+                async execute() {
+                  return { content: [{ type: "text", text: "ok" }] };
+                },
+              }),
+            );
+          }
+          pi.on("session_start", () => {
+            activeTools = pi.getActiveTools();
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([fauxAssistantMessage("done", { stopReason: "stop" })]);
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
+    const agentRegistry: AgentRegistry = new Map([
+      [
+        "locked",
+        {
+          name: "locked",
+          tools: ["read", "execute", "edit", "write", "ast_grep_replace", "workflow"],
+          disallowedTools: ["execute"],
+          prompt: "Inspect without changing the repository.",
+          source: "project",
+        },
+      ],
+    ]);
+
+    const result = await runWorkflow(
+      `export const meta = { name: 'locked_read_only', description: 'read-only hard denials' }
+return await agent('inspect', { label: 'locked', agentType: 'locked', readOnly: true })`,
+      { agent, agentRegistry, persistLogs: false },
+    );
+
+    assert.equal(result.result, "done");
+    assert.deepEqual(activeTools, ["read"], `expected only the non-denied read tool, got ${activeTools.join(", ")}`);
+  }));
+
+test("a named read-only denylist applies without an allowlist", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
+    let activeTools: string[] = [];
+    const agentDir = getAgentDir();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: SettingsManager.create(cwd, agentDir),
+      extensionFactories: [
+        (pi) => {
+          for (const name of ["grep", "web_search"]) {
+            pi.registerTool(
+              defineTool({
+                name,
+                description: `${name} test tool`,
+                parameters: Type.Object({}),
+                async execute() {
+                  return { content: [{ type: "text", text: "ok" }] };
+                },
+              }),
+            );
+          }
+          pi.on("session_start", () => {
+            activeTools = pi.getActiveTools();
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    setResponses([fauxAssistantMessage("done", { stopReason: "stop" })]);
+    const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
+    const agentRegistry: AgentRegistry = new Map([
+      [
+        "deny-only",
+        {
+          name: "deny-only",
+          disallowedTools: ["web_search"],
+          prompt: "Inspect without web search.",
+          source: "project",
+        },
+      ],
+    ]);
+
+    const result = await runWorkflow(
+      `export const meta = { name: 'deny_only_read_only', description: 'read-only deny-only policy' }
+return await agent('inspect', { label: 'deny-only', agentType: 'deny-only', readOnly: true })`,
+      { agent, agentRegistry, persistLogs: false },
+    );
+
+    assert.equal(result.result, "done");
+    const expectedTools = ["read", "grep", "find", "ls"];
+    if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) expectedTools.push("bash");
+    assert.deepEqual(
+      new Set(activeTools),
+      new Set(expectedTools),
+      `expected the deny-only policy to remove web_search, got ${activeTools.join(", ")}`,
+    );
+  }));
+
 test("a read-only real subagent excludes write-capable tools and preserves read-only tools", () =>
   withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     let activeTools: string[] = [];
@@ -450,6 +658,8 @@ test("a read-only real subagent excludes write-capable tools and preserves read-
               "fffind",
               "ast_grep_search",
               "web_search",
+              "execute",
+              "unlisted_extension",
               "ast_grep_replace",
               "structured_return",
               "workflow",
@@ -476,19 +686,13 @@ test("a read-only real subagent excludes write-capable tools and preserves read-
     const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
     await agent.run("review the code", { label: "read-only", readOnly: true });
 
-    assert.ok(activeTools.includes("read"), `expected read to remain active, got ${activeTools.join(", ")}`);
-    for (const name of ["grep", "find", "ls", "ffgrep", "fffind", "ast_grep_search", "web_search"]) {
-      assert.ok(activeTools.includes(name), `expected ${name} to remain active, got ${activeTools.join(", ")}`);
-    }
-    const sandboxedBashAvailable = process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec");
-    assert.equal(
-      activeTools.includes("bash"),
-      sandboxedBashAvailable,
-      `expected bash availability to match the read-only sandbox, got ${activeTools.join(", ")}`,
+    const expectedTools = ["read", "grep", "find", "ls", "ffgrep", "fffind", "ast_grep_search", "web_search"];
+    if (process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec")) expectedTools.push("bash");
+    assert.deepEqual(
+      new Set(activeTools),
+      new Set(expectedTools),
+      `expected the ordinary fixed read-only tool set, got ${activeTools.join(", ")}`,
     );
-    for (const name of ["edit", "write", "ast_grep_replace", "structured_return", "workflow"]) {
-      assert.ok(!activeTools.includes(name), `expected ${name} to be excluded, got ${activeTools.join(", ")}`);
-    }
   }));
 
 test("workflow orchestration tools are excluded from every subagent session", () =>
