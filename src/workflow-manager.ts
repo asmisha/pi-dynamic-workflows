@@ -265,8 +265,7 @@ export class WorkflowManager extends EventEmitter {
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
-  /** Short-TTL cache for listRuns(): the task panel re-renders on every run event,
-   * and an uncached list re-reads + re-parses every persisted run file each time. */
+  /** Short-TTL cache for repeated persisted-history queries. */
   private runsCache?: { at: number; runs: PersistedRunState[] };
   /** Pending debounced persists, keyed by runId (progress/journal saves are coalesced). */
   private persistTimers = new Map<string, NodeJS.Timeout>();
@@ -1391,6 +1390,13 @@ export class WorkflowManager extends EventEmitter {
     return this.runs.get(runId);
   }
 
+  /** Active runs owned by this manager's current session. Never reads persisted history. */
+  listActiveRuns(): ManagedRun[] {
+    return [...this.runs.values()].filter(
+      (run) => this.ownsCurrentSession(run.sessionId) && (run.status === "running" || run.status === "paused"),
+    );
+  }
+
   private ownsCurrentSession(owner: string | undefined): boolean {
     return this.sessionId === undefined || owner === undefined || owner === this.sessionId;
   }
@@ -1437,19 +1443,15 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * List all runs (active + persisted).
-   */
-  /**
-   * Runs for the navigator/task panel. Once bound to a session (setSessionId), only
-   * that session's runs are returned — runs from other sessions stay on disk and
-   * reappear when you switch back. Unbound (tests/legacy) returns everything.
+   * Persisted runs for the navigator and commands. Once bound to a session
+   * (setSessionId), only that session's runs are returned — runs from other
+   * sessions stay on disk and reappear when you switch back. Unbound
+   * (tests/legacy) returns everything.
    */
   listRuns(): PersistedRunState[] {
     const now = Date.now();
-    // 300ms TTL: the task panel calls this on every run event; without a cache
-    // each call re-reads and re-parses every persisted run file plus a lock file
-    // and a pid liveness probe per run. Writers invalidate via the wrapped
-    // persistence, so the TTL only bounds staleness from OTHER processes.
+    // Writers invalidate this cache, so the TTL only bounds staleness from
+    // other processes during repeated history queries.
     if (!this.runsCache || now - this.runsCache.at > 300) {
       this.runsCache = {
         at: now,

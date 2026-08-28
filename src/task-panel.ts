@@ -283,29 +283,19 @@ export function installResultDelivery(
 }
 
 export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {
-  const all = manager.listRuns();
-  const active = all.filter((r) => r.status === "running" || r.status === "paused");
+  const active = manager.listActiveRuns();
   if (!active.length) return [];
   const rows = active.map((r) => {
-    const live = manager.getRun(r.runId);
-    const steps = live?.snapshot.agents ?? r.agents;
+    const steps = r.snapshot.agents;
     const done = steps.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     // Running bash steps are the only visible work in script-heavy workflows.
     const bashRunning = steps.filter((a) => !isAgentStep(a) && a.status === "running").length;
     const bash = bashRunning ? ` · ${bashRunning} bash running` : "";
-    const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
-    return `  ${icon} ${r.workflowName}  ${done}/${steps.length} steps${bash}${phase}`;
+    const phase = r.snapshot.currentPhase ? ` · ${r.snapshot.currentPhase}` : "";
+    return `  ${icon} ${r.snapshot.name}  ${done}/${steps.length} steps${bash}${phase}`;
   });
-  // Finished runs leave this live panel but are kept in the navigator. Tell the
-  // user so a completed run doesn't look like it vanished.
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
-  const hint = theme.fg(
-    "dim",
-    finished > 0
-      ? `  /workflows — open navigator (${finished} finished kept in history)`
-      : "  /workflows — open navigator",
-  );
+  const hint = theme.fg("dim", "  /workflows — open navigator");
   return [theme.bold(`Workflows running (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
 }
 
@@ -427,19 +417,17 @@ export function renderPanelDetailed(
   maxAgents: number,
   now: number,
 ): string[] {
-  const all = manager.listRuns();
-  const active = all.filter((r) => r.status === "running" || r.status === "paused");
+  const active = manager.listActiveRuns();
   if (!active.length) return [];
   const dim = (t: string) => theme.fg("dim", t);
   const out: string[] = [theme.bold(`Workflows running (${active.length}):`)];
 
   for (const r of active) {
-    const live = manager.getRun(r.runId);
-    const snap = live?.snapshot;
-    const agents = (snap?.agents ?? r.agents) as WorkflowAgentSnapshot[];
+    const snap = r.snapshot;
+    const agents = snap.agents;
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
-    const usage = snap?.tokenUsage ?? r.tokenUsage;
+    const usage = snap.tokenUsage;
     // Sum per-agent usage so the run header stays consistent with the phase
     // subtotals. Running agents update after each provider response.
     const total = agents.reduce((n, a) => n + (a.tokens ?? 0), 0);
@@ -451,7 +439,7 @@ export function renderPanelDetailed(
     const meta = [
       `${done}/${agents.length} steps`,
       bashRunning ? `${bashRunning} bash running` : "",
-      snap?.currentPhase || "",
+      snap.currentPhase || "",
       total > 0 ? `${fmtTokensShort(total)} tok` : "",
       // 2 decimals for ≥1¢, 4 for sub-cent so a real cost never shows as "$0.00".
       // (cost is only known once the run finalizes its usage.)
@@ -460,18 +448,11 @@ export function renderPanelDetailed(
     ]
       .filter(Boolean)
       .join(" · ");
-    out.push(`  ${icon} ${theme.bold(r.workflowName)}  ${dim(meta)}`);
-    if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme));
+    out.push(`  ${icon} ${theme.bold(snap.name)}  ${dim(meta)}`);
+    out.push(...renderRunBody(snap, agents, maxAgents, theme));
   }
 
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
-  out.push(
-    dim(
-      finished > 0
-        ? `  /workflows — open navigator (${finished} finished kept in history)`
-        : "  /workflows — open navigator",
-    ),
-  );
+  out.push(dim("  /workflows — open navigator"));
   return out.map((line) => fitLine(line, width));
 }
 
@@ -504,7 +485,7 @@ export function installTaskPanel(
     }
     return cached;
   };
-  const hasActiveRun = () => manager.listRuns().some((r) => r.status === "running" || r.status === "paused");
+  const hasActiveRun = () => manager.listActiveRuns().length > 0;
 
   ui.setWidget(
     "workflow-tasks",

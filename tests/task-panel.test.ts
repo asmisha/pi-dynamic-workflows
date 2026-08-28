@@ -621,11 +621,9 @@ describe("installResultDelivery", () => {
 describe("installTaskPanel", () => {
   it("registers a widget named workflow-tasks with belowEditor placement", () => {
     const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
-      getRun: (...args: unknown[]) => unknown;
-      listRuns: () => unknown[];
+      listActiveRuns: () => unknown[];
     };
-    manager.getRun = () => null;
-    manager.listRuns = () => [];
+    manager.listActiveRuns = () => [];
 
     let registeredName = "";
     let registeredPlacement = "";
@@ -643,17 +641,16 @@ describe("installTaskPanel", () => {
 
   it("passes the render width through to the task panel", () => {
     const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
-      getRun: (...args: unknown[]) => unknown;
-      listRuns: () => unknown[];
+      listActiveRuns: () => unknown[];
     };
-    manager.getRun = () => undefined;
-    manager.listRuns = () => [
+    manager.listActiveRuns = () => [
       {
         runId: "a",
-        workflowName: "handle_gh_issues_11_12_with_a_long_suffix",
         status: "running",
-        agents: [{ status: "done" }, { status: "running" }],
-        logs: [],
+        snapshot: {
+          name: "handle_gh_issues_11_12_with_a_long_suffix",
+          agents: [{ status: "done" }, { status: "running" }],
+        },
       },
     ];
 
@@ -684,20 +681,24 @@ describe("installTaskPanel", () => {
 describe("renderPanel", () => {
   const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 
-  it("hints that finished runs are kept in /workflows history", async () => {
+  it("renders active runs without reading persisted history", async () => {
     const { renderPanel } = await import("../src/task-panel.js");
     const manager = {
-      listRuns: () => [
-        { runId: "a", workflowName: "live", status: "running", agents: [{ status: "done" }], logs: [] },
-        { runId: "b", workflowName: "old", status: "completed", agents: [], logs: [] },
-        { runId: "c", workflowName: "older", status: "aborted", agents: [], logs: [] },
+      listActiveRuns: () => [
+        {
+          runId: "a",
+          status: "running",
+          snapshot: { name: "live", agents: [{ status: "done" }] },
+        },
       ],
-      getRun: () => undefined,
+      listRuns: () => {
+        throw new Error("render must not list persisted history");
+      },
     };
     const lines = renderPanel(manager as never, theme as never);
     assert.ok(
-      lines.some((l) => /2 finished kept in history/.test(l)),
-      "hint should report the finished-run count",
+      lines.some((l) => l.includes("live")),
+      "active run should be rendered",
     );
     assert.ok(
       lines.some((l) => l.includes("/workflows")),
@@ -707,10 +708,7 @@ describe("renderPanel", () => {
 
   it("renders nothing when no run is active", async () => {
     const { renderPanel } = await import("../src/task-panel.js");
-    const manager = {
-      listRuns: () => [{ runId: "b", workflowName: "old", status: "completed", agents: [], logs: [] }],
-      getRun: () => undefined,
-    };
+    const manager = { listActiveRuns: () => [] };
     assert.deepEqual(renderPanel(manager as never, theme as never), []);
   });
 
@@ -721,22 +719,17 @@ describe("renderPanel", () => {
       bold: (t: string) => `\x1b[1m${t}\x1b[22m`,
     };
     const manager = {
-      listRuns: () => [
+      listActiveRuns: () => [
         {
           runId: "a",
-          workflowName: "handle_gh_issues_11_12_中文_🙂_very_long_workflow_name",
           status: "running",
-          agents: [{ status: "done" }, { status: "running" }],
-          logs: [],
+          snapshot: {
+            name: "handle_gh_issues_11_12_中文_🙂_very_long_workflow_name",
+            currentPhase: "Issue implementation phase with a very long suffix",
+            agents: [{ status: "done" }, { status: "running" }],
+          },
         },
-        { runId: "b", workflowName: "old", status: "completed", agents: [], logs: [] },
       ],
-      getRun: () => ({
-        snapshot: {
-          currentPhase: "Issue implementation phase with a very long suffix",
-          agents: [{ status: "done" }, { status: "running" }],
-        },
-      }),
     };
 
     const lines = renderPanel(manager as never, ansiTheme as never, 42);
@@ -820,10 +813,7 @@ describe("renderPanelDetailed", () => {
       tokenUsage: { total: 0, input: 0, output: 0, cost: 0.02 },
     };
     return {
-      listRuns: () => [
-        { runId: "r1", workflowName: "auth_audit", status, agents: snapshot.agents, tokenUsage: snapshot.tokenUsage },
-      ],
-      getRun: (id: string) => (id === "r1" ? { snapshot, status } : undefined),
+      listActiveRuns: () => [{ runId: "r1", status, snapshot }],
     };
   }
 
@@ -901,8 +891,7 @@ describe("installTaskPanel mode selection", () => {
 
   function activeManager() {
     const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
-      getRun: (id: string) => unknown;
-      listRuns: () => unknown[];
+      listActiveRuns: () => unknown[];
     };
     const snapshot = {
       name: "wf",
@@ -912,10 +901,7 @@ describe("installTaskPanel mode selection", () => {
       agents: [{ id: 1, label: "a", status: "running", phase: "P1", tokens: 500 }],
       tokenUsage: { total: 500, input: 250, output: 250 },
     };
-    manager.listRuns = () => [
-      { runId: "r1", workflowName: "wf", status: "running", agents: snapshot.agents, tokenUsage: snapshot.tokenUsage },
-    ];
-    manager.getRun = (id: string) => (id === "r1" ? { snapshot, status: "running" } : undefined);
+    manager.listActiveRuns = () => [{ runId: "r1", status: "running", snapshot }];
     return manager;
   }
 

@@ -802,6 +802,18 @@ test(
 );
 
 test(
+  "WorkflowManager.listActiveRuns does not read persisted history",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, sessionId: "s1" });
+    manager.getPersistence().list = () => {
+      throw new Error("active runs must come from memory");
+    };
+
+    assert.deepEqual(manager.listActiveRuns(), []);
+  }),
+);
+
+test(
   "WorkflowManager.listRuns is scoped to the bound session and switches with setSessionId",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
