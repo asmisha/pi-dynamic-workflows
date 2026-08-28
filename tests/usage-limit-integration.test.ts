@@ -9,9 +9,9 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 import {
   DefaultResourceLoader,
@@ -30,6 +30,87 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 import { loadFaux } from "./helpers/load-faux.js";
 
 const USAGE_LIMIT_MSG = "Codex usage limit reached (plus plan). Resets in ~3h.";
+const SAFE_MISE_VARIABLE = "PI_WORKFLOW_SAFE_PROJECT_VALUE";
+const SAFE_INHERITED_VARIABLE = "PI_WORKFLOW_SAFE_INHERITED_VALUE";
+
+async function withSyntheticMise(run: () => Promise<void>): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-mise-"));
+  const bin = join(root, "bin");
+  const executable = join(bin, "mise");
+  const globalConfig = join(root, "global.toml");
+  mkdirSync(bin);
+  writeFileSync(globalConfig, `[env]\n${SAFE_MISE_VARIABLE} = "global-wrong"\n`);
+  writeFileSync(
+    executable,
+    `#!/usr/bin/env node
+const { existsSync, readFileSync, realpathSync, rmSync } = require("node:fs");
+const { join } = require("node:path");
+const args = process.argv.slice(2);
+const cdIndex = args.indexOf("-C");
+const cwd = cdIndex >= 0 ? args[cdIndex + 1] : process.cwd();
+const globalConfig = ${JSON.stringify(globalConfig)};
+const localConfig = [
+  join(cwd, "mise.toml"),
+  join(cwd, ".mise", "config.toml"),
+  join(cwd, ".config", "mise", "config.toml"),
+].find(existsSync);
+if (args[0] === "config" && args[1] === "ls") {
+  const failOnce = join(cwd, ".mise-fail-once");
+  if (existsSync(failOnce)) {
+    rmSync(failOnce);
+    process.exit(1);
+  }
+  const configs = [{ path: realpathSync(globalConfig), tools: [] }];
+  if (localConfig) configs.unshift({ path: realpathSync(localConfig), tools: [] });
+  process.stdout.write(JSON.stringify(configs));
+} else if (args[0] === "env") {
+  const config = localConfig ?? globalConfig;
+  const match = readFileSync(config, "utf8").match(/${SAFE_MISE_VARIABLE}\\s*=\\s*"([^"]*)"/);
+  if (!match) process.exit(1);
+  process.stdout.write(JSON.stringify({ ${SAFE_MISE_VARIABLE}: match[1] }));
+} else {
+  process.exit(2);
+}
+`,
+  );
+  chmodSync(executable, 0o755);
+
+  const previousPath = process.env.PATH;
+  process.env.PATH = [bin, previousPath].filter(Boolean).join(delimiter);
+  try {
+    await run();
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function toolResultTexts(context: unknown): string[] {
+  const messages = (context as { messages?: Array<{ role?: string; content?: unknown }> }).messages ?? [];
+  return messages.flatMap((message) => {
+    if (message.role !== "toolResult") return [];
+    const content = Array.isArray(message.content) ? message.content : [];
+    const text = content.find((part): part is { type: "text"; text: string } =>
+      Boolean(
+        part &&
+          typeof part === "object" &&
+          (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string",
+      ),
+    )?.text;
+    return text === undefined ? [] : [text.trim()];
+  });
+}
+
+function echoLatestToolText(
+  context: unknown,
+  fauxAssistantMessage: typeof import("@earendil-works/pi-ai").fauxAssistantMessage,
+): unknown {
+  const text = toolResultTexts(context).at(-1);
+  if (text === undefined) throw new Error("bash did not produce a text tool result");
+  return fauxAssistantMessage(text, { stopReason: "stop" });
+}
 
 /**
  * Run `fn` with isolated Pi settings and a dummy provider key so
@@ -131,6 +212,167 @@ async function withFauxSession(
     rmSync(cwd, { recursive: true, force: true });
   }
 }
+
+test("a subagent cwd without mise configuration preserves the inherited process environment", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage, fauxToolCall }) => {
+    await withSyntheticMise(async () => {
+      const previousValue = process.env[SAFE_MISE_VARIABLE];
+      process.env[SAFE_MISE_VARIABLE] = "inherited-host";
+      try {
+        setResponses([
+          fauxAssistantMessage(fauxToolCall("bash", { command: `printf '%s' "$${SAFE_MISE_VARIABLE}"` }), {
+            stopReason: "toolUse",
+          }),
+          (context: unknown) => echoLatestToolText(context, fauxAssistantMessage),
+        ]);
+        const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
+
+        assert.equal(await agent.run("read the safe project value"), "inherited-host");
+        assert.equal(process.env[SAFE_MISE_VARIABLE], "inherited-host");
+      } finally {
+        if (previousValue === undefined) delete process.env[SAFE_MISE_VARIABLE];
+        else process.env[SAFE_MISE_VARIABLE] = previousValue;
+      }
+    });
+  }));
+
+test("a subagent uses the mise environment configured for its default cwd", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage, fauxToolCall }) => {
+    await withSyntheticMise(async () => {
+      writeFileSync(join(cwd, "mise.toml"), `[env]\n${SAFE_MISE_VARIABLE} = "default-cwd-project"\n`);
+
+      const previousValue = process.env[SAFE_MISE_VARIABLE];
+      process.env[SAFE_MISE_VARIABLE] = "inherited-host";
+      try {
+        setResponses([
+          fauxAssistantMessage(fauxToolCall("bash", { command: `printf '%s' "$${SAFE_MISE_VARIABLE}"` }), {
+            stopReason: "toolUse",
+          }),
+          (context: unknown) => echoLatestToolText(context, fauxAssistantMessage),
+        ]);
+        const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
+
+        assert.equal(await agent.run("read the safe project value"), "default-cwd-project");
+        assert.equal(process.env[SAFE_MISE_VARIABLE], "inherited-host");
+      } finally {
+        if (previousValue === undefined) delete process.env[SAFE_MISE_VARIABLE];
+        else process.env[SAFE_MISE_VARIABLE] = previousValue;
+      }
+    });
+  }));
+
+test("a transient mise failure falls back for one Bash process and retries for the next", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage, fauxToolCall }) => {
+    await withSyntheticMise(async () => {
+      const worktree = join(cwd, "retry-worktree");
+      mkdirSync(worktree);
+      writeFileSync(join(worktree, "mise.toml"), `[env]\n${SAFE_MISE_VARIABLE} = "retry-project"\n`);
+      writeFileSync(join(worktree, ".mise-fail-once"), "fail once\n");
+
+      const previousValue = process.env[SAFE_MISE_VARIABLE];
+      process.env[SAFE_MISE_VARIABLE] = "inherited-host";
+      try {
+        const bashCall = () =>
+          fauxAssistantMessage(fauxToolCall("bash", { command: `printf '%s' "$${SAFE_MISE_VARIABLE}"` }), {
+            stopReason: "toolUse",
+          });
+        setResponses([
+          bashCall(),
+          bashCall(),
+          (context: unknown) => fauxAssistantMessage(toolResultTexts(context).join("|"), { stopReason: "stop" }),
+        ]);
+        const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
+
+        assert.equal(
+          await agent.run("read the safe project value twice", { cwd: worktree }),
+          "inherited-host|retry-project",
+        );
+      } finally {
+        if (previousValue === undefined) delete process.env[SAFE_MISE_VARIABLE];
+        else process.env[SAFE_MISE_VARIABLE] = previousValue;
+      }
+    });
+  }));
+
+test("concurrent subagents bind Bash processes to distinct cwd-local mise environments", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage, fauxToolCall }) => {
+    await withSyntheticMise(async () => {
+      const firstCwd = join(cwd, "worktree-one");
+      const secondCwd = join(cwd, "worktree-two");
+      mkdirSync(join(firstCwd, ".mise"), { recursive: true });
+      mkdirSync(join(secondCwd, ".config", "mise"), { recursive: true });
+      writeFileSync(join(firstCwd, ".mise", "config.toml"), `[env]\n${SAFE_MISE_VARIABLE} = "first-project"\n`);
+      writeFileSync(
+        join(secondCwd, ".config", "mise", "config.toml"),
+        `[env]\n${SAFE_MISE_VARIABLE} = "second-project"\n`,
+      );
+
+      const previousValue = process.env[SAFE_MISE_VARIABLE];
+      const previousInheritedValue = process.env[SAFE_INHERITED_VARIABLE];
+      process.env[SAFE_MISE_VARIABLE] = "inherited-host";
+      process.env[SAFE_INHERITED_VARIABLE] = "preserved-inherited";
+      try {
+        const bashCall = () =>
+          fauxAssistantMessage(
+            fauxToolCall("bash", {
+              command: `printf '%s|%s' "$${SAFE_MISE_VARIABLE}" "$${SAFE_INHERITED_VARIABLE}"`,
+            }),
+            { stopReason: "toolUse" },
+          );
+        setResponses([
+          bashCall(),
+          bashCall(),
+          (context: unknown) => echoLatestToolText(context, fauxAssistantMessage),
+          (context: unknown) => echoLatestToolText(context, fauxAssistantMessage),
+        ]);
+        const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
+
+        const [first, second] = await Promise.all([
+          agent.run("read the first project value", { cwd: firstCwd }),
+          agent.run("read the second project value", { cwd: secondCwd }),
+        ]);
+
+        assert.deepEqual([first, second], ["first-project|preserved-inherited", "second-project|preserved-inherited"]);
+        assert.equal(process.env[SAFE_MISE_VARIABLE], "inherited-host");
+      } finally {
+        if (previousValue === undefined) delete process.env[SAFE_MISE_VARIABLE];
+        else process.env[SAFE_MISE_VARIABLE] = previousValue;
+        if (previousInheritedValue === undefined) delete process.env[SAFE_INHERITED_VARIABLE];
+        else process.env[SAFE_INHERITED_VARIABLE] = previousInheritedValue;
+      }
+    });
+  }));
+
+test("persisted subagent follow-ups resolve the current mise environment through the shared run boundary", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage, fauxToolCall }) => {
+    await withSyntheticMise(async () => {
+      const worktree = join(cwd, "persistent-worktree");
+      const config = join(worktree, "mise.toml");
+      const sessionPath = join(cwd, "persisted-subagent.jsonl");
+      mkdirSync(worktree);
+      writeFileSync(config, `[env]\n${SAFE_MISE_VARIABLE} = "initial-project"\n`);
+
+      const bashCall = () =>
+        fauxAssistantMessage(fauxToolCall("bash", { command: `printf '%s' "$${SAFE_MISE_VARIABLE}"` }), {
+          stopReason: "toolUse",
+        });
+      setResponses([
+        bashCall(),
+        (context: unknown) => echoLatestToolText(context, fauxAssistantMessage),
+        bashCall(),
+        (context: unknown) => echoLatestToolText(context, fauxAssistantMessage),
+      ]);
+      const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
+
+      const first = await agent.run("read the initial project value", { cwd: worktree, sessionPath });
+      writeFileSync(config, `[env]\n${SAFE_MISE_VARIABLE} = "follow-up-project"\n`);
+      const followUp = await agent.run("read the current project value", { cwd: worktree, sessionPath });
+
+      assert.equal(first, "initial-project");
+      assert.equal(followUp, "follow-up-project");
+      assert.equal(existsSync(sessionPath), true);
+    });
+  }));
 
 test("command conversation forks and continuations use the real persistent createAgentSession path", () =>
   withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {

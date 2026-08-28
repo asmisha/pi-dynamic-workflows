@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
@@ -8,6 +9,7 @@ import {
   getShellConfig,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { createMiseEnvironmentBinding, type MiseCommandOptions, type MiseCommandResult } from "./mise-environment.js";
 
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 
@@ -18,6 +20,7 @@ const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
  * command returns, so the bound has to live out here.
  */
 export const DEFAULT_READ_ONLY_BASH_TIMEOUT_SECONDS = 120;
+const MAX_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
 
 export interface ReadOnlyBashSession {
   tool?: ToolDefinition;
@@ -29,6 +32,67 @@ type SandboxPaths = {
   temp: string;
   profile: string;
 };
+
+function sandboxEnvironment(environment: NodeJS.ProcessEnv | undefined, sandbox: SandboxPaths): NodeJS.ProcessEnv {
+  return {
+    ...environment,
+    // HOME stays real so ssh config/keys, CLI credentials, and dotfiles
+    // resolve normally; the sandbox profile still blocks writing them.
+    TMPDIR: `${sandbox.temp}${sep}`,
+    TMP: sandbox.temp,
+    TEMP: sandbox.temp,
+    XDG_CACHE_HOME: join(sandbox.root, "cache"),
+    GIT_OPTIONAL_LOCKS: "0",
+  };
+}
+
+function runSandboxedMise(
+  profile: string,
+  args: string[],
+  options: MiseCommandOptions,
+): Promise<MiseCommandResult | undefined> {
+  return new Promise((resolveResult) => {
+    let settled = false;
+    let output = "";
+    const child = spawn(SANDBOX_EXEC, ["-f", profile, "mise", ...args], {
+      cwd: options.cwd,
+      env: options.environment,
+      detached: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const kill = () => {
+      if (!child.pid) return;
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    };
+    const timer = options.timeoutMs === undefined ? undefined : setTimeout(kill, Math.max(1, options.timeoutMs));
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      options.signal?.removeEventListener("abort", kill);
+    };
+    const finish = (result?: MiseCommandResult) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveResult(result);
+    };
+
+    child.stdout?.on("data", (data: Buffer) => {
+      output += data.toString();
+    });
+    child.on("error", () => finish());
+    child.on("close", (code) => finish(code === 0 ? { stdout: output } : undefined));
+    if (options.signal?.aborted) kill();
+    else options.signal?.addEventListener("abort", kill, { once: true });
+  });
+}
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
@@ -84,26 +148,43 @@ export function createReadOnlyBashSession(
   const shell = getShellConfig();
   let paths: SandboxPaths | undefined;
   const ensurePaths = () => (paths ??= createSandboxPaths());
+  const bindEnvironment = createMiseEnvironmentBinding((args, options) => {
+    const sandbox = ensurePaths();
+    return runSandboxedMise(sandbox.profile, args, {
+      ...options,
+      environment: sandboxEnvironment(options.environment, sandbox),
+    });
+  });
   const operations: BashOperations = {
     async exec(command, commandCwd, options) {
       const sandbox = ensurePaths();
+      const timeoutSeconds = options.timeout ?? defaultTimeoutSeconds;
+      if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+        throw new Error("Invalid timeout: must be a finite number of seconds");
+      }
+      if (timeoutSeconds > MAX_TIMEOUT_SECONDS) {
+        throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+      }
+      const startedAt = Date.now();
+      const environment = await bindEnvironment(commandCwd, options.signal, options.env, timeoutSeconds * 1000);
+      const remainingTimeoutSeconds = timeoutSeconds - (Date.now() - startedAt) / 1000;
+      if (remainingTimeoutSeconds <= 0) throw new Error(`timeout:${timeoutSeconds}`);
+
       const wrappedCommand = [SANDBOX_EXEC, "-f", sandbox.profile, shell.shell, ...shell.args, command]
         .map(shellQuote)
         .join(" ");
-      return localOperations.exec(wrappedCommand, commandCwd, {
-        ...options,
-        timeout: options.timeout ?? defaultTimeoutSeconds,
-        env: {
-          ...options.env,
-          // HOME stays real so ssh config/keys, CLI credentials, and dotfiles
-          // resolve normally; the sandbox profile still blocks writing them.
-          TMPDIR: `${sandbox.temp}${sep}`,
-          TMP: sandbox.temp,
-          TEMP: sandbox.temp,
-          XDG_CACHE_HOME: join(sandbox.root, "cache"),
-          GIT_OPTIONAL_LOCKS: "0",
-        },
-      });
+      try {
+        return await localOperations.exec(wrappedCommand, commandCwd, {
+          ...options,
+          timeout: remainingTimeoutSeconds,
+          env: sandboxEnvironment(environment, sandbox),
+        });
+      } catch (error) {
+        if ((error as Error | undefined)?.message.startsWith("timeout:")) {
+          throw new Error(`timeout:${timeoutSeconds}`);
+        }
+        throw error;
+      }
     },
   };
   const tool = createBashToolDefinition(cwd, { operations });

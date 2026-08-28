@@ -25,6 +25,7 @@ import {
   WorkflowError,
   WorkflowErrorCode,
 } from "./errors.js";
+import { createMiseBashOperations } from "./mise-environment.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { createReadOnlyBashSession } from "./read-only-bash.js";
 import { acquireSessionWriterLease } from "./session-writer-lease.js";
@@ -795,7 +796,7 @@ function resolveAgentModelRoute(
 
 export class WorkflowAgent {
   private readonly cwd: string;
-  private readonly baseTools: ToolDefinition[];
+  private readonly baseTools?: ToolDefinition[];
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
   private readonly instructions?: string;
   private readonly mainModel?: string;
@@ -806,7 +807,7 @@ export class WorkflowAgent {
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
-    this.baseTools = options.tools ?? createCodingTools(this.cwd);
+    this.baseTools = options.tools;
     this.sessionOptions = options.session ?? {};
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
@@ -848,11 +849,14 @@ export class WorkflowAgent {
     options: AgentRunOptions<TSchemaDef> = {},
   ): Promise<AgentRunResult<TSchemaDef>> {
     const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
-    // Per-call cwd (e.g. a worktree) needs coding tools bound to that directory,
-    // since tools and resource loaders capture their cwd and can't be relocated.
+    // Per-call cwd (e.g. a worktree) needs coding tools and their child-process
+    // environment bound to that directory; neither can be relocated afterward.
     const runCwd = options.cwd ?? this.cwd;
     const readOnlyBash = options.readOnly ? createReadOnlyBashSession(runCwd) : undefined;
-    const baseTools = runCwd === this.cwd ? this.baseTools : createCodingTools(runCwd);
+    const baseTools =
+      runCwd === this.cwd && this.baseTools
+        ? this.baseTools
+        : createCodingTools(runCwd, { bash: { operations: createMiseBashOperations() } });
     const modeTools = options.readOnly
       ? [
           ...baseTools.filter((tool) => tool.name !== "bash"),

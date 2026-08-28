@@ -8,6 +8,18 @@ import test from "node:test";
 import { createReadOnlyBashSession } from "../src/read-only-bash.js";
 
 const macOnly = { skip: process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-exec") };
+const macWithMise = {
+  skip:
+    macOnly.skip ||
+    (() => {
+      try {
+        execFileSync("mise", ["--version"], { stdio: "ignore" });
+        return false;
+      } catch {
+        return true;
+      }
+    })(),
+};
 
 async function runBash(
   tool: NonNullable<ReturnType<typeof createReadOnlyBashSession>["tool"]>,
@@ -56,6 +68,69 @@ test("read-only bash supports Git reads and isolated temporary writes", macOnly,
       sandbox.cleanup();
     }
   } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test(
+  "read-only bash uses cwd-local mise values without surrendering its private temp environment",
+  macWithMise,
+  async () => {
+    const repo = mkdtempSync(join(tmpdir(), "readonly-bash-mise-"));
+    const previousTrustedPaths = process.env.MISE_TRUSTED_CONFIG_PATHS;
+    try {
+      writeFileSync(
+        join(repo, "mise-source.sh"),
+        `touch ${JSON.stringify(join(repo, "mise-preflight-write"))} 2>/dev/null || true\nexport PI_WORKFLOW_SAFE_SOURCE_VALUE=source-ran\n`,
+      );
+      writeFileSync(
+        join(repo, "mise.toml"),
+        `[env]\nPI_WORKFLOW_SAFE_PROJECT_VALUE = "read-only-project"\nTMPDIR = ${JSON.stringify(repo)}\n\n[env._]\nsource = "./mise-source.sh"\n`,
+      );
+      process.env.MISE_TRUSTED_CONFIG_PATHS = repo;
+      const sandbox = createReadOnlyBashSession(repo);
+      assert.ok(sandbox.tool);
+      try {
+        const output = await runBash(
+          sandbox.tool,
+          `printf '%s\\n%s\\n%s' "$PI_WORKFLOW_SAFE_PROJECT_VALUE" "$PI_WORKFLOW_SAFE_SOURCE_VALUE" "$TMPDIR"`,
+        );
+        const [projectValue, sourceValue, sandboxTemp] = output.trim().split("\n");
+        assert.equal(projectValue, "read-only-project");
+        assert.equal(sourceValue, "source-ran");
+        assert.match(sandboxTemp ?? "", /pi-readonly-bash-/);
+        assert.equal(existsSync(join(repo, "mise-preflight-write")), false);
+      } finally {
+        sandbox.cleanup();
+      }
+    } finally {
+      if (previousTrustedPaths === undefined) delete process.env.MISE_TRUSTED_CONFIG_PATHS;
+      else process.env.MISE_TRUSTED_CONFIG_PATHS = previousTrustedPaths;
+      rmSync(repo, { recursive: true, force: true });
+    }
+  },
+);
+
+test("read-only bash bounds mise environment evaluation within the command timeout", macWithMise, async () => {
+  const repo = mkdtempSync(join(tmpdir(), "readonly-bash-mise-timeout-"));
+  const previousTrustedPaths = process.env.MISE_TRUSTED_CONFIG_PATHS;
+  try {
+    writeFileSync(join(repo, "mise-source.sh"), "sleep 20\nexport PI_WORKFLOW_SAFE_SOURCE_VALUE=too-late\n");
+    writeFileSync(join(repo, "mise.toml"), `[env._]\nsource = "./mise-source.sh"\n`);
+    process.env.MISE_TRUSTED_CONFIG_PATHS = repo;
+    const sandbox = createReadOnlyBashSession(repo, { defaultTimeoutSeconds: 1 });
+    assert.ok(sandbox.tool);
+    try {
+      const startedAt = Date.now();
+      await assert.rejects(() => runBash(sandbox.tool, "echo finished"), /timed out after 1 seconds/);
+      assert.ok(Date.now() - startedAt < 15_000);
+      assert.equal(execFileSync("/bin/sh", ["-c", "pgrep -f 'sleep 20' | wc -l"]).toString().trim(), "0");
+    } finally {
+      sandbox.cleanup();
+    }
+  } finally {
+    if (previousTrustedPaths === undefined) delete process.env.MISE_TRUSTED_CONFIG_PATHS;
+    else process.env.MISE_TRUSTED_CONFIG_PATHS = previousTrustedPaths;
     rmSync(repo, { recursive: true, force: true });
   }
 });
