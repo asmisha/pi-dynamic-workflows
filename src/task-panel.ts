@@ -295,8 +295,7 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
     const phase = r.snapshot.currentPhase ? ` · ${r.snapshot.currentPhase}` : "";
     return `  ${icon} ${r.snapshot.name}  ${done}/${steps.length} steps${bash}${phase}`;
   });
-  const hint = theme.fg("dim", "  /workflows — open navigator");
-  return [theme.bold(`Workflows running (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
+  return [theme.bold(`Workflows running (${active.length}):`), ...rows].map((line) => fitLine(line, width));
 }
 
 // ─── Detailed mode: live token rate ────────────────────────────────────────────
@@ -452,7 +451,6 @@ export function renderPanelDetailed(
     out.push(...renderRunBody(snap, agents, maxAgents, theme));
   }
 
-  out.push(dim("  /workflows — open navigator"));
   return out.map((line) => fitLine(line, width));
 }
 

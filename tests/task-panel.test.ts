@@ -700,10 +700,7 @@ describe("renderPanel", () => {
       lines.some((l) => l.includes("live")),
       "active run should be rendered",
     );
-    assert.ok(
-      lines.some((l) => l.includes("/workflows")),
-      "hint should point at /workflows",
-    );
+    assert.ok(!lines.some((l) => l.includes("/workflows")), "panel should not render a navigator hint");
   });
 
   it("renders nothing when no run is active", async () => {
@@ -850,6 +847,7 @@ describe("renderPanelDetailed", () => {
       lines.some((l) => l.includes("[3] ○ scan_middleware")),
       "queued agent row",
     );
+    assert.ok(!lines.some((l) => l.includes("/workflows")), "panel should not render a navigator hint");
   });
 
   it("shows a live token/s after two growing samples", async () => {
