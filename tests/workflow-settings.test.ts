@@ -44,17 +44,17 @@ describe("workflow settings", () => {
     });
   });
 
-  it("normalizes default concurrency and agent retries", () => {
+  it("normalizes agent retries", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
-      writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 4.9, defaultAgentRetries: 2.8 }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultConcurrency: 4, defaultAgentRetries: 2 });
+      writeFileSync(settingsPath, JSON.stringify({ defaultAgentRetries: 2.8 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultAgentRetries: 2 });
 
-      writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 99, defaultAgentRetries: 99 }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultConcurrency: 16, defaultAgentRetries: 3 });
+      writeFileSync(settingsPath, JSON.stringify({ defaultAgentRetries: 99 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultAgentRetries: 3 });
 
-      writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 0, defaultAgentRetries: -1 }), "utf-8");
+      writeFileSync(settingsPath, JSON.stringify({ defaultAgentRetries: -1 }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
     });
   });

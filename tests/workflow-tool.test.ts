@@ -117,11 +117,10 @@ test("createWorkflowTool schema describes unbounded default timeout", () => {
   assert.match(description, /only when the user asks/i);
 });
 
-test("createWorkflowTool schema exposes concurrency and agentRetries", () => {
+test("createWorkflowTool schema exposes agentRetries", () => {
   const tool = createWorkflowTool();
   const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
 
-  assert.match(parameters.properties?.concurrency?.description ?? "", /Maximum concurrent agents/i);
   assert.match(parameters.properties?.agentRetries?.description ?? "", /retry attempts/i);
   assert.match(parameters.properties?.agentRetries?.description ?? "", /read-only agents default to at least 1/i);
   assert.equal(parameters.properties?.maxAgents, undefined);
@@ -885,18 +884,15 @@ test("createWorkflowTool prepareArguments passes through args", () => {
     const prepare = tool.prepareArguments as (args: unknown) => {
       script: string;
       args?: unknown;
-      concurrency?: number;
       agentRetries?: number;
     };
     const result = prepare({
       script: "export const meta = { name: 't', description: 't' }",
       args: { question: "test" },
-      concurrency: 2,
       agentRetries: 1,
     });
     assert.equal(result.script, "export const meta = { name: 't', description: 't' }");
     assert.deepEqual(result.args, { question: "test" });
-    assert.equal(result.concurrency, 2);
     assert.equal(result.agentRetries, 1);
   }
 });

@@ -7,13 +7,11 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { MAX_AGENT_RETRIES, MAX_CONCURRENCY } from "./config.js";
+import { MAX_AGENT_RETRIES } from "./config.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {
   defaultAgentTimeoutMs?: number | null;
-  /** Default max concurrent agents per run. Clamped to the runtime maximum. */
-  defaultConcurrency?: number;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
   /** Bottom task-panel display mode: "compact" (default, one line per run) | "detailed". */
@@ -112,8 +110,6 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   ) {
     settings.defaultAgentTimeoutMs = raw.defaultAgentTimeoutMs;
   }
-  const defaultConcurrency = normalizeInteger(raw.defaultConcurrency, 1, MAX_CONCURRENCY);
-  if (defaultConcurrency !== undefined) settings.defaultConcurrency = defaultConcurrency;
   const defaultAgentRetries = normalizeInteger(raw.defaultAgentRetries, 0, MAX_AGENT_RETRIES);
   if (defaultAgentRetries !== undefined) settings.defaultAgentRetries = defaultAgentRetries;
   if (raw.progressPanelMode === "compact" || raw.progressPanelMode === "detailed") {

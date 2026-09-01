@@ -106,12 +106,6 @@ const workflowToolSchema = Type.Object({
         "Optional JSON object exposed to the workflow script as global `args`. Pass an object, not stringified JSON.",
     }),
   ),
-  concurrency: Type.Optional(
-    Type.Number({
-      description:
-        "Maximum concurrent agents for this run. Clamped to the runtime maximum. Use when provider/transport stability matters.",
-    }),
-  ),
   agentRetries: Type.Optional(
     Type.Number({
       description:
@@ -133,20 +127,16 @@ export type WorkflowToolInput = {
   scriptPath?: string;
   cwd?: string;
   args?: unknown;
-  concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number;
 };
 
 export interface WorkflowToolOptions {
   cwd?: string;
-  concurrency?: number;
   /** Shared manager so background runs are reachable from the `/workflows` command. */
   manager?: WorkflowManager;
   /** Default per-agent timeout for runs created by this tool. null means no hard timeout. */
   defaultAgentTimeoutMs?: number | null;
-  /** Default max concurrent agents when no tool-level concurrency is passed. */
-  defaultConcurrency?: number;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
 }
@@ -337,7 +327,6 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     options.manager ??
     new WorkflowManager({
       cwd: options.cwd,
-      concurrency: defaults.concurrency,
       defaultAgentTimeoutMs: defaults.agentTimeoutMs,
       defaultAgentRetries: defaults.agentRetries,
     });
@@ -403,7 +392,6 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       const { runId } = manager.startInBackground(source.script, params.args, {
         workflowModulePath: source.workflowModulePath,
         workflowModule: source.workflowModule,
-        concurrency: params.concurrency,
         agentRetries: params.agentRetries,
         agentTimeoutMs: params.agentTimeoutMs,
         cwd: runCwd,
@@ -440,14 +428,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 function resolveWorkflowToolDefaults(
   options: WorkflowToolOptions,
   cwd: string,
-): { agentTimeoutMs: number | null; concurrency?: number; agentRetries: number } {
+): { agentTimeoutMs: number | null; agentRetries: number } {
   const settings = loadWorkflowSettings({ cwd });
   return {
     agentTimeoutMs:
       options.defaultAgentTimeoutMs !== undefined
         ? options.defaultAgentTimeoutMs
         : (settings.defaultAgentTimeoutMs ?? null),
-    concurrency: options.defaultConcurrency ?? options.concurrency ?? settings.defaultConcurrency,
     agentRetries: options.defaultAgentRetries ?? settings.defaultAgentRetries ?? 0,
   };
 }
@@ -501,7 +488,7 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
   if (Object.hasOwn(value, "reply")) {
     throw new Error("workflow `reply` requires `resumeRunId`");
   }
-  const startFields = new Set(["script", "scriptPath", "cwd", "args", "concurrency", "agentRetries", "agentTimeoutMs"]);
+  const startFields = new Set(["script", "scriptPath", "cwd", "args", "agentRetries", "agentTimeoutMs"]);
   const unsupportedField = Object.keys(value).find((field) => !startFields.has(field));
   if (unsupportedField) throw new Error(`workflow \`${unsupportedField}\` is not supported`);
   if (hasScript && typeof value.script !== "string") {
