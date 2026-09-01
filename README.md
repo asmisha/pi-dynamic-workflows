@@ -32,11 +32,21 @@ npm install @quintinshaw/pi-dynamic-workflows \
   @earendil-works/pi-coding-agent @earendil-works/pi-tui typebox
 ```
 
-The object form of `runWorkflow` is the stable one-shot Node API. It loads Pi's agent directory, settings, model catalog, and authentication, then waits for the workflow's real terminal `WorkflowRunResult`:
+A source-only git install uses the same API and does not need a package build. Declare the git dependency in the consumer's `package.json`, commit the resulting lockfile, and use `npm ci` for reproducible installs:
+
+```bash
+npm install \
+  github:asmisha/pi-dynamic-workflows#main \
+  @earendil-works/pi-coding-agent @earendil-works/pi-tui typebox
+```
+
+Import the stable one-shot API through the public `node-api` subpath. It is a plain-JavaScript entrypoint that loads the package's shipped TypeScript through its own `tsx` runtime dependency. The caller runs plain `node`: it does not need a TypeScript loader, a build step, or knowledge of the package's `src/` layout. Loading is anchored to the installed package, not the calling process's current directory.
+
+The object form of `runWorkflow` loads Pi's agent directory, settings, model catalog, and authentication, then waits for the workflow's real terminal `WorkflowRunResult`:
 
 ```js
 // run-audit.mjs
-import { runWorkflow } from '@quintinshaw/pi-dynamic-workflows'
+import { runWorkflow } from '@quintinshaw/pi-dynamic-workflows/node-api'
 
 const controller = new AbortController()
 
@@ -86,7 +96,7 @@ export function summarize(review) {
 
 ```js
 // run-review.mjs
-import { runWorkflow } from '@quintinshaw/pi-dynamic-workflows'
+import { runWorkflow } from '@quintinshaw/pi-dynamic-workflows/node-api'
 
 const completed = await runWorkflow({
   scriptPath: './workflows/review.mjs',
@@ -135,7 +145,7 @@ const completed = await promise
 
 The manager starts asynchronously and persists run/journal state for its resume/retry APIs; its returned promise is still the terminal result for this process. The Pi extension's `workflow` tool is different again: it always launches through the manager in the background, ends the current Pi turn immediately, updates the live panel, and delivers completion or checkpoint events back to the parent conversation.
 
-The original low-level `runWorkflow(script, options)` signature remains supported for existing consumers and injected hosts. New standalone Node callers should use the object form so the package owns Pi runtime/model setup.
+The original low-level `runWorkflow(script, options)` signature remains supported for existing consumers and injected hosts. New standalone Node callers should use the object form so the package owns Pi runtime/model setup. The built package root still exports `runWorkflow` for existing published/built consumers; source-only git consumers should use the `node-api` subpath because the root export remains backed by `dist/`.
 
 ## Try it
 
@@ -302,7 +312,7 @@ npm run build && pi install .
 
 Then restart/reload Pi so the next session loads the rebuilt extension. `pi list` should show this repo path for the installed package.
 
-Never run `npm install` or `npm run build` inside an *installed* package directory. Pi loads `extensions/workflow.ts` and its `src/` imports directly, so `dist/` is only for consumers importing this package as a library, and the Pi SDK is a peer dependency supplied by the host at load time. A plain `npm install` there adds a second SDK copy that wins over the host's, and the extension then silently runs whatever version that copy pins. Update an installed copy with `pi update --extensions`, which resets the checkout, cleans it, and installs runtime dependencies only.
+Do not manually run `npm install` or `npm run build` inside an *installed* package directory. Pi's installer owns the initial `npm install --omit=dev`, and `pi update --extensions` resets the checkout, cleans it, and reinstalls runtime dependencies. Pi loads `extensions/workflow.ts` and its `src/` imports directly; the public `node-api` subpath loads the same shipped source through the package's `tsx` dependency. `dist/` remains the built root export. A manual plain `npm install` adds a second Pi SDK copy that wins over the host's peer dependency, and the extension then silently runs whatever version that copy pins.
 
 Every feature is also verified end-to-end against a real Pi subagent session before release.
 
