@@ -127,11 +127,10 @@ test("createWorkflowTool schema exposes agentRetries", () => {
   assert.equal(parameters.properties?.tokenBudget, undefined);
 });
 
-test("createWorkflowTool promptGuidelines mention retry and concurrency controls", () => {
+test("createWorkflowTool promptGuidelines mention retry controls", () => {
   const tool = createWorkflowTool();
   const all = tool.promptGuidelines.join(" ");
 
-  assert.match(all, /low concurrency/i);
   assert.match(all, /agentRetries/i);
   assert.match(all, /readOnly = true.*one automatic recoverable retry/i);
   assert.match(all, /retryable = false.*duplicate side effects/i);
