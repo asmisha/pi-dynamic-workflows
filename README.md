@@ -117,7 +117,7 @@ Pass exactly one of `script` or `scriptPath`.
 | `mainModel` | Exact `provider/modelId` used by untagged agents and as the fallback route for an unconfigured tier. |
 | `signal` | Run-level `AbortSignal`, forwarded to agent and bash work. Cancellation rejects with `WorkflowErrorCode.WORKFLOW_ABORTED`; trusted native JS is not forcibly preempted between runtime calls. |
 | `agentTimeoutMs` | Per-agent attempt timeout. `null` means no hard timeout. An individual `agent(..., { timeoutMs })` overrides it. This is not a whole-workflow deadline. |
-| `concurrency` / `agentRetries` | Run-level agent concurrency and recoverable retry limits; per-agent options still take precedence. |
+| `agentRetries` | Run-level recoverable retry limit; per-agent `retries` still takes precedence. |
 | `persistLogs`, `artifactCwd`, `runId` | Control one-shot log/bash artifacts and their run identity. Logs persist by default; this does not create managed run state. |
 | callbacks | The progress, phase, agent, usage, and log callbacks from `WorkflowRunOptions` observe the in-process run. |
 | `agent`, `agentRegistry`, `tools`, `instructions` | Advanced injection/customization boundaries for tests and embedded hosts. Ordinary callers do not need Pi SDK plumbing. |
