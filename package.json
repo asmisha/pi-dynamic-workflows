@@ -12,12 +12,16 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./node-api": {
+      "import": "./node-api.js"
     }
   },
   "files": [
     "dist/",
     "extensions/",
     "src/",
+    "node-api.js",
     "README.md"
   ],
   "scripts": {
@@ -63,7 +67,8 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "acorn": "^8.16.0"
+    "acorn": "^8.16.0",
+    "tsx": "^4.23.13"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.82.0",
@@ -75,7 +80,6 @@
     "@earendil-works/pi-ai": "^0.83.0",
     "@earendil-works/pi-coding-agent": "^0.83.0",
     "@earendil-works/pi-tui": "^0.83.0",
-    "tsx": "latest",
     "typebox": "latest",
     "typescript": "latest"
   }
