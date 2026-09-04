@@ -282,10 +282,15 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+    this.persistence = this.createPersistence(this.cwd);
+    this.recoverStaleRuns();
+  }
+
+  private createPersistence(cwd: string): RunPersistence {
     // Wrap the persistence writers so ANY save/delete (including direct calls via
     // getPersistence()) invalidates the listRuns() cache.
-    const persistence = createRunPersistence(this.cwd);
-    this.persistence = {
+    const persistence = createRunPersistence(cwd);
+    return {
       ...persistence,
       save: (state, opts) => {
         this.runsCache = undefined;
@@ -301,7 +306,25 @@ export class WorkflowManager extends EventEmitter {
         return persistence.delete(runId);
       },
     };
+  }
+
+  /** Bind project-scoped persistence to the current host session cwd. */
+  setCwd(cwd: string): void {
+    if (cwd === this.cwd) return;
+    this.cwd = cwd;
+    this.persistence = this.createPersistence(cwd);
+    this.runsCache = undefined;
     this.recoverStaleRuns();
+  }
+
+  getCwd(): string {
+    return this.cwd;
+  }
+
+  /** Apply the current host project's defaults to subsequently started runs. */
+  setDefaultExecutionOptions(options: { defaultAgentTimeoutMs?: number | null; defaultAgentRetries?: number }): void {
+    this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
+    this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
   }
 
   /** Bind the manager to the current pi session, so new runs are tagged with it and
