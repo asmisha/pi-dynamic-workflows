@@ -321,15 +321,16 @@ export function createWorkflowResumeTool(
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
-  const cwd = options.cwd ?? process.cwd();
-  const defaults = resolveWorkflowToolDefaults(options, cwd);
-  const manager =
-    options.manager ??
-    new WorkflowManager({
+  let manager = options.manager;
+  if (!manager) {
+    const cwd = options.cwd ?? process.cwd();
+    const defaults = resolveWorkflowToolDefaults(options, cwd);
+    manager = new WorkflowManager({
       cwd: options.cwd,
       defaultAgentTimeoutMs: defaults.agentTimeoutMs,
       defaultAgentRetries: defaults.agentRetries,
     });
+  }
 
   return defineTool({
     name: "workflow",
@@ -355,7 +356,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         "checkpoint(question) always pauses and transfers its question to the parent conversation; continue the same run with the host workflow({resumeRunId, reply}) tool call.",
         "For machine-readable agent output pass a plain JSON Schema via opts.schema (not TypeScript/TypeBox). opts.cwd runs an agent in another directory. opts.thinking sets one agent's reasoning effort (low | medium | high | xhigh | max); it is independent of the model and each model maps the level itself, so raise it for judgement-heavy synthesis and lower it for mechanical scans. opts.readOnly also removes code-writing tools and grants one automatic recoverable retry by default, so ordinary read-only calls need no retries configuration; read-only agents can persist files only under /tmp, so direct their artifact outputs there. For a required cross-provider backup, set opts.fallbackModel to an exact provider/modelId alongside opts.model; only missing authentication/availability or a provider usage limit triggers the handoff, and the same subagent session continues with prior tool work intact. Session args: opts.forkFrom forks an existing Pi session file as read-only starting context; opts.sessionPath persists/continues this subagent's working session (relative paths resolve under ~/.pi/workflows/sessions/); using both forks into a new persistent session and is invalid if the target already exists. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle still applies. With multiple phases, call phase('Exact Title') before each phase's work so agents group correctly. End with a synthesis agent when combining results; return a compact JSON-serializable value.",
         modelRoutingGuideline(() => manager.getModelRegistry()),
-        agentTypeGuideline(),
+        agentTypeGuideline(manager.getCwd()),
         "Don't set agentTimeoutMs unless the user asks to bound time. Use agentRetries for flaky provider fan-outs.",
       ].filter((g): g is string => typeof g === "string" && g.length > 0);
     },
@@ -363,7 +364,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     prepareArguments(args) {
       return normalizeWorkflowToolArgs(args);
     },
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (params.resumeRunId) {
         const resumed = await manager.resumeWithReply(params.resumeRunId, params.reply);
         if (!resumed) {
@@ -383,7 +384,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       }
 
       const source = await resolveWorkflowSource(params);
-      const runCwd = resolveWorkflowCwd(params.cwd);
+      const runCwd = resolveWorkflowCwd(params.cwd ?? options.cwd ?? ctx.cwd);
       const parsed = source.workflowModule ? { meta: source.workflowModule.meta } : parseWorkflowScript(source.script);
 
       // Always background: return immediately so the turn ends and the user

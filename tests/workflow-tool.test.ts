@@ -195,6 +195,45 @@ test("createWorkflowTool with custom cwd creates tool", () => {
   assert.equal(tool.name, "workflow");
 });
 
+test("workflow tool defaults new runs to the execution context cwd while explicit cwd wins", async () => {
+  const originalCwd = process.cwd();
+  const oldCwd = mkdtempSync(join(tmpdir(), "workflow-tool-old-cwd-"));
+  const contextCwd = mkdtempSync(join(tmpdir(), "workflow-tool-context-cwd-"));
+  const explicitCwd = mkdtempSync(join(tmpdir(), "workflow-tool-explicit-cwd-"));
+  const home = mkdtempSync(join(tmpdir(), "workflow-tool-cwd-home-"));
+  try {
+    process.chdir(oldCwd);
+    await withFakeHomeAsync(home, async () => {
+      const manager = new WorkflowManager({ cwd: oldCwd });
+      const execute = createWorkflowTool({ manager }).execute as (...args: any[]) => Promise<any>;
+      const script = `export const meta = { name: 'cwd_boundary', description: 'reports its cwd' }
+return { cwd }`;
+
+      const run = async (params: { script: string; cwd?: string }, expectedCwd: string) => {
+        const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
+        const started = await execute("cwd-call", params, new AbortController().signal, () => {}, {
+          cwd: contextCwd,
+          hasUI: false,
+        });
+        await completed;
+
+        const persisted = manager.getPersistence().load(started.details.runId);
+        assert.equal(persisted?.cwd, expectedCwd);
+        assert.deepEqual(persisted?.result, { cwd: expectedCwd });
+      };
+
+      await run({ script }, contextCwd);
+      await run({ script, cwd: explicitCwd }, explicitCwd);
+    });
+  } finally {
+    process.chdir(originalCwd);
+    rmSync(oldCwd, { recursive: true, force: true });
+    rmSync(contextCwd, { recursive: true, force: true });
+    rmSync(explicitCwd, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("workflow retry tool invokes manager.retry", async () => {
   const manager = {
     isRunInCurrentSession: () => true,
@@ -794,8 +833,10 @@ test("background run loads scriptPath and runs in the requested cwd", async () =
   }
 });
 
-test("workflow tool returns a checkpoint to the parent and continues the same run with reply", async () => {
+test("workflow tool returns a checkpoint to the parent and continues the same run with its persisted cwd", async () => {
   const home = mkdtempSync(join(tmpdir(), "workflow-tool-checkpoint-home-"));
+  const runCwd = mkdtempSync(join(tmpdir(), "workflow-tool-checkpoint-run-cwd-"));
+  const replacementCwd = mkdtempSync(join(tmpdir(), "workflow-tool-checkpoint-replacement-cwd-"));
   try {
     await withFakeHomeAsync(home, async () => {
       let calls = 0;
@@ -814,12 +855,13 @@ test("workflow tool returns a checkpoint to the parent and continues the same ru
 const before = await agent('before')
 const reply = await checkpoint('Accept?')
 const after = await agent('after:' + reply)
-return { before, reply, after }`;
+return { before, reply, after, cwd }`;
 
       const pausedEvent = new Promise<{ reason?: string; checkpoint?: { prompt?: string } }>((resolve) =>
         manager.once("paused", (event: { reason?: string; checkpoint?: { prompt?: string } }) => resolve(event)),
       );
-      const started = await execute("call-start", { script }, new AbortController().signal, () => {}, {
+      const started = await execute("call-start", { script, cwd: runCwd }, new AbortController().signal, () => {}, {
+        cwd: runCwd,
         hasUI: false,
       });
       const runId = started.details.runId;
@@ -834,19 +876,28 @@ return { before, reply, after }`;
         { resumeRunId: runId, reply: "yes" },
         new AbortController().signal,
         () => {},
-        { hasUI: false },
+        { cwd: replacementCwd, hasUI: false },
       );
       assert.equal(continued.details.runId, runId);
       assert.equal(continued.details.resumed, true);
       await completed;
-      const result = manager.getRun(runId)?.result?.result as { before?: string; reply?: string; after?: string };
+      const result = manager.getRun(runId)?.result?.result as {
+        before?: string;
+        reply?: string;
+        after?: string;
+        cwd?: string;
+      };
       assert.equal(result.before, "before");
       assert.equal(result.reply, "yes");
       assert.equal(result.after, "after:yes");
+      assert.equal(result.cwd, runCwd);
+      assert.equal(manager.getPersistence().load(runId)?.cwd, runCwd);
       assert.equal(calls, 2);
     });
   } finally {
     rmSync(home, { recursive: true, force: true });
+    rmSync(runCwd, { recursive: true, force: true });
+    rmSync(replacementCwd, { recursive: true, force: true });
   }
 });
 

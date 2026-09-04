@@ -19,15 +19,9 @@ import {
 export default function extension(pi: ExtensionAPI) {
   // Single manager shared by the workflow tool and the /workflows command, so
   // background runs started by the tool are reachable from the command.
-  const cwd = process.cwd();
-  const settings = loadWorkflowSettings({ cwd });
-  const manager = new WorkflowManager({
-    cwd,
-    defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
-    defaultAgentRetries: settings.defaultAgentRetries,
-  });
+  const manager = new WorkflowManager();
 
-  const workflowTool = createWorkflowTool({ cwd, manager });
+  const workflowTool = createWorkflowTool({ manager });
   const workflowStatusTool = createWorkflowStatusTool(manager);
   const workflowPauseTool = createWorkflowPauseTool(manager);
   const workflowResumeTool = createWorkflowResumeTool(manager);
@@ -50,11 +44,13 @@ export default function extension(pi: ExtensionAPI) {
   registerWorkflowCommands(pi, manager);
   registerWorkflowModelsCommand(pi);
   registerWorkflowProgressCommands(pi, {
-    load: () => loadWorkflowSettings({ cwd }),
-    save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, cwd),
+    load: () => loadWorkflowSettings({ cwd: manager.getCwd() }),
+    save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, manager.getCwd()),
   });
 
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+    manager.setCwd(ctx.cwd);
+    manager.setDefaultExecutionOptions(loadWorkflowSettings({ cwd: ctx.cwd }));
     // Tell the manager the session's main model so "explore" agents auto-tier
     // down to a lighter same-family sibling (e.g. Claude → Haiku).
     manager.setMainModel(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
@@ -74,6 +70,8 @@ export default function extension(pi: ExtensionAPI) {
     // the current session's append-only entries after restarts and settled turns.
     installResultDelivery(pi, manager, ctx.sessionManager, { isIdle: () => ctx.isIdle() });
     // Live "workflows running" panel below the input.
-    installTaskPanel(pi, manager, ctx.ui, { loadSettings: () => loadWorkflowSettings({ cwd }) });
+    installTaskPanel(pi, manager, ctx.ui, {
+      loadSettings: () => loadWorkflowSettings({ cwd: manager.getCwd() }),
+    });
   });
 }
