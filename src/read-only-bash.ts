@@ -107,7 +107,7 @@ export function createReadOnlyBashSession(
     },
   };
   const tool = createBashToolDefinition(cwd, { operations });
-  tool.description = `${tool.description} Reads and network access work normally (ssh, curl, remote logs), but writes are confined to /tmp and $TMPDIR: the repository, $HOME, and the rest of the host are not writable. $TMPDIR is a private scratch directory deleted when this agent finishes; write files that must outlive this agent or be shared with other agents under /tmp. A command without its own timeout is killed after ${defaultTimeoutSeconds} seconds.`;
+  tool.description = `${tool.description} Reads and network access work normally (ssh, curl, remote logs). Writes are confined to shared /tmp (including a checkout located there), private $TMPDIR, and /dev/null; $HOME and paths outside those temporary areas are not writable. $TMPDIR is deleted when this agent finishes. Put full research artifacts that the host or other agents must read afterward under /tmp; they survive agent cleanup but remain OS-temporary. A command without its own timeout is killed after ${defaultTimeoutSeconds} seconds.`;
 
   return {
     tool: tool as unknown as ToolDefinition,

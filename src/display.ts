@@ -47,6 +47,13 @@ export function isAgentStep(step: Pick<WorkflowAgentSnapshot, "kind">): boolean 
   return (step.kind ?? "agent") === "agent";
 }
 
+/** Short, human-friendly model label: drop the provider prefix for display. */
+export function shortModel(model: string | undefined): string | undefined {
+  if (!model) return undefined;
+  const slash = model.indexOf("/");
+  return slash > 0 ? model.slice(slash + 1) : model;
+}
+
 export function resolveWorkflowFailureLocation(
   snapshot: WorkflowSnapshot,
   explicitAgentLabel?: string,

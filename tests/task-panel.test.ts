@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { before, describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
+import {
+  agentFailureDeliveryText,
+  checkpointDeliveryText,
+  usageLimitDeliveryText,
+} from "../src/workflow-notifications.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 type TaskPanelModule = {
   deliverText: (run: unknown) => string;
@@ -174,6 +185,17 @@ function persistedRun(delivery: Delivery) {
   };
 }
 
+async function withTempWorkflowState(fn: (cwd: string) => Promise<void>): Promise<void> {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-delivery-"));
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
+  try {
+    await withFakeHomeAsync(fakeHome, () => fn(cwd));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+}
+
 // ─── Durable terminal-result delivery ────────────────────────────────────────
 
 describe("installResultDelivery", () => {
@@ -308,9 +330,6 @@ describe("installResultDelivery", () => {
   });
 
   it("makes a no-trigger custom result part of the next manually initiated parent context", async () => {
-    const { mkdtempSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
     const { SessionManager } = await import("@earendil-works/pi-coding-agent");
     const root = mkdtempSync(join(tmpdir(), "pi-dw-parent-context-"));
     try {
@@ -378,127 +397,91 @@ describe("installResultDelivery", () => {
     assert.equal(second._calls[0].details?.deliveryId, "test-run-1:completed");
   });
 
-  it("redelivers a pending terminal notification after a simulated manager restart", async () => {
-    const { mkdtempSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const { WorkflowManager } = await import("../src/workflow-manager.js");
-    const { withFakeHomeAsync } = await import("./helpers/fake-home.js");
-    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-delivery-"));
-    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
-    try {
-      await withFakeHomeAsync(fakeHome, async () => {
-        const delivery: Delivery = {
-          runId: "restart-run",
-          deliveryId: "restart-run:completed",
-          sessionId: "session-1",
-          content: "durable completion",
-          state: "pending",
-        };
-        const original = new WorkflowManager({ cwd, sessionId: "session-1" });
-        original.getPersistence().save(persistedRun(delivery));
+  it("redelivers a pending checkpoint notification after a simulated manager restart", async () => {
+    await withTempWorkflowState(async (cwd) => {
+      const delivery: Delivery = {
+        runId: "restart-run",
+        deliveryId: "restart-run:paused:checkpoint",
+        sessionId: "session-1",
+        content: checkpointDeliveryText("restart-run", "Approve restart?"),
+        state: "pending",
+      };
+      const original = new WorkflowManager({ cwd, sessionId: "session-1" });
+      original.getPersistence().save(persistedRun(delivery));
 
-        const restarted = new WorkflowManager({ cwd, sessionId: "session-1" });
-        const pi = createMockPi();
-        mod.installResultDelivery(pi, restarted, createMockSessionManager());
+      const restarted = new WorkflowManager({ cwd, sessionId: "session-1" });
+      const pi = createMockPi();
+      mod.installResultDelivery(pi, restarted, createMockSessionManager());
 
-        assert.deepEqual(pi._calls, [
-          {
-            customType: "workflow-result",
-            display: true,
-            content: "durable completion",
-            details: { runId: "restart-run", deliveryId: "restart-run:completed" },
-          },
-        ]);
-        assert.equal(
-          restarted.getPersistence().load("restart-run")?.terminalDeliveries?.[0].state,
-          "pending",
-          "enqueueing is not proof that Pi persisted the message",
-        );
-      });
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
-    }
+      assert.deepEqual(pi._calls, [
+        {
+          customType: "workflow-result",
+          display: true,
+          content: checkpointDeliveryText("restart-run", "Approve restart?"),
+          details: { runId: "restart-run", deliveryId: "restart-run:paused:checkpoint" },
+        },
+      ]);
+      assert.equal(
+        restarted.getPersistence().load("restart-run")?.terminalDeliveries?.[0].state,
+        "pending",
+        "enqueueing is not proof that Pi persisted the message",
+      );
+    });
   });
 
   it("redelivers a branch-affine no-trigger result after manager restart", async () => {
-    const { mkdtempSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const { WorkflowManager } = await import("../src/workflow-manager.js");
-    const { withFakeHomeAsync } = await import("./helpers/fake-home.js");
-    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-command-delivery-"));
-    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
-    try {
-      await withFakeHomeAsync(fakeHome, async () => {
-        const delivery: Delivery = {
-          runId: "command-restart-run",
-          deliveryId: "command-restart-run:completed",
-          sessionId: "session-1",
-          content: "durable fork completion",
-          state: "pending",
-          deliveryMode: "no-trigger",
-          parentLeafId: "origin-leaf",
-        };
-        const original = new WorkflowManager({ cwd, sessionId: "session-1" });
-        original.getPersistence().save(persistedRun(delivery));
+    await withTempWorkflowState(async (cwd) => {
+      const delivery: Delivery = {
+        runId: "command-restart-run",
+        deliveryId: "command-restart-run:completed",
+        sessionId: "session-1",
+        content: "durable fork completion",
+        state: "pending",
+        deliveryMode: "no-trigger",
+        parentLeafId: "origin-leaf",
+      };
+      const original = new WorkflowManager({ cwd, sessionId: "session-1" });
+      original.getPersistence().save(persistedRun(delivery));
 
-        const restarted = new WorkflowManager({ cwd, sessionId: "session-1" });
-        const pi = createMockPi();
-        mod.installResultDelivery(pi, restarted, createMockSessionManager("session-1", [], [{ id: "origin-leaf" }]), {
-          isIdle: () => true,
-        });
-
-        assert.equal(pi._calls[0]?.content, "durable fork completion");
-        assert.deepEqual(pi._options[0], { triggerTurn: false });
+      const restarted = new WorkflowManager({ cwd, sessionId: "session-1" });
+      const pi = createMockPi();
+      mod.installResultDelivery(pi, restarted, createMockSessionManager("session-1", [], [{ id: "origin-leaf" }]), {
+        isIdle: () => true,
       });
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
-    }
+
+      assert.equal(pi._calls[0]?.content, "durable fork completion");
+      assert.deepEqual(pi._options[0], { triggerTurn: false });
+    });
   });
 
-  it("does not duplicate a custom message already persisted before restart", async () => {
-    const { mkdtempSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const { WorkflowManager } = await import("../src/workflow-manager.js");
-    const { withFakeHomeAsync } = await import("./helpers/fake-home.js");
-    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-dedup-"));
-    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
-    try {
-      await withFakeHomeAsync(fakeHome, async () => {
-        const delivery: Delivery = {
-          runId: "dedup-run",
-          deliveryId: "dedup-run:completed",
-          sessionId: "session-1",
-          content: "already delivered",
-          state: "pending",
-        };
-        const original = new WorkflowManager({ cwd, sessionId: "session-1" });
-        original.getPersistence().save(persistedRun(delivery));
-        const restarted = new WorkflowManager({ cwd, sessionId: "session-1" });
-        const pi = createMockPi();
-        const session = createMockSessionManager("session-1", [
-          {
-            type: "custom_message",
-            customType: "workflow-result",
-            content: "already delivered",
-            display: true,
-            details: { runId: "dedup-run", deliveryId: "dedup-run:completed" },
-          },
-        ]);
+  it("does not duplicate a pause message already persisted before restart", async () => {
+    await withTempWorkflowState(async (cwd) => {
+      const delivery: Delivery = {
+        runId: "dedup-run",
+        deliveryId: "dedup-run:paused:checkpoint",
+        sessionId: "session-1",
+        content: checkpointDeliveryText("dedup-run", "Already asked?"),
+        state: "pending",
+      };
+      const original = new WorkflowManager({ cwd, sessionId: "session-1" });
+      original.getPersistence().save(persistedRun(delivery));
+      const restarted = new WorkflowManager({ cwd, sessionId: "session-1" });
+      const pi = createMockPi();
+      const session = createMockSessionManager("session-1", [
+        {
+          type: "custom_message",
+          customType: "workflow-result",
+          content: checkpointDeliveryText("dedup-run", "Already asked?"),
+          display: true,
+          details: { runId: "dedup-run", deliveryId: "dedup-run:paused:checkpoint" },
+        },
+      ]);
 
-        mod.installResultDelivery(pi, restarted, session);
+      mod.installResultDelivery(pi, restarted, session);
 
-        assert.equal(pi._calls.length, 0);
-        assert.equal(restarted.getPersistence().load("dedup-run")?.terminalDeliveries?.[0].state, "delivered");
-      });
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
-    }
+      assert.equal(pi._calls.length, 0);
+      assert.equal(restarted.getPersistence().load("dedup-run")?.terminalDeliveries?.[0].state, "delivered");
+    });
   });
 
   it("marks an enqueued delivery delivered only after agent-settled sees its session entry", () => {
@@ -520,24 +503,176 @@ describe("installResultDelivery", () => {
     assert.equal(pi._calls.length, 1);
   });
 
-  // Paused notifications remain transient: they are resumable, not terminal.
-  it("delivers a resumable checkpoint message on a usage-limit paused event", () => {
-    const pi = createMockPi();
-    const manager = createMockManager(makeRun());
-    mod.installResultDelivery(pi, manager, createMockSessionManager());
+  const actionablePauseCases = [
+    {
+      name: "usage limit",
+      deliveryId: "test-run-1:paused:usage",
+      content: usageLimitDeliveryText("test-run-1", "Codex usage limit reached (plus plan).", "Resets in ~3h"),
+      matches: [/paused/, /\/workflows resume test-run-1/, /Resets in ~3h/],
+      excludes: [/failed/],
+    },
+    {
+      name: "retryable agent failure",
+      deliveryId: "test-run-1:paused:failure",
+      content: agentFailureDeliveryText("test-run-1", "reviewer returned malformed output"),
+      matches: [/reviewer returned malformed output/, /\/workflows retry test-run-1/],
+      excludes: [],
+    },
+    {
+      name: "human checkpoint",
+      deliveryId: "test-run-1:paused:checkpoint",
+      content: checkpointDeliveryText("test-run-1", "Accept the bounded rollout risk?"),
+      matches: [/Accept the bounded rollout risk\?/, /resumeRunId/],
+      excludes: [/Ask the user|Do not start a new run/],
+    },
+  ];
 
-    manager.emit("paused", {
-      runId: "test-run-1",
-      reason: "usage_limit",
-      error: { message: "Codex usage limit reached (plus plan)." },
-      resetHint: "Resets in ~3h",
+  for (const deliveryCase of actionablePauseCases) {
+    it(`delivers a durable ${deliveryCase.name} pause record`, () => {
+      const pi = createMockPi();
+      const manager = createMockManager(makeRun());
+      mod.installResultDelivery(pi, manager, createMockSessionManager());
+      manager._queue(deliveryCase.content, { deliveryId: deliveryCase.deliveryId });
+
+      manager.emit("paused", { runId: "test-run-1" });
+
+      assert.equal(pi._calls.length, 1);
+      for (const pattern of deliveryCase.matches) assert.match(pi._calls[0].content, pattern);
+      for (const pattern of deliveryCase.excludes) assert.doesNotMatch(pi._calls[0].content, pattern);
+      assert.deepEqual(pi._calls[0].details, {
+        runId: "test-run-1",
+        deliveryId: deliveryCase.deliveryId,
+      });
     });
+  }
 
-    assert.equal(pi._calls.length, 1);
-    assert.match(pi._calls[0].content, /paused/);
-    assert.match(pi._calls[0].content, /\/workflows resume test-run-1/);
-    assert.match(pi._calls[0].content, /Resets in ~3h/);
-    assert.doesNotMatch(pi._calls[0].content, /failed/);
+  const managedActionablePauseCases = [
+    {
+      name: "human checkpoint",
+      script: `export const meta = { name: 'checkpoint_wakeup', description: 'checkpoint wakeup' }
+return await checkpoint('Approve the next step?')`,
+      agent: {
+        async run() {
+          return "unused";
+        },
+      },
+      content: /Approve the next step\?/,
+    },
+    {
+      name: "retryable agent failure",
+      script: `export const meta = { name: 'failure_wakeup', description: 'failure wakeup' }
+return await agent('review', { label: 'reviewer' })`,
+      agent: {
+        async run() {
+          throw new WorkflowError("retryable reviewer failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+            recoverable: true,
+            agentLabel: "reviewer",
+          });
+        },
+      },
+      content: /retryable reviewer failure/,
+    },
+    {
+      name: "usage limit",
+      script: `export const meta = { name: 'usage_wakeup', description: 'usage wakeup' }
+return await agent('continue', { label: 'limited', retryable: false })`,
+      agent: {
+        async run() {
+          throw new WorkflowError("provider usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+            resetHint: "Resets soon",
+          });
+        },
+      },
+      content: /provider usage limit reached/,
+    },
+  ];
+
+  for (const pauseCase of managedActionablePauseCases) {
+    it(`wakes the parent for a manager-produced ${pauseCase.name} pause`, async () => {
+      await withTempWorkflowState(async (cwd) => {
+        const manager = new WorkflowManager({
+          cwd,
+          sessionId: "session-1",
+          agent: pauseCase.agent,
+        });
+        const pi = createMockPi();
+        mod.installResultDelivery(pi, manager, createMockSessionManager(), { isIdle: () => false });
+
+        const { runId, promise } = manager.startInBackground(pauseCase.script);
+        await assert.rejects(promise);
+
+        assert.equal(pi._calls.length, 1);
+        assert.match(pi._calls[0].content, pauseCase.content);
+        assert.deepEqual(pi._options, [{ triggerTurn: true, deliverAs: "followUp" }]);
+        assert.equal(pi._calls[0].details?.runId, runId);
+        assert.ok(pi._calls[0].details?.deliveryId.startsWith(`${runId}:paused:`));
+      });
+    });
+  }
+
+  it("wakes the parent again when the same retryable run pauses after retry", async () => {
+    await withTempWorkflowState(async (cwd) => {
+      let attempts = 0;
+      const manager = new WorkflowManager({
+        cwd,
+        sessionId: "session-1",
+        agent: {
+          async run() {
+            attempts++;
+            throw new WorkflowError(`retryable failure ${attempts}`, WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+              recoverable: true,
+              agentLabel: "reviewer",
+            });
+          },
+        },
+      });
+      const session = createMockSessionManager();
+      const pi = createMockPi();
+      const originalSend = pi.sendMessage.bind(pi);
+      pi.sendMessage = ((message: any, options?: unknown) => {
+        session.entries.push({
+          type: "custom_message",
+          customType: message.customType,
+          content: message.content,
+          display: message.display,
+          details: message.details,
+        });
+        originalSend(message, options);
+      }) as typeof pi.sendMessage;
+      mod.installResultDelivery(pi, manager, session, { isIdle: () => false });
+
+      const script = `export const meta = { name: 'repeat_wakeup', description: 'repeat wakeup' }
+return await agent('review', { label: 'reviewer' })`;
+      const { runId, promise } = manager.startInBackground(script);
+      await assert.rejects(promise);
+      assert.equal(pi._calls.length, 1);
+      const firstDeliveryId = pi._calls[0].details?.deliveryId;
+      assert.ok(firstDeliveryId);
+
+      pi._emit("agent_settled");
+      assert.equal(
+        manager
+          .getPersistence()
+          .load(runId)
+          ?.terminalDeliveries?.find((delivery) => delivery.deliveryId === firstDeliveryId)?.state,
+        "delivered",
+      );
+
+      const pausedAgain = new Promise<void>((resolve) => manager.once("paused", () => resolve()));
+      assert.equal(await manager.retry(runId), true);
+      await pausedAgain;
+
+      assert.equal(attempts, 2);
+      assert.equal(pi._calls.length, 2, "the second actionable pause must send another wake-up");
+      assert.match(pi._calls[1].content, /retryable failure 2/);
+      assert.ok(pi._calls[1].details?.deliveryId.startsWith(`${runId}:paused:`));
+      assert.notEqual(pi._calls[1].details?.deliveryId, firstDeliveryId);
+      assert.deepEqual(pi._options, [
+        { triggerTurn: true, deliverAs: "followUp" },
+        { triggerTurn: true, deliverAs: "followUp" },
+      ]);
+    });
   });
 
   it("a command fork's usage-limit pause delivers only its durable no-trigger record", () => {
@@ -559,60 +694,43 @@ describe("installResultDelivery", () => {
       parentLeafId: null,
     });
 
-    manager.emit("paused", {
-      runId: "test-run-1",
-      reason: "usage_limit",
-      error: { message: "Codex usage limit reached (plus plan)." },
-      resetHint: "Resets in ~3h",
-    });
+    manager.emit("paused", { runId: "test-run-1" });
 
     assert.equal(pi._calls.length, 1, "only the durable outbox record is delivered");
     assert.equal(pi._calls[0].content, "⏸ Conversation fork test-run-1 paused");
     assert.deepEqual(pi._options[0], { triggerTurn: false }, "a fork pause never triggers a parent turn");
   });
 
-  it("delivers a retryable agent-failure pause without treating it as terminal", () => {
-    const pi = createMockPi();
-    const manager = createMockManager(makeRun());
-    mod.installResultDelivery(pi, manager, createMockSessionManager());
+  it("a manual manager pause leaves no actionable record or parent wake-up", async () => {
+    await withTempWorkflowState(async (cwd) => {
+      let releaseAgent!: () => void;
+      const agentReleased = new Promise<void>((resolve) => {
+        releaseAgent = resolve;
+      });
+      const manager = new WorkflowManager({
+        cwd,
+        sessionId: "session-1",
+        agent: {
+          async run() {
+            await agentReleased;
+            return "done";
+          },
+        },
+      });
+      const pi = createMockPi();
+      mod.installResultDelivery(pi, manager, createMockSessionManager());
+      const started = new Promise<void>((resolve) => manager.once("agentStart", () => resolve()));
+      const run = manager.startInBackground(`export const meta = { name: 'manual', description: 'manual pause' }
+return await agent('wait')`);
+      await started;
 
-    manager.emit("paused", {
-      runId: "test-run-1",
-      reason: "agent_failure",
-      error: { message: "reviewer returned malformed output" },
+      assert.equal(manager.pause(run.runId), true);
+      assert.deepEqual(manager.listPendingTerminalDeliveries("session-1"), []);
+      assert.equal(pi._calls.length, 0);
+
+      releaseAgent();
+      await run.promise.catch(() => {});
     });
-
-    assert.equal(pi._calls.length, 1);
-    assert.match(pi._calls[0].content, /reviewer returned malformed output/);
-    assert.match(pi._calls[0].content, /\/workflows retry test-run-1/);
-    assert.equal(pi._calls[0].details, undefined);
-  });
-
-  it("delivers a human checkpoint to the parent conversation", () => {
-    const pi = createMockPi();
-    const manager = createMockManager(makeRun());
-    mod.installResultDelivery(pi, manager, createMockSessionManager());
-
-    manager.emit("paused", {
-      runId: "test-run-1",
-      reason: "human_input",
-      checkpoint: { prompt: "Accept the bounded rollout risk?" },
-    });
-
-    assert.equal(pi._calls.length, 1);
-    assert.match(pi._calls[0].content, /Accept the bounded rollout risk\?/);
-    assert.match(pi._calls[0].content, /resumeRunId/);
-    assert.doesNotMatch(pi._calls[0].content, /Ask the user|Do not start a new run/);
-  });
-
-  it("ignores a manual pause", () => {
-    const pi = createMockPi();
-    const manager = createMockManager(makeRun());
-    mod.installResultDelivery(pi, manager, createMockSessionManager());
-
-    manager.emit("paused", { runId: "test-run-1" });
-
-    assert.equal(pi._calls.length, 0);
   });
 });
 

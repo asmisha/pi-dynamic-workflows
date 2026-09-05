@@ -51,7 +51,7 @@ export type { PersistedRunState, RunPersistence, RunStatus, TerminalDelivery } f
 export { createRunPersistence, generateRunId } from "./run-persistence.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
-export { deliverText, installResultDelivery, installTaskPanel, type TaskPanelOptions } from "./task-panel.js";
+export { installTaskPanel, type TaskPanelOptions } from "./task-panel.js";
 export type {
   AgentOptions,
   JournalEntry,
@@ -68,6 +68,7 @@ export { loadWorkflowModule, parseWorkflowScript } from "./workflow.js";
 export { buildForcedWorkflowPrompt, registerWorkflowCommands, WORKFLOW_TOOL_NAME } from "./workflow-commands.js";
 export type { ManagedRun, PendingTerminalDelivery, WorkflowManagerOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";
+export { deliverText, installResultDelivery } from "./workflow-notifications.js";
 export { workflowOutcome } from "./workflow-outcome.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {

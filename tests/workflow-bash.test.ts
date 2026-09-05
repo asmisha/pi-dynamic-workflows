@@ -46,6 +46,40 @@ return { pidType: typeof r.pid, code: r.exitCode, stdoutFile: r.stdoutFile, stde
   }),
 );
 
+test("concurrent one-shot runs get independent generated IDs and bash artifacts", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflow-run-id-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-workflow-run-id-home-"));
+  t.mock.method(Date, "now", () => 1_700_000_000_000);
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const script = `export const meta = { name: 'concurrent_ids', description: 'separate artifacts' }
+const output = await bash('printf ' + args.value)
+return { runId, stdoutFile: output.stdoutFile }`;
+      const results = await Promise.all(
+        Array.from({ length: 25 }, (_, index) =>
+          runWorkflow<{ runId: string; stdoutFile: string }>(script, {
+            args: { value: `value-${index}` },
+            cwd: dir,
+            artifactCwd: dir,
+            persistLogs: true,
+            agent: fakeAgent(),
+          }),
+        ),
+      );
+
+      assert.equal(new Set(results.map((result) => result.runId)).size, results.length);
+      assert.equal(new Set(results.map((result) => result.result.stdoutFile)).size, results.length);
+      assert.deepEqual(
+        results.map((result) => readFileSync(result.result.stdoutFile, "utf-8")),
+        results.map((_result, index) => `value-${index}`),
+      );
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test(
   "bash() returns non-zero exit codes and stores stderr instead of throwing",
   withTempDir(async (dir) => {

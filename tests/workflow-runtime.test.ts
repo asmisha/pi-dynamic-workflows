@@ -1262,7 +1262,7 @@ return { runId, viaAgent: await agent('probe ' + runId, { label: 'probe' }) }`;
     agent: fakeAgent({ total: 10 }),
     persistLogs: false,
   });
-  assert.match(generated.result.runId, /^run-[a-z0-9]+$/);
+  assert.match(generated.result.runId, /^run-[A-Za-z0-9_-]+$/);
 });
 
 test("runWorkflow process.cwd() works inside script", async () => {

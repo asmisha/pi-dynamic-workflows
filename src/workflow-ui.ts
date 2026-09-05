@@ -14,7 +14,7 @@
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { parseKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { isAgentStep, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import { isAgentStep, shortModel, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 
@@ -71,12 +71,7 @@ interface AgentRow {
   thinking?: string;
 }
 
-/** Short, human-friendly model label: drop the provider prefix for display. */
-export function shortModel(model: string | undefined): string | undefined {
-  if (!model) return undefined;
-  const slash = model.indexOf("/");
-  return slash > 0 ? model.slice(slash + 1) : model;
-}
+export { shortModel };
 
 /** Reads run/phase/agent data from the manager, preferring live snapshots. */
 export class NavigatorModel {

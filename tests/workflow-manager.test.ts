@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import type { AgentHistoryEntry } from "../src/agent-history.js";
@@ -107,6 +107,24 @@ const reviews = await parallel([
 phase('Synthesize')
 const synth = await agent('synth ' + writer + ' ' + reviews.join(','), { label: 'synth' })
 return { writer, reviews, synth }`;
+
+function savePausedRun(manager: WorkflowManager, runId: string, sessionId?: string): void {
+  const timestamp = new Date().toISOString();
+  manager.getPersistence().save({
+    runId,
+    workflowName: "control_guard",
+    script: oneAgentScript,
+    sessionId,
+    status: "paused",
+    pauseReason: "manual",
+    phases: [],
+    agents: [],
+    logs: [],
+    journal: [],
+    startedAt: timestamp,
+    updatedAt: timestamp,
+  });
+}
 
 /** Run each manager test with isolated cwd and HOME so workflow state is isolated. */
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
@@ -552,6 +570,7 @@ test(
     let calls = 0;
     const manager = new WorkflowManager({
       cwd,
+      sessionId: "parent-session",
       agent: {
         async run() {
           calls++;
@@ -563,6 +582,13 @@ test(
       },
     });
     manager.on("error", () => {});
+    let deliveryAtPause: string | undefined;
+    manager.on("paused", ({ runId }: { runId: string }) => {
+      deliveryAtPause = manager
+        .getPersistence()
+        .load(runId)
+        ?.terminalDeliveries?.find((delivery) => delivery.deliveryId.startsWith(`${runId}:paused`))?.content;
+    });
 
     await assert.rejects(
       runAndWait(
@@ -576,6 +602,12 @@ return await agent('review', { label: 'reviewer', readOnly: true })`,
     assert.equal(calls, 2);
     assert.equal(run?.status, "paused");
     assert.equal(run?.pauseReason, "agent_failure");
+    assert.match(deliveryAtPause ?? "", /transient review failure/);
+    assert.match(deliveryAtPause ?? "", new RegExp(`/workflows retry ${run?.runId}`));
+    assert.equal(
+      run?.terminalDeliveries?.find((delivery) => delivery.deliveryId.startsWith(`${run.runId}:paused`))?.state,
+      "pending",
+    );
   }),
 );
 
@@ -658,8 +690,21 @@ test(
     const paused = manager.listRuns().find((entry) => entry.workflowName === "retry_parallel");
     assert.equal(paused?.status, "paused");
     assert.ok(paused?.runId);
+    assert.equal(
+      paused.terminalDeliveries?.filter((delivery) => delivery.deliveryId.startsWith(`${paused.runId}:paused`)).length,
+      1,
+    );
 
     assert.equal(await manager.retry(paused.runId), true);
+    assert.equal(
+      manager
+        .getPersistence()
+        .load(paused.runId)
+        ?.terminalDeliveries?.some(
+          (delivery) => delivery.state === "pending" && delivery.deliveryId.startsWith(`${paused.runId}:paused`),
+        ),
+      false,
+    );
     const completed = await waitFor(() => {
       const run = manager.listRuns().find((entry) => entry.runId === paused.runId);
       return run?.status === "completed" ? run : undefined;
@@ -1423,6 +1468,209 @@ test(
 );
 
 test(
+  "management controls reject path-like run IDs before touching persistence",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const victimBase = join(cwd, "outside-run-storage");
+    const craftedRunId = relative(manager.getPersistence().getRunsDir(), victimBase);
+    writeFileSync(
+      `${victimBase}.json`,
+      JSON.stringify({
+        runId: craftedRunId,
+        workflowName: "outside",
+        script: oneAgentScript,
+        status: "paused",
+        pauseReason: "manual",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+
+    assert.equal(await manager.resume(craftedRunId), false);
+    assert.equal(await manager.resumeWithReply(craftedRunId, "reply"), false);
+    assert.equal(manager.stop(craftedRunId), false);
+    assert.equal(manager.deleteRun(craftedRunId), false);
+    assert.equal(manager.pause(craftedRunId), false);
+    assert.equal(await manager.retry(craftedRunId), false);
+    assert.equal(manager.isRunInCurrentSession(craftedRunId), false);
+    assert.equal(manager.markTerminalDeliveryDelivered(craftedRunId, "crafted:completed"), false);
+    assert.equal(existsSync(`${victimBase}.json`), true);
+  }),
+);
+
+test(
+  "management controls enforce session ownership and retain same-session operations",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, sessionId: "session-a", agent: fakeAgent() });
+    savePausedRun(manager, "resume-owned", "session-a");
+    savePausedRun(manager, "stop-owned", "session-a");
+    savePausedRun(manager, "delete-owned", "session-a");
+    savePausedRun(manager, "delivery-owned", "session-a");
+    savePausedRun(manager, "reply-owned", "session-a");
+    savePausedRun(manager, "retry-owned", "session-a");
+    const deliveryRun = manager.getPersistence().load("delivery-owned");
+    assert.ok(deliveryRun);
+    manager.getPersistence().save({
+      ...deliveryRun,
+      terminalDeliveries: [
+        {
+          deliveryId: "delivery-owned:paused:notice",
+          sessionId: "session-a",
+          content: "owned notice",
+          state: "pending",
+        },
+      ],
+    });
+    const replyRun = manager.getPersistence().load("reply-owned");
+    const retryRun = manager.getPersistence().load("retry-owned");
+    assert.ok(replyRun);
+    assert.ok(retryRun);
+    manager.getPersistence().save({
+      ...replyRun,
+      pauseReason: "human_input",
+      pendingCheckpoint: { prompt: "Owned question?", callIndex: 0, hash: "owned-checkpoint" },
+    });
+    manager.getPersistence().save({
+      ...retryRun,
+      pauseReason: "agent_failure",
+      retryState: {
+        failures: [{ callId: "agent-0", retryable: true }],
+        pausedAt: new Date().toISOString(),
+      },
+    });
+
+    manager.setSessionId("session-b");
+    assert.equal(manager.listRuns().length, 0);
+    assert.equal(await manager.resume("resume-owned"), false);
+    assert.equal(await manager.resumeWithReply("reply-owned", "answer"), false);
+    assert.equal(await manager.retry("retry-owned"), false);
+    assert.equal(manager.stop("stop-owned"), false);
+    assert.equal(manager.deleteRun("delete-owned"), false);
+    assert.equal(manager.markTerminalDeliveryDelivered("delivery-owned", "delivery-owned:paused:notice"), false);
+    assert.equal(manager.getPersistence().load("resume-owned")?.status, "paused");
+    assert.equal(manager.getPersistence().load("stop-owned")?.status, "paused");
+    assert.ok(manager.getPersistence().load("delete-owned"));
+
+    manager.setSessionId("session-a");
+    assert.equal(await manager.resume("resume-owned"), true);
+    await waitFor(
+      () => (manager.getPersistence().load("resume-owned")?.status === "completed" ? true : undefined),
+      "same-session resume should complete",
+    );
+    assert.equal(manager.stop("stop-owned", { notifyParent: false }), true);
+    assert.equal(manager.deleteRun("delete-owned"), true);
+    assert.equal(manager.markTerminalDeliveryDelivered("delivery-owned", "delivery-owned:paused:notice"), true);
+  }),
+);
+
+test(
+  "an unbound manager retains legacy control of session-tagged runs",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    savePausedRun(manager, "legacy-unbound", "another-session");
+    savePausedRun(manager, "legacy-unowned");
+
+    assert.equal(manager.stop("legacy-unbound", { notifyParent: false }), true);
+    assert.equal(manager.stop("legacy-unowned", { notifyParent: false }), true);
+    assert.equal(manager.getPersistence().load("legacy-unbound")?.status, "aborted");
+    assert.equal(manager.getPersistence().load("legacy-unowned")?.status, "aborted");
+  }),
+);
+
+test(
+  "a session-bound manager retains every management control for legacy ownerless runs",
+  withTempCwd(async (cwd) => {
+    const activeAgent = deferredAgent();
+    const pauseManager = new WorkflowManager({ cwd, agent: activeAgent.runner });
+    const active = pauseManager.startInBackground(oneAgentScript);
+    await waitFor(
+      () => (pauseManager.getRun(active.runId)?.snapshot.agents[0]?.status === "running" ? true : undefined),
+      "ownerless run start",
+    );
+    pauseManager.setSessionId("current-session");
+    assert.equal(pauseManager.pause(active.runId), true);
+    activeAgent.resolve("done");
+    await active.promise.catch(() => {});
+
+    const persistedManager = new WorkflowManager({ cwd, sessionId: "current-session", agent: fakeAgent() });
+    savePausedRun(persistedManager, "legacy-resume");
+    savePausedRun(persistedManager, "legacy-stop");
+    savePausedRun(persistedManager, "legacy-delete");
+    assert.equal(persistedManager.isRunInCurrentSession("legacy-resume"), true);
+    assert.equal(await persistedManager.resume("legacy-resume"), true);
+    await waitFor(
+      () => (persistedManager.getPersistence().load("legacy-resume")?.status === "completed" ? true : undefined),
+      "ownerless resume",
+    );
+    assert.equal(persistedManager.stop("legacy-stop", { notifyParent: false }), true);
+    assert.equal(persistedManager.deleteRun("legacy-delete"), true);
+
+    const checkpointManager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const checkpointScript = `export const meta = { name: 'legacy_checkpoint', description: 'ownerless reply' }
+return await checkpoint('Legacy question?')`;
+    const checkpointPaused = new Promise<void>((resolve) => checkpointManager.once("paused", () => resolve()));
+    const checkpointRun = checkpointManager.startInBackground(checkpointScript);
+    await checkpointPaused;
+    await checkpointRun.promise.catch(() => {});
+    checkpointManager.setSessionId("current-session");
+    const checkpointCompleted = new Promise<void>((resolve) => checkpointManager.once("complete", () => resolve()));
+    assert.equal(await checkpointManager.resumeWithReply(checkpointRun.runId, "legacy answer"), true);
+    await checkpointCompleted;
+
+    let failRetry = true;
+    const retryManager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          if (failRetry) {
+            failRetry = false;
+            throw new WorkflowError("retry legacy run", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, {
+              recoverable: false,
+            });
+          }
+          return "retried";
+        },
+      },
+    });
+    const retryRun = retryManager.startInBackground(oneAgentScript);
+    await retryRun.promise.catch(() => {});
+    assert.equal(retryManager.getPersistence().load(retryRun.runId)?.pauseReason, "agent_failure");
+    retryManager.setSessionId("current-session");
+    assert.equal(await retryManager.retry(retryRun.runId), true);
+    await waitFor(
+      () => (retryManager.getPersistence().load(retryRun.runId)?.status === "completed" ? true : undefined),
+      "ownerless retry",
+    );
+  }),
+);
+
+test(
+  "sibling controls cannot mutate an active run after the manager binds another session",
+  withTempCwd(async (cwd) => {
+    const deferred = deferredAgent();
+    const manager = new WorkflowManager({ cwd, sessionId: "session-a", agent: deferred.runner });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await waitFor(
+      () => (manager.getRun(runId)?.snapshot.agents[0]?.status === "running" ? true : undefined),
+      "run start",
+    );
+
+    manager.setSessionId("session-b");
+    assert.equal(manager.pause(runId), false);
+    assert.equal(manager.stop(runId), false);
+    assert.equal(manager.deleteRun(runId), false);
+
+    manager.setSessionId("session-a");
+    assert.equal(manager.stop(runId, { notifyParent: false }), true);
+    deferred.resolve("done");
+    await promise.catch(() => {});
+  }),
+);
+
+test(
   "stop aborts a persisted paused workflow with no in-memory runner",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd });
@@ -1433,6 +1681,13 @@ test(
       status: "paused",
       pauseReason: "usage_limit",
       resetHint: "Resets in ~3h",
+      terminalDeliveries: [
+        {
+          deliveryId: "persisted-paused:paused:notice",
+          content: "stale pause",
+          state: "pending",
+        },
+      ],
       phases: [],
       agents: [],
       logs: [],
@@ -1447,6 +1702,10 @@ test(
     assert.equal(persisted?.status, "aborted");
     assert.equal(persisted?.pauseReason, undefined);
     assert.equal(persisted?.resetHint, undefined);
+    assert.equal(
+      persisted?.terminalDeliveries?.some((delivery) => delivery.deliveryId === "persisted-paused:paused:notice"),
+      false,
+    );
   }),
 );
 
@@ -2166,6 +2425,7 @@ test(
     let limitActive = true;
     const manager = new WorkflowManager({
       cwd,
+      sessionId: "parent-session",
       agent: {
         async run(prompt: string) {
           if (prompt.includes("second") && limitActive) {
@@ -2179,8 +2439,15 @@ test(
         },
       },
     });
-    const pausedEvents: Array<{ runId: string; reason?: string; resetHint?: string }> = [];
-    manager.on("paused", (e: { runId: string; reason?: string; resetHint?: string }) => pausedEvents.push(e));
+    const pausedEvents: Array<{ runId: string; reason?: string; resetHint?: string; deliveryId?: string }> = [];
+    let persistedDeliveryAtPause: string | undefined;
+    manager.on("paused", (e: { runId: string; reason?: string; resetHint?: string; deliveryId?: string }) => {
+      pausedEvents.push(e);
+      persistedDeliveryAtPause = manager
+        .getPersistence()
+        .load(e.runId)
+        ?.terminalDeliveries?.find((delivery) => delivery.deliveryId === e.deliveryId)?.content;
+    });
 
     const twoAgentScript = `export const meta = { name: 'quota_demo', description: 'two agents' }
 const a = await agent('first', { label: 'first' })
@@ -2202,16 +2469,184 @@ return { a, b }`;
     assert.equal(pausedEvents.length, 1);
     assert.equal(pausedEvents[0].reason, "usage_limit");
     assert.equal(pausedEvents[0].resetHint, "Resets in ~3h");
+    assert.ok(pausedEvents[0].deliveryId?.startsWith(`${runId}:paused`));
+    assert.match(persistedDeliveryAtPause ?? "", /Codex usage limit reached/);
+    assert.match(persistedDeliveryAtPause ?? "", /Resets in ~3h/);
+    assert.match(persistedDeliveryAtPause ?? "", new RegExp(`/workflows resume ${runId}`));
 
     // After the provider limit resets, resume replays agent 1 and runs agent 2 live to completion.
     limitActive = false;
     const resumed = await manager.resume(runId);
     assert.equal(resumed, true);
+    assert.equal(
+      manager
+        .getPersistence()
+        .load(runId)
+        ?.terminalDeliveries?.some(
+          (delivery) => delivery.state === "pending" && delivery.deliveryId.startsWith(`${runId}:paused`),
+        ),
+      false,
+    );
     await new Promise((r) => setTimeout(r, 50));
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed run completes once the limit clears");
     assert.equal(finalRun?.result?.result?.a, "first-result");
     assert.equal(finalRun?.result?.result?.b, "second-result");
+  }),
+);
+
+test(
+  "a host abort during usage-limit sibling drain finalizes the run as aborted",
+  withTempCwd(async (cwd) => {
+    const external = new AbortController();
+    const slowStarted = createDeferred<void>();
+    const slowAborted = createDeferred<void>();
+    const limitThrown = createDeferred<void>();
+    const manager = new WorkflowManager({
+      cwd,
+      sessionId: "parent-session",
+      agent: {
+        async run(prompt: string, options?: { signal?: AbortSignal }) {
+          if (prompt === "limited") {
+            await slowStarted.promise;
+            limitThrown.resolve();
+            throw new WorkflowError("provider limit", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+              recoverable: false,
+            });
+          }
+          slowStarted.resolve();
+          return new Promise((_, reject) => {
+            options?.signal?.addEventListener(
+              "abort",
+              () => {
+                slowAborted.resolve();
+                reject(new Error("host aborted sibling"));
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+    });
+    let pausedEvents = 0;
+    let stoppedEvents = 0;
+    manager.on("paused", () => {
+      pausedEvents++;
+    });
+    manager.on("stopped", () => {
+      stoppedEvents++;
+    });
+
+    const script = `export const meta = { name: 'abort_usage_limit', description: 'host abort wins during pause drain' }
+return await parallel([
+  () => agent('limited', { retryable: false }),
+  () => agent('slow', { retryable: false }),
+])`;
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      concurrency: 2,
+      externalSignal: external.signal,
+    });
+    let settled = false;
+    void promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    await limitThrown.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "the usage-limit unwind waits for its active sibling");
+    external.abort();
+    await slowAborted.promise;
+
+    await assert.rejects(promise, (error: unknown) => {
+      return error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED;
+    });
+    assert.equal(pausedEvents, 0);
+    assert.equal(stoppedEvents, 1);
+
+    const persistence = manager.getPersistence();
+    const persisted = persistence.load(runId);
+    assert.equal(persisted?.status, "aborted");
+    assert.equal(persisted?.pauseReason, undefined);
+    assert.equal(
+      persisted?.terminalDeliveries?.some(
+        (delivery) => delivery.state === "pending" && delivery.deliveryId.startsWith(`${runId}:paused`),
+      ),
+      false,
+    );
+    assert.ok(
+      persisted?.terminalDeliveries?.some(
+        (delivery) => delivery.state === "pending" && delivery.deliveryId === `${runId}:aborted`,
+      ),
+      "the stopped notification is durable",
+    );
+    assert.equal(persistence.getRunLock(runId)?.alive ?? false, false, "the aborted run releases its lease");
+
+    const restarted = new WorkflowManager({ cwd, sessionId: "parent-session" });
+    assert.equal(restarted.getPersistence().load(runId)?.status, "aborted");
+    assert.equal(await restarted.resume(runId), false, "restart recovery does not make the aborted run resumable");
+  }),
+);
+
+test(
+  "a usage-limit pause is not emitted when its outbox cannot be persisted",
+  withTempCwd(async (cwd) => {
+    let releaseAgent!: () => void;
+    const agentReleased = new Promise<void>((resolve) => {
+      releaseAgent = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          await agentReleased;
+          throw new WorkflowError("provider limit", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+          });
+        },
+      },
+    });
+    let paused = false;
+    let emittedError: WorkflowError | undefined;
+    manager.on("paused", () => {
+      paused = true;
+    });
+    manager.on("error", ({ error }: { error: WorkflowError }) => {
+      emittedError = error;
+    });
+
+    const started = new Promise<void>((resolve) => manager.once("agentStart", () => resolve()));
+    const { runId, promise } = manager.startInBackground(nonRetryableOneAgentScript);
+    await started;
+    const persistence = manager.getPersistence();
+    const originalSave = persistence.save;
+    let failNextSave = true;
+    persistence.save = (...args: Parameters<typeof originalSave>) => {
+      if (failNextSave) {
+        failNextSave = false;
+        throw new Error("pause outbox disk failure");
+      }
+      return originalSave(...args);
+    };
+    releaseAgent();
+
+    await assert.rejects(promise, (error: unknown) => {
+      return error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR;
+    });
+    persistence.save = originalSave;
+
+    assert.equal(paused, false);
+    assert.equal(emittedError?.code, WorkflowErrorCode.PERSISTENCE_ERROR);
+    const persisted = persistence.load(runId);
+    assert.equal(persisted?.status, "failed");
+    assert.equal(
+      persisted?.terminalDeliveries?.some((delivery) => delivery.deliveryId.startsWith(`${runId}:paused`)),
+      false,
+    );
   }),
 );
 
@@ -3358,9 +3793,14 @@ const reply = await checkpoint('Accept risk?')
 const after = await agent('after:' + reply, { label: 'after' })
 return { before, reply, after }`;
 
+      let deliveryAtPause: string | undefined;
       const paused = new Promise<void>((resolve) => {
-        manager.once("paused", ({ reason }) => {
+        manager.once("paused", ({ runId: pausedRunId, reason, deliveryId }) => {
           assert.equal(reason, "human_input");
+          deliveryAtPause = manager
+            .getPersistence()
+            .load(pausedRunId)
+            ?.terminalDeliveries?.find((delivery) => delivery.deliveryId === deliveryId)?.content;
           resolve();
         });
       });
@@ -3375,6 +3815,12 @@ return { before, reply, after }`;
       assert.equal(persisted?.status, "paused");
       assert.equal(persisted?.pauseReason, "human_input");
       assert.equal(persisted?.pendingCheckpoint?.prompt, "Accept risk?");
+      assert.match(deliveryAtPause ?? "", /Accept risk\?/);
+      assert.match(deliveryAtPause ?? "", new RegExp(`resumeRunId: "${runId}"`));
+      assert.equal(
+        persisted?.terminalDeliveries?.filter((delivery) => delivery.deliveryId.startsWith(`${runId}:paused`)).length,
+        1,
+      );
       assert.deepEqual(persisted?.executionOptions, {
         agentTimeoutMs: 1234,
         concurrency: 2,
@@ -3402,6 +3848,15 @@ return { before, reply, after }`;
 
       const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
       assert.equal(await manager.resumeWithReply(runId, "accept"), true);
+      assert.equal(
+        manager
+          .getPersistence()
+          .load(runId)
+          ?.terminalDeliveries?.some(
+            (delivery) => delivery.state === "pending" && delivery.deliveryId.startsWith(`${runId}:paused`),
+          ),
+        false,
+      );
       await completed;
 
       const run = manager.getRun(runId);

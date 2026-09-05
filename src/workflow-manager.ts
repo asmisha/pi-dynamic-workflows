@@ -27,7 +27,6 @@ import {
   type RunStatus,
   type TerminalDelivery,
 } from "./run-persistence.js";
-import { deliverText, failureDeliveryText, stoppedDeliveryText } from "./task-panel.js";
 import {
   type JournalEntry,
   loadWorkflowModule,
@@ -37,6 +36,14 @@ import {
   type WorkflowModuleDefinition,
   type WorkflowRunResult,
 } from "./workflow.js";
+import {
+  agentFailureDeliveryText,
+  checkpointDeliveryText,
+  deliverText,
+  failureDeliveryText,
+  stoppedDeliveryText,
+  usageLimitDeliveryText,
+} from "./workflow-notifications.js";
 import { resolveWorkflowSessionPath } from "./workflow-paths.js";
 
 /**
@@ -97,6 +104,20 @@ function appendTerminalDelivery(
   const deliveryId = terminalDeliveryId(runId, status);
   if (deliveries?.some((delivery) => delivery.deliveryId === deliveryId)) return deliveries;
   return [...(deliveries ?? []), { deliveryId, sessionId, content, state: "pending", ...options }];
+}
+
+function appendPauseDelivery(
+  deliveries: TerminalDelivery[] | undefined,
+  runId: string,
+  sessionId: string | undefined,
+  content: string,
+  options: Pick<TerminalDelivery, "deliveryMode" | "parentLeafId"> = {},
+): { deliveries: TerminalDelivery[]; deliveryId: string } {
+  const deliveryId = `${runId}:paused:${generateRunId()}`;
+  return {
+    deliveries: [...(deliveries ?? []), { deliveryId, sessionId, content, state: "pending", ...options }],
+    deliveryId,
+  };
 }
 
 /**
@@ -772,7 +793,7 @@ export class WorkflowManager extends EventEmitter {
       return result;
     } catch (error) {
       const wrappedError = wrapError(error);
-      const workflowError =
+      let workflowError =
         managed.controller.signal.aborted && wrappedError.code !== WorkflowErrorCode.WORKFLOW_ABORTED
           ? new WorkflowError(wrappedError.message, WorkflowErrorCode.WORKFLOW_ABORTED, {
               recoverable: true,
@@ -782,18 +803,22 @@ export class WorkflowManager extends EventEmitter {
 
       if (workflowError.callId) escapedAgentFailureCallIds.add(workflowError.callId);
       const checkpoint = checkpointFromError(workflowError);
-      const usageLimitPaused =
+      const usageLimitFailure =
         !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
       // Paused runs remain resumable, so their journal must be quiescent before
       // releasing the lease. Ordinary failures are terminal and persist promptly;
       // their surviving combinator branches drain passively after finalization.
-      if (!managed.controller.signal.aborted && (checkpoint || usageLimitPaused)) {
+      if (!managed.controller.signal.aborted && (checkpoint || usageLimitFailure)) {
         await waitForRuntimeOwnedWork();
       }
       if (!managed.controller.signal.aborted && checkpoint) {
         managed.status = "paused";
         managed.pendingCheckpoint = checkpoint;
         managed.pauseReason = "human_input";
+        const pauseDeliveryId = this.preparePauseDelivery(
+          managed,
+          checkpointDeliveryText(managed.runId, checkpoint.prompt),
+        );
         if (!this.persistRun(managed)) {
           const persistenceError = new WorkflowError(
             "Could not persist the workflow checkpoint",
@@ -804,6 +829,7 @@ export class WorkflowManager extends EventEmitter {
           managed.pendingCheckpoint = undefined;
           managed.pauseReason = undefined;
           managed.error = persistenceError;
+          managed.terminalDeliveries = withoutPendingPauseNotices(managed.terminalDeliveries, managed.runId);
           const deliveryId = this.prepareTerminalDelivery(managed, failureDeliveryText(managed, persistenceError));
           this.persistRun(managed);
           this.emit("error", { runId: managed.runId, error: persistenceError, deliveryId });
@@ -811,7 +837,7 @@ export class WorkflowManager extends EventEmitter {
           this.releaseRunLease(managed);
           throw persistenceError;
         }
-        this.emit("paused", { runId: managed.runId, reason: "human_input", checkpoint });
+        this.emit("paused", { runId: managed.runId, reason: "human_input", checkpoint, deliveryId: pauseDeliveryId });
         managed.finalized = true;
         this.releaseRunLease(managed);
         this.runs.delete(managed.runId);
@@ -823,7 +849,7 @@ export class WorkflowManager extends EventEmitter {
 
       if (
         !managed.controller.signal.aborted &&
-        !usageLimitPaused &&
+        !usageLimitFailure &&
         failedAgentEntries(managed.journal).some((entry) => entry.retryable !== false)
       ) {
         await waitForRuntimeOwnedWork();
@@ -835,6 +861,10 @@ export class WorkflowManager extends EventEmitter {
             managed.retryState = retryState;
             managed.activeRetryCallIds = undefined;
             managed.error = workflowError;
+            const pauseDeliveryId = this.preparePauseDelivery(
+              managed,
+              agentFailureDeliveryText(managed.runId, workflowError.message),
+            );
             if (!this.persistRun(managed)) {
               const persistenceError = new WorkflowError(
                 "Could not persist the workflow retry state",
@@ -845,6 +875,7 @@ export class WorkflowManager extends EventEmitter {
               managed.pauseReason = undefined;
               managed.retryState = undefined;
               managed.error = persistenceError;
+              managed.terminalDeliveries = withoutPendingPauseNotices(managed.terminalDeliveries, managed.runId);
               const deliveryId = this.prepareTerminalDelivery(managed, failureDeliveryText(managed, persistenceError));
               this.persistRun(managed);
               this.emit("error", { runId: managed.runId, error: persistenceError, deliveryId });
@@ -852,7 +883,13 @@ export class WorkflowManager extends EventEmitter {
               this.releaseRunLease(managed);
               throw persistenceError;
             }
-            this.emit("paused", { runId: managed.runId, reason: "agent_failure", retryState, error: workflowError });
+            this.emit("paused", {
+              runId: managed.runId,
+              reason: "agent_failure",
+              retryState,
+              error: workflowError,
+              deliveryId: pauseDeliveryId,
+            });
             managed.finalized = true;
             this.releaseRunLease(managed);
             throw new WorkflowError(workflowError.message, workflowError.code, {
@@ -866,6 +903,13 @@ export class WorkflowManager extends EventEmitter {
         }
       }
 
+      if (managed.controller.signal.aborted && workflowError.code !== WorkflowErrorCode.WORKFLOW_ABORTED) {
+        workflowError = new WorkflowError(workflowError.message, WorkflowErrorCode.WORKFLOW_ABORTED, {
+          recoverable: true,
+          details: error,
+        });
+      }
+
       let abortedByHost = false;
       if (managed.controller.signal.aborted) {
         // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
@@ -873,7 +917,7 @@ export class WorkflowManager extends EventEmitter {
           managed.status = "aborted";
           abortedByHost = true; // Esc/external abort: no pause()/stop() emitted an event
         }
-      } else if (usageLimitPaused) {
+      } else if (usageLimitFailure) {
         managed.pauseReason = "usage_limit";
         // Provider quota/usage limit: NOT a failure. Checkpoint the run as paused so
         // the persisted journal (completed agent results) is replayed by resume()
@@ -892,46 +936,60 @@ export class WorkflowManager extends EventEmitter {
         throw workflowError;
       }
 
+      const usageLimitPaused = managed.status === "paused" && managed.pauseReason === "usage_limit";
       const deliveryId =
         managed.status === "failed"
           ? this.prepareTerminalDelivery(managed, failureDeliveryText(managed, workflowError))
           : managed.status === "aborted" && !managed.stopNotificationSuppressed
             ? this.prepareTerminalDelivery(managed, stoppedDeliveryText(managed.runId))
             : undefined;
-
-      // A command fork must never trigger a parent turn, so its usage-limit pause
-      // notice goes through the durable no-trigger outbox instead of the transient
-      // trigger-turn advisory used by tool-started runs.
-      if (usageLimitPaused && managed.conversationFork) {
-        managed.terminalDeliveries = [
-          ...(managed.terminalDeliveries ?? []),
-          {
-            deliveryId: `${managed.runId}:paused:${Date.now()}`,
-            sessionId: managed.sessionId,
-            content: conversationForkPausedDeliveryText(
-              managed.runId,
-              managed.conversationFork,
-              workflowError.message,
-              workflowError.resetHint,
-            ),
-            state: "pending",
-            deliveryMode: "no-trigger",
-            parentLeafId: managed.conversationFork.parentLeafId,
-          },
-        ];
-      }
+      const pauseDeliveryId = usageLimitPaused
+        ? this.preparePauseDelivery(
+            managed,
+            managed.conversationFork
+              ? conversationForkPausedDeliveryText(
+                  managed.runId,
+                  managed.conversationFork,
+                  workflowError.message,
+                  workflowError.resetHint,
+                )
+              : usageLimitDeliveryText(managed.runId, workflowError.message, workflowError.resetHint),
+          )
+        : undefined;
 
       // Persist the first terminal error and its delivery outbox before emitting
       // the terminal event. Failed fan-outs retain their lease while surviving
       // runtime-owned siblings drain, preventing another process from racing late
       // journal/snapshot updates.
       const terminalPersisted = this.persistRun(managed);
+      if (usageLimitPaused && !terminalPersisted) {
+        const persistenceError = new WorkflowError(
+          "Could not persist the workflow usage-limit checkpoint",
+          WorkflowErrorCode.PERSISTENCE_ERROR,
+          { recoverable: false, details: workflowError },
+        );
+        managed.status = "failed";
+        managed.pauseReason = undefined;
+        managed.error = persistenceError;
+        managed.terminalDeliveries = withoutPendingPauseNotices(managed.terminalDeliveries, managed.runId);
+        const persistenceDeliveryId = this.prepareTerminalDelivery(
+          managed,
+          failureDeliveryText(managed, persistenceError),
+        );
+        if (this.persistRun(managed)) {
+          managed.finalized = true;
+          this.releaseRunLease(managed);
+        }
+        this.emit("error", { runId: managed.runId, error: persistenceError, deliveryId: persistenceDeliveryId });
+        throw persistenceError;
+      }
       if (usageLimitPaused) {
         this.emit("paused", {
           runId: managed.runId,
           reason: "usage_limit",
           error: workflowError,
           resetHint: workflowError.resetHint,
+          deliveryId: pauseDeliveryId,
         });
       } else if (abortedByHost) {
         // Host abort (Esc / external signal): the run was stopped, not failed —
@@ -988,6 +1046,22 @@ export class WorkflowManager extends EventEmitter {
       conversation ? { deliveryMode: "no-trigger", parentLeafId: conversation.parentLeafId } : {},
     );
     return terminalDeliveryId(managed.runId, status);
+  }
+
+  private preparePauseDelivery(managed: ManagedRun, content: string): string {
+    if (managed.status !== "paused") {
+      throw new Error(`Cannot create a pause delivery for ${managed.status} run ${managed.runId}`);
+    }
+    const conversation = managed.conversationFork;
+    const appended = appendPauseDelivery(
+      managed.terminalDeliveries,
+      managed.runId,
+      managed.sessionId,
+      content,
+      conversation ? { deliveryMode: "no-trigger", parentLeafId: conversation.parentLeafId } : {},
+    );
+    managed.terminalDeliveries = appended.deliveries;
+    return appended.deliveryId;
   }
 
   private releaseRunLease(managed: ManagedRun): void {
@@ -1124,8 +1198,9 @@ export class WorkflowManager extends EventEmitter {
    * Pause a running workflow.
    */
   pause(runId: string): boolean {
+    if (!isValidRunId(runId)) return false;
     const managed = this.runs.get(runId);
-    if (managed?.status !== "running") return false;
+    if (!managed || !this.ownsCurrentSession(managed.sessionId) || managed.status !== "running") return false;
 
     managed.controller.abort();
     managed.status = "paused";
@@ -1148,12 +1223,15 @@ export class WorkflowManager extends EventEmitter {
    * resumeWithReply().
    */
   async resume(runId: string): Promise<boolean> {
+    if (!isValidRunId(runId)) return false;
     const active = this.runs.get(runId);
+    if (active && !this.ownsCurrentSession(active.sessionId)) return false;
     if (active?.status === "running" || active?.status === "aborted") return false;
 
     const persisted = this.persistence.load(runId);
     if (
       !persisted?.script ||
+      !this.ownsCurrentSession(persisted.sessionId) ||
       persisted.status === "completed" ||
       persisted.status === "failed" ||
       persisted.status === "aborted" ||
@@ -1186,6 +1264,7 @@ export class WorkflowManager extends EventEmitter {
   async resumeWithReply(runId: string, reply: unknown): Promise<boolean> {
     if (!isValidRunId(runId)) return false;
     const active = this.runs.get(runId);
+    if (active && !this.ownsCurrentSession(active.sessionId)) return false;
     if (active?.status === "running" || active?.status === "aborted") return false;
 
     const persisted = this.persistence.load(runId);
@@ -1290,6 +1369,7 @@ export class WorkflowManager extends EventEmitter {
   async retry(runId: string): Promise<boolean> {
     if (!isValidRunId(runId)) return false;
     const active = this.runs.get(runId);
+    if (active && !this.ownsCurrentSession(active.sessionId)) return false;
     if (active?.status === "running" || active?.status === "aborted") return false;
 
     const persisted = this.persistence.load(runId);
@@ -1339,9 +1419,11 @@ export class WorkflowManager extends EventEmitter {
    * Stop a running/paused workflow or surviving siblings draining after failure.
    */
   stop(runId: string, options: StopOptions = {}): boolean {
+    if (!isValidRunId(runId)) return false;
     const notifyParent = options.notifyParent !== false;
     const managed = this.runs.get(runId);
     if (managed) {
+      if (!this.ownsCurrentSession(managed.sessionId)) return false;
       const canStop =
         managed.status === "running" ||
         managed.status === "paused" ||
@@ -1369,14 +1451,22 @@ export class WorkflowManager extends EventEmitter {
     // to another manager/Pi session. This manager cannot safely stop it, and the
     // UI filters it out; leave it alone.
     const persisted = this.persistence.load(runId);
-    if (!persisted || (persisted.status !== "running" && persisted.status !== "paused")) return false;
+    if (
+      !persisted ||
+      !this.ownsCurrentSession(persisted.sessionId) ||
+      (persisted.status !== "running" && persisted.status !== "paused")
+    ) {
+      return false;
+    }
     if (this.hasLiveExternalOwner(runId)) return false;
 
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
     try {
       const latest = this.persistence.load(runId) ?? persisted;
-      if (latest.status !== "running" && latest.status !== "paused") return false;
+      if (!this.ownsCurrentSession(latest.sessionId) || (latest.status !== "running" && latest.status !== "paused")) {
+        return false;
+      }
       const deliveryId = notifyParent ? terminalDeliveryId(runId, "aborted") : undefined;
       const conversation = latest.conversationFork;
       const baseDeliveries = withoutPendingPauseNotices(latest.terminalDeliveries, runId);
@@ -1426,8 +1516,11 @@ export class WorkflowManager extends EventEmitter {
 
   /** Whether this run belongs to the parent Pi session currently bound to the manager. */
   isRunInCurrentSession(runId: string): boolean {
-    const owner = this.runs.get(runId)?.sessionId ?? this.persistence.load(runId)?.sessionId;
-    return this.ownsCurrentSession(owner);
+    if (!isValidRunId(runId)) return false;
+    const active = this.runs.get(runId);
+    if (active) return this.ownsCurrentSession(active.sessionId);
+    const persisted = this.persistence.load(runId);
+    return persisted !== null && this.ownsCurrentSession(persisted.sessionId);
   }
 
   /** Pending terminal notifications for one exact parent session. */
@@ -1452,6 +1545,10 @@ export class WorkflowManager extends EventEmitter {
 
   /** Mark a terminal notification delivered after its session entry is durable. */
   markTerminalDeliveryDelivered(runId: string, deliveryId: string): boolean {
+    if (!isValidRunId(runId)) return false;
+    const managed = this.runs.get(runId);
+    const owner = managed?.sessionId ?? this.persistence.load(runId)?.sessionId;
+    if (!this.ownsCurrentSession(owner)) return false;
     try {
       if (!this.persistence.markTerminalDeliveryDelivered(runId, deliveryId)) return false;
       const delivery = this.runs
@@ -1503,8 +1600,10 @@ export class WorkflowManager extends EventEmitter {
    * by another manager/Pi session are ignored; listRuns() filters them out.
    */
   deleteRun(runId: string): boolean {
+    if (!isValidRunId(runId)) return false;
     const managed = this.runs.get(runId);
     if (managed) {
+      if (!this.ownsCurrentSession(managed.sessionId)) return false;
       managed.deleted = true;
       managed.controller.abort();
       managed.status = "aborted";
@@ -1516,6 +1615,8 @@ export class WorkflowManager extends EventEmitter {
       return true;
     }
 
+    const persisted = this.persistence.load(runId);
+    if (!persisted || !this.ownsCurrentSession(persisted.sessionId)) return false;
     if (this.hasLiveExternalOwner(runId)) return false;
     const deleted = this.persistence.delete(runId);
     if (deleted) this.emit("stopped", { runId });
