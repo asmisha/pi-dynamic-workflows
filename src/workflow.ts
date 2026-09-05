@@ -30,6 +30,7 @@ import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { nativeImport } from "./native-import.mjs";
+import { generateRunId } from "./run-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 const AGENT_TIMEOUT_CLEANUP_GRACE_MS = 1000;
@@ -389,7 +390,7 @@ export async function runWorkflow<T = unknown>(
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
-  const runId = options.runId ?? `run-${started.toString(36)}`;
+  const runId = options.runId ?? `run-${generateRunId()}`;
   const baseCwd = options.cwd ?? process.cwd();
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
   // observe a mid-run edit (determinism); a later resume re-reads it.
