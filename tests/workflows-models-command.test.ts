@@ -10,7 +10,11 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, mock } from "node:test";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 async function loadCommand() {
   const mod = await import("../src/workflows-models-command.js");
@@ -118,4 +122,61 @@ describe("workflows-models-command", () => {
       assert.equal(result.small, "openai/gpt-4.1-mini");
     });
   });
+});
+
+it("model edits retain tier thinking and do not mutate the input", async () => {
+  const { editSingleTier } = await loadCommand();
+  const tiers = { medium: { model: "old/model", thinking: "low" as const }, small: "legacy" };
+  const ctx = { ui: { custom: async () => "new/model", notify: () => {} } };
+  assert.deepEqual(await editSingleTier(ctx as never, tiers, "medium"), {
+    medium: { model: "new/model", thinking: "low" },
+    small: "legacy",
+  });
+  assert.equal(tiers.medium.model, "old/model");
+});
+
+it("command displays, edits, saves, and clears tier thinking", async () => {
+  const { loadModelTierConfig, saveModelTierConfig } = await import("../src/model-tier-config.js");
+  const { registerWorkflowModelsCommand } = await loadCommand();
+  const home = mkdtempSync(join(tmpdir(), "tier-ui-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      saveModelTierConfig({ tiers: { medium: { model: "provider/astra", thinking: "low" } } });
+      let handler = async (_args: string, _ctx: any) => {};
+      registerWorkflowModelsCommand({
+        registerCommand: (_name: string, opts: any) => {
+          handler = opts.handler;
+        },
+      } as never);
+      for (const level of ["medium", "Session default"]) {
+        let call = 0;
+        await handler("", {
+          waitForIdle: async () => {},
+          ui: {
+            select: async (_title: string, options: string[]) => {
+              call++;
+              if (call === 1) {
+                assert.ok(options.some((option) => option.includes("provider/astra")));
+                assert.ok(options.includes(`medium thinking → ${level === "medium" ? "low" : "medium"}`));
+                assert.ok(!options.some((option) => option.includes("[object Object]")));
+                return options.find((option) => option.startsWith("medium thinking →"));
+              }
+              if (call === 2) {
+                assert.ok(options.includes(level));
+                return level;
+              }
+              return "Save and exit";
+            },
+            notify: () => {},
+          },
+        });
+        assert.deepEqual(
+          loadModelTierConfig()?.tiers.medium,
+          level === "Session default" ? "provider/astra" : { model: "provider/astra", thinking: "medium" },
+        );
+      }
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

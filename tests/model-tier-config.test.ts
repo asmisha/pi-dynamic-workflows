@@ -7,7 +7,6 @@
  * 3. save/load round-trip + all validation/error paths (scoped to a temp dir)
  * 4. sortedTierNames helper
  *
- * All tier configs are single-model-per-tier (Record<string, string>).
  */
 
 import assert from "node:assert/strict";
@@ -148,4 +147,35 @@ describe("model-tier-config", () => {
       assert.deepEqual(sortedTierNames(config), ["small", "medium", "xlarge"]);
     });
   });
+});
+
+it("round trips mixed tier entries and validates object effort", async () => {
+  const { loadModelTierConfig, saveModelTierConfig, resolveTierModel } = await loadModule();
+  const dir = mkdtempSync(join(tmpdir(), "tier-thinking-"));
+  const path = join(dir, "nested", "tiers.json");
+  try {
+    for (const thinking of ["low", "medium", "high", "xhigh", "max"] as const) {
+      const config = {
+        tiers: { small: "legacy", medium: { model: "provider/astra", thinking }, big: { model: "provider/astra" } },
+      };
+      saveModelTierConfig(config, path);
+      assert.deepEqual(loadModelTierConfig(path), config);
+      assert.equal(resolveTierModel("medium", config), "provider/astra");
+    }
+    for (const entry of [
+      null,
+      [],
+      {},
+      { thinking: "low" },
+      { model: 5 },
+      { model: "m", thinking: "off" },
+      { model: "m", thinking: null },
+      { model: "m", thinking: "ultra" },
+    ]) {
+      writeFileSync(path, JSON.stringify({ tiers: { medium: entry } }));
+      assert.equal(loadModelTierConfig(path), null);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

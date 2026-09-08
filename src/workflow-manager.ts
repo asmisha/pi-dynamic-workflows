@@ -758,7 +758,11 @@ export class WorkflowManager extends EventEmitter {
         },
         onAgentModel: (event) => {
           const agent = managed.snapshot.agents.find((candidate) => candidate.callId === event.callId);
-          if (agent) agent.model = event.model;
+          if (agent) {
+            agent.model = event.model;
+            agent.thinking = event.thinking;
+          }
+          this.emit("agentModel", { runId: managed.runId, ...event });
           progress();
         },
         onTokenUsage: (usage) => {

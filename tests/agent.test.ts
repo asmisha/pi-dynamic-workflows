@@ -1261,3 +1261,35 @@ test("resolveSubagentSession rejects forkFrom + existing sessionPath", async () 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("tier thinking follows model routing and explicit effort wins", async () => {
+  const { resolveAgentModelSelection } = await import("../src/agent.js");
+  const config = () => ({
+    tiers: {
+      small: "vendor/legacy",
+      medium: { model: "vendor/astra", thinking: "low" as const },
+      big: { model: "vendor/astra", thinking: "medium" as const },
+    },
+  });
+  for (const [options, main, expected] of [
+    [{ tier: "medium" }, "host/model", "low"],
+    [{ tier: "big" }, "host/model", "medium"],
+    [{ tier: "small" }, "host/model", undefined],
+    [{ tier: "missing" }, "host/model", undefined],
+    [{ tier: "big", thinking: "max" }, "host/model", "max"],
+    [{ tier: "big", model: "explicit/model" }, "host/model", undefined],
+    [{ tier: "big", model: "explicit/model", thinking: "high" }, "host/model", "high"],
+    [{}, "host/model", undefined],
+    [{}, undefined, "low"],
+    [{ tier: "" }, undefined, "low"],
+    [{ tier: "big", restoreSessionModel: true }, undefined, undefined],
+  ] as const) {
+    assert.equal(options.thinking ?? resolveAgentModelSelection(options, main, config).thinking, expected);
+  }
+  assert.equal(resolveAgentModelSpec({ tier: "big" }, "host/model", config), "vendor/astra");
+  assert.equal(resolveAgentModelSpec({}, undefined, config), "vendor/astra");
+  assert.equal(
+    resolveAgentModelSpec({}, "", () => null),
+    undefined,
+  );
+});
