@@ -9,11 +9,12 @@ import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
-import type { AgentThinkingLevel, AgentUsage } from "./agent.js";
+import type { AgentFallback, AgentThinkingLevel, AgentUsage } from "./agent.js";
 import {
   AGENT_THINKING_LEVELS,
   isAgentThinkingLevel,
   isExactModelSpec,
+  normalizeAgentFallbacks,
   resolveAgentModelSelection,
   WorkflowAgent,
   type WorkflowAgentOptions,
@@ -223,6 +224,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * limit. The handoff preserves prior tool calls and side effects.
    */
   fallbackModel?: string;
+  /** Ordered backups with per-route thinking and optional catalog availability; excludes fallbackModel. */
+  fallbacks?: AgentFallback[];
   /**
    * Coarse model tier ("small" | "medium" | "big"), resolved from the user's
    * model-tiers config (see /workflows-models). An explicit `model` takes
@@ -544,6 +547,8 @@ export async function runWorkflow<T = unknown>(
 
   const agentImpl = async (prompt: string, agentOptions: AgentOptions = {}) => {
     throwIfAborted();
+    const fallbacks = normalizeAgentFallbacks(agentOptions);
+    if (fallbacks !== undefined) agentOptions = { ...agentOptions, fallbacks };
 
     // Reject an unknown level instead of letting the SDK fall back to the session
     // default: a silent fallback is indistinguishable from the option working.
@@ -778,6 +783,7 @@ export async function runWorkflow<T = unknown>(
               model: modelSpec,
               restoreSessionModel: options.restoreAgentSessionModel,
               fallbackModel: agentOptions.fallbackModel,
+              fallbacks: agentOptions.fallbacks,
               tier: agentOptions.tier,
               thinking: agentOptions.thinking,
               modelSelection,
@@ -1444,6 +1450,7 @@ function hashAgentCall(
     prompt,
     model: model ?? null,
     fallbackModel: options.fallbackModel ?? null,
+    ...(options.fallbacks !== undefined ? { fallbacks: options.fallbacks } : {}),
     tier: options.tier ?? null,
     // Reasoning effort changes the answer, so raising it must invalidate a cached
     // result on resume instead of replaying the cheaper one.

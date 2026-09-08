@@ -79,8 +79,16 @@ async function withFauxSession(
         maxTokens: 4096,
         reasoning: true,
       },
+      {
+        id: "faux-deepseek-last",
+        name: "Faux Last Backup",
+        contextWindow: 128000,
+        maxTokens: 4096,
+        reasoning: true,
+      },
     ],
   });
+  for (const model of faux.models) model.thinkingLevelMap = { xhigh: "xhigh" };
   mkdirSync(agentDir, { recursive: true });
   writeFileSync(
     join(agentDir, "models.json"),
@@ -1036,4 +1044,192 @@ test("an unavailable primary without a fallbackModel still fails the stage", () 
     const agent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
 
     await assert.rejects(() => agent.run("do the task", { label: "no-fallback-probe" }), /Service Unavailable/);
+  }));
+
+// Named routes make the expected provider order independent of the response queue.
+const primary = "deepseek/faux-deepseek";
+const middle = "deepseek/faux-deepseek-fallback";
+const last = "deepseek/faux-deepseek-last";
+for (const scenario of [
+  { name: "healthy primary", errors: [], expected: [[primary, "xhigh"]] },
+  {
+    name: "first available backup",
+    errors: [USAGE_LIMIT_MSG],
+    expected: [
+      [primary, "xhigh"],
+      [middle, "high"],
+    ],
+  },
+  {
+    name: "both runtime handoffs",
+    errors: [USAGE_LIMIT_MSG, "502 Bad Gateway"],
+    expected: [
+      [primary, "xhigh"],
+      [middle, "high"],
+      [last, "xhigh"],
+    ],
+  },
+  {
+    name: "absent optional backup",
+    optional: "missing/model",
+    errors: [USAGE_LIMIT_MSG],
+    expected: [
+      [primary, "xhigh"],
+      [last, "xhigh"],
+    ],
+  },
+  {
+    name: "unauthenticated optional backup",
+    optional: "anthropic/faux-anthropic",
+    errors: [USAGE_LIMIT_MSG],
+    expected: [
+      [primary, "xhigh"],
+      [last, "xhigh"],
+    ],
+  },
+  {
+    name: "unavailable primary then failed backup",
+    primary: "missing/model",
+    errors: ["401 Unauthorized"],
+    expected: [
+      [middle, "high"],
+      [last, "xhigh"],
+    ],
+  },
+  {
+    name: "exhausted chain",
+    errors: [USAGE_LIMIT_MSG, "502 Bad Gateway", USAGE_LIMIT_MSG],
+    expected: [
+      [primary, "xhigh"],
+      [middle, "high"],
+      [last, "xhigh"],
+    ],
+    reject: WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+  },
+  {
+    name: "task error does not hand off",
+    errors: ["invalid request: task failure"],
+    expected: [[primary, "xhigh"]],
+    reject: WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+  },
+]) {
+  test(`ordered fallbacks: ${scenario.name}, preserving effort, tool work, and session`, () =>
+    withFauxSession(
+      async ({ cwd, modelRegistry, setResponses, fauxAssistantMessage, fauxToolCall, anthropicCallCount }) => {
+        SettingsManager.create(cwd, getAgentDir()).setRetryEnabled(false);
+        const artifact = join(cwd, "completed-once.txt");
+        const sessionPath = join(cwd, "chain.jsonl");
+        const requests: string[][] = [];
+        const resolved: string[][] = [];
+        const handoffs: Array<[string, string | undefined]> = [];
+        const usage: AgentUsage[] = [];
+        const responses = [
+          fauxAssistantMessage(fauxToolCall("write", { path: artifact, content: "completed once" }), {
+            stopReason: "toolUse",
+          }),
+          ...scenario.errors.map((errorMessage) => fauxAssistantMessage("", { stopReason: "error", errorMessage })),
+          ...(scenario.reject
+            ? []
+            : [fauxAssistantMessage(fauxToolCall("structured_output", { ok: true }), { stopReason: "toolUse" })]),
+        ];
+        setResponses(
+          responses.map(
+            (response, index) =>
+              (
+                context: { messages: Array<{ role: string; toolName?: string }> },
+                options: { reasoning?: string },
+                _state: unknown,
+                model: { provider: string; id: string },
+              ) => {
+                requests.push([`${model.provider}/${model.id}`, options.reasoning ?? "off"]);
+                if (index > 0) {
+                  assert.equal(
+                    context.messages.filter((m) => m.role === "toolResult" && m.toolName === "write").length,
+                    1,
+                    "every later model sees the single completed tool result",
+                  );
+                }
+                return response;
+              },
+          ),
+        );
+        const agent = new WorkflowAgent({ cwd, modelRegistry });
+        const promise = agent.run("Write the artifact once, then report success.", {
+          model: scenario.primary ?? primary,
+          thinking: "xhigh",
+          sessionPath,
+          fallbacks: [
+            { model: scenario.optional ?? middle, thinking: "high", optional: true },
+            { model: last, thinking: "xhigh" },
+          ],
+          schema: {
+            type: "object",
+            required: ["ok"],
+            properties: { ok: { type: "boolean" } },
+            additionalProperties: false,
+          },
+          onModelResolved: (model, thinking) => resolved.push([model, thinking ?? "off"]),
+          onModelFallback: (from, to) => handoffs.push([from, to]),
+          onUsage: (snapshot) => usage.push(snapshot),
+        });
+        if (scenario.reject) {
+          await assert.rejects(promise, (error: unknown) => (error as { code: string }).code === scenario.reject);
+        } else {
+          assert.deepEqual(await promise, { ok: true });
+        }
+        const expected = scenario.expected;
+        assert.deepEqual(requests, [expected[0], ...expected]);
+        assert.deepEqual(resolved, expected, "actual model/effort attribution follows every handoff");
+        const chain = [scenario.primary ?? primary, ...expected.map(([model]) => model)];
+        assert.deepEqual(
+          handoffs,
+          chain.slice(1).flatMap((model, i) => (model === chain[i] ? [] : [[chain[i], model]])),
+        );
+        assert.equal(anthropicCallCount(), 0);
+        assert.equal(readFileSync(artifact, "utf8"), "completed once");
+        const saved = SessionManager.open(sessionPath).buildSessionContext();
+        assert.equal(`${saved.model?.provider}/${saved.model?.modelId}`, expected.at(-1)?.[0]);
+        assert.equal(saved.thinkingLevel, expected.at(-1)?.[1]);
+        assert.equal(saved.messages.filter((m) => m.role === "toolResult" && m.toolName === "write").length, 1);
+        const assistantMessages = saved.messages.filter((message) => message.role === "assistant");
+        assert.equal(assistantMessages.length, requests.length);
+        assert.ok((usage.at(-1)?.total ?? 0) > 0);
+        assert.equal(
+          usage.at(-1)?.total,
+          assistantMessages.reduce((total, message) => total + message.usage.totalTokens, 0),
+          "one usage total includes all provider attempts, not only the last route",
+        );
+      },
+    ));
+}
+
+test("required unavailable fallback still fails before a healthy primary starts", () =>
+  withFauxSession(async ({ cwd, modelRegistry, deepseekCallCount }) => {
+    const agent = new WorkflowAgent({ cwd, modelRegistry });
+    await assert.rejects(
+      () =>
+        agent.run("task", {
+          model: primary,
+          fallbacks: [
+            { model: middle, thinking: "high", optional: true },
+            { model: "missing/model", thinking: "xhigh" },
+          ],
+        }),
+      /Fallback model.*unavailable or unauthenticated/,
+    );
+    assert.equal(deepseekCallCount(), 0);
+  }));
+
+test("an all-optional unavailable chain cannot silently use the session default", () =>
+  withFauxSession(async ({ cwd, modelRegistry, deepseekCallCount }) => {
+    const agent = new WorkflowAgent({ cwd, modelRegistry });
+    await assert.rejects(
+      () =>
+        agent.run("task", {
+          model: "missing/primary",
+          fallbacks: [{ model: "missing/backup", thinking: "high", optional: true }],
+        }),
+      /unavailable or unauthenticated/,
+    );
+    assert.equal(deepseekCallCount(), 0);
   }));

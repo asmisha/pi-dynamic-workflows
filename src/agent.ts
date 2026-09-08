@@ -626,6 +626,14 @@ export function isAgentThinkingLevel(value: unknown): value is AgentThinkingLeve
   return typeof value === "string" && (AGENT_THINKING_LEVELS as readonly string[]).includes(value);
 }
 
+/** One ordered backup route, with an explicit model-specific reasoning effort. */
+export interface AgentFallback {
+  model: string;
+  thinking: AgentThinkingLevel;
+  /** Skip this entry when it is absent from the authenticated model catalog. */
+  optional?: boolean;
+}
+
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
   label?: string;
   schema?: TSchemaDef;
@@ -650,6 +658,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * model handoff, not a fresh agent retry, so completed tool work is preserved.
    */
   fallbackModel?: string;
+  /** Ordered backup routes; mutually exclusive with fallbackModel. */
+  fallbacks?: AgentFallback[];
   /**
    * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
@@ -730,13 +740,46 @@ export function isExactModelSpec(value: unknown): value is string {
   return typeof value === "string" && EXACT_MODEL_SPEC.test(value);
 }
 
+interface ResolvedFallback extends Omit<AgentFallback, "model" | "thinking"> {
+  spec: string;
+  model: Model<any>;
+  thinking?: AgentThinkingLevel;
+}
+
 interface AgentModelRoute {
   modelSpec?: string;
-  fallbackSpec?: string;
   model?: Model<any>;
-  fallbackModel?: Model<any>;
-  usedFallback: boolean;
+  fallbacks: ResolvedFallback[];
+  selectedFallback?: ResolvedFallback;
   thinking?: AgentThinkingLevel;
+}
+
+/** Validate and snapshot new routes before queueing or resolving availability. */
+export function normalizeAgentFallbacks(
+  options: Pick<AgentRunOptions, "fallbacks" | "fallbackModel" | "label">,
+): AgentFallback[] | undefined {
+  if (options.fallbacks === undefined) return undefined;
+  const invalid = (message: string): never => {
+    throw new WorkflowError(message, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+      recoverable: false,
+      agentLabel: options.label,
+    });
+  };
+  if (options.fallbackModel !== undefined) invalid("fallbacks and fallbackModel are mutually exclusive");
+  if (!Array.isArray(options.fallbacks)) invalid("fallbacks must be an array of { model, thinking, optional? }");
+  return Array.from(options.fallbacks, (entry) => {
+    if (!entry || typeof entry !== "object" || !isExactModelSpec(entry.model)) {
+      invalid("Each fallback must name an exact provider/modelId");
+    }
+    if (!isAgentThinkingLevel(entry.thinking)) invalid("Each fallback requires a valid thinking level");
+    if (entry.optional !== undefined && typeof entry.optional !== "boolean")
+      invalid("fallback optional must be boolean");
+    return {
+      model: entry.model,
+      thinking: entry.thinking,
+      ...(entry.optional !== undefined ? { optional: entry.optional } : {}),
+    };
+  });
 }
 
 function resolveModelFromRegistry(spec: string, registry?: ModelRegistry): Model<any> | undefined {
@@ -772,45 +815,51 @@ function resolveAgentModelRoute(
 ): AgentModelRoute {
   const selection = options.modelSelection ?? resolveAgentModelSelection(options, mainModel);
   const modelSpec = selection.model;
+  const configured = normalizeAgentFallbacks(options);
   const fallbackSpec = options.fallbackModel?.trim();
-  if (fallbackSpec && !modelSpec) {
-    throw new WorkflowError("fallbackModel requires a primary model", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
-      recoverable: false,
-      agentLabel: options.label,
-    });
-  }
-
-  const fallbackModel = fallbackSpec ? resolveModelFromRegistry(fallbackSpec, registry) : undefined;
-  if (fallbackSpec && (!fallbackModel || !modelIsAvailableInRegistry(fallbackModel, registry))) {
+  const requested: Array<{ model: string; thinking?: AgentThinkingLevel; optional?: boolean }> =
+    configured ?? (fallbackSpec ? [{ model: fallbackSpec }] : []);
+  if (requested.length && !modelSpec) {
     throw new WorkflowError(
-      `Fallback model "${fallbackSpec}" is unavailable or unauthenticated`,
-      WorkflowErrorCode.AGENT_EXECUTION_ERROR,
-      { recoverable: false, agentLabel: options.label },
+      `${configured === undefined ? "fallbackModel" : "fallbacks"} requires a primary model`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      {
+        recoverable: false,
+        agentLabel: options.label,
+      },
     );
   }
-  if (!modelSpec) return { fallbackSpec, fallbackModel, usedFallback: false };
+
+  const fallbacks: ResolvedFallback[] = [];
+  for (const entry of requested) {
+    const model = resolveModelFromRegistry(entry.model, registry);
+    if (!model || !modelIsAvailableInRegistry(model, registry)) {
+      if (entry.optional) continue;
+      throw new WorkflowError(
+        `Fallback model "${entry.model}" is unavailable or unauthenticated`,
+        WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+        { recoverable: false, agentLabel: options.label },
+      );
+    }
+    fallbacks.push({ spec: entry.model, model, thinking: entry.thinking, optional: entry.optional });
+  }
+  if (!modelSpec) return { fallbacks };
 
   const primaryModel = resolveModelFromRegistry(modelSpec, registry);
   const primaryIsAvailable = Boolean(primaryModel && modelIsAvailableInRegistry(primaryModel, registry));
-  if (primaryModel && (primaryIsAvailable || (!requireAvailable && !fallbackSpec))) {
-    return {
-      modelSpec,
-      fallbackSpec,
-      model: primaryModel,
-      fallbackModel,
-      usedFallback: false,
-      thinking: selection.thinking,
-    };
+  if (primaryModel && (primaryIsAvailable || (!requireAvailable && !requested.length))) {
+    return { modelSpec, model: primaryModel, fallbacks, thinking: selection.thinking };
   }
-  if (fallbackModel && fallbackSpec) {
-    options.onModelFallback?.(modelSpec, fallbackSpec, "primary model is unavailable or unauthenticated");
-    return { modelSpec, fallbackSpec, model: fallbackModel, fallbackModel, usedFallback: true };
+  const selectedFallback = fallbacks.shift();
+  if (selectedFallback) {
+    options.onModelFallback?.(modelSpec, selectedFallback.spec, "primary model is unavailable or unauthenticated");
+    return { modelSpec, model: selectedFallback.model, fallbacks, selectedFallback };
   }
-  if (requireAvailable) throw unavailableModelError(modelSpec, registry, options.label);
+  if (requireAvailable || requested.length) throw unavailableModelError(modelSpec, registry, options.label);
 
   console.warn(`[workflow] model "${modelSpec}" not found; using session default`);
   options.onModelFallback?.(modelSpec);
-  return { modelSpec, fallbackSpec, usedFallback: false };
+  return { modelSpec, fallbacks };
 }
 
 /**
@@ -922,11 +971,10 @@ export class WorkflowAgent {
     );
 
     const modelRoute = resolveAgentModelRoute(options, this.mainModel, this.getRegistry(options.modelRegistry), false);
-    const thinking = options.thinking ?? modelRoute.thinking;
+    const thinking = modelRoute.selectedFallback?.thinking ?? options.thinking ?? modelRoute.thinking;
     const modelSpec = modelRoute.modelSpec;
-    const fallbackSpec = modelRoute.fallbackSpec;
     let resolvedModel = modelRoute.model;
-    const resolvedFallbackModel = modelRoute.fallbackModel;
+    const pendingFallbacks = [...modelRoute.fallbacks];
 
     const agentDir = getAgentDir();
     // Use a real SettingsManager to inherit the user's default provider/model,
@@ -944,9 +992,9 @@ export class WorkflowAgent {
       throw error;
     });
     const tierFallbackThinking =
-      modelRoute.thinking !== undefined && resolvedFallbackModel
+      modelRoute.thinking !== undefined && options.fallbacks === undefined && pendingFallbacks[0]
         ? fallbackSessionThinking(
-            resolvedFallbackModel,
+            pendingFallbacks[0].model,
             this.sessionOptions,
             this.sessionOptions.sessionManager ?? forked.sessionManager,
             this.sessionOptions.settingsManager ?? this.settingsManager,
@@ -1138,48 +1186,54 @@ export class WorkflowAgent {
         return text as AgentRunResult<TSchemaDef>;
       };
 
-      try {
-        await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
-        await waitForSubagentIdle(session, options.signal);
-        return await completeTurn();
-      } catch (error) {
-        const fallbackModel = resolvedFallbackModel;
-        const canHandoff =
-          resolvedModel &&
-          fallbackModel &&
-          (resolvedModel.provider !== fallbackModel.provider || resolvedModel.id !== fallbackModel.id);
-        if (
-          !modelSpec ||
-          !fallbackModel ||
-          !canHandoff ||
-          (!isProviderUsageLimit(error) && !isProviderAuthFailure(error) && !isProviderUnavailable(error))
-        ) {
-          throw error;
+      let nextPrompt = this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema));
+      for (;;) {
+        try {
+          await session.prompt(nextPrompt);
+          await waitForSubagentIdle(session, options.signal);
+          return await completeTurn();
+        } catch (error) {
+          if (options.signal?.aborted) throw abortError();
+          if (
+            !modelSpec ||
+            (!isProviderUsageLimit(error) && !isProviderAuthFailure(error) && !isProviderUnavailable(error))
+          ) {
+            throw error;
+          }
+          let fallback = pendingFallbacks.shift();
+          while (
+            fallback &&
+            resolvedModel?.provider === fallback.model.provider &&
+            resolvedModel.id === fallback.model.id
+          ) {
+            fallback = pendingFallbacks.shift();
+          }
+          if (!resolvedModel || !fallback) throw error;
+
+          const previousSpec =
+            options.fallbacks === undefined ? modelSpec : `${resolvedModel.provider}/${resolvedModel.id}`;
+          const provider = options.fallbacks === undefined ? "primary provider" : "provider";
+          const reason = isProviderUsageLimit(error)
+            ? `${provider} usage limit`
+            : isProviderAuthFailure(error)
+              ? `${provider} authentication failed`
+              : `${provider} is not answering`;
+          resolvedModel = fallback.model;
+          // Keep one AgentSession, transcript, tool state, and usage accumulator.
+          // setModel() would also overwrite the user's global default model.
+          session.agent.state.model = fallback.model;
+          session.sessionManager.appendModelChange(fallback.model.provider, fallback.model.id);
+          session.setThinkingLevel(
+            fallback.thinking ?? options.thinking ?? tierFallbackThinking ?? session.thinkingLevel,
+          );
+          options.onModelFallback?.(previousSpec, fallback.spec, reason);
+          options.onModelResolved?.(`${fallback.model.provider}/${fallback.model.id}`, session.thinkingLevel);
+
+          const structuredReminder = options.schema
+            ? " Finish by calling structured_output exactly once with the required replacement result."
+            : "";
+          nextPrompt = `The previous model became unavailable. Continue the same task from this transcript and current tool state. Do not restart or repeat completed work. Verify actual state, finish the original task, and satisfy the original output contract.${structuredReminder}`;
         }
-
-        const reason = isProviderUsageLimit(error)
-          ? "primary provider usage limit"
-          : isProviderAuthFailure(error)
-            ? "primary provider authentication failed"
-            : "primary provider is not answering";
-        resolvedModel = fallbackModel;
-        // Keep the same transcript and tool state so a writer that already edited
-        // files remains one logical agent. Avoid AgentSession.setModel(), which
-        // would also overwrite the user's global default model.
-        session.agent.state.model = fallbackModel;
-        session.sessionManager.appendModelChange(fallbackModel.provider, fallbackModel.id);
-        session.setThinkingLevel(options.thinking ?? tierFallbackThinking ?? session.thinkingLevel);
-        options.onModelFallback?.(modelSpec, fallbackSpec, reason);
-        options.onModelResolved?.(`${fallbackModel.provider}/${fallbackModel.id}`, session.thinkingLevel);
-
-        const structuredReminder = options.schema
-          ? " Finish by calling structured_output exactly once with the required replacement result."
-          : "";
-        await session.prompt(
-          `The primary model became unavailable. Continue the same task from this transcript and current tool state. Do not restart or repeat completed work. Verify actual state, finish the original task, and satisfy the original output contract.${structuredReminder}`,
-        );
-        await waitForSubagentIdle(session, options.signal);
-        return await completeTurn();
       }
     } finally {
       removeAbortListener?.();
@@ -1255,21 +1309,29 @@ export function createFailClosedModelAgent(
       if (!route.model) return agent.run(prompt, options);
 
       const selectedModel = `${route.model.provider}/${route.model.id}`;
-      const fallbackModel =
-        !route.usedFallback && route.fallbackModel
-          ? `${route.fallbackModel.provider}/${route.fallbackModel.id}`
-          : undefined;
-      if (route.usedFallback && route.modelSpec && route.fallbackSpec) {
+      const remainingFallbacks =
+        options.fallbacks === undefined
+          ? { fallbackModel: route.fallbacks[0]?.spec }
+          : {
+              fallbacks: route.fallbacks.map(({ spec, thinking, optional }) => ({
+                model: spec,
+                // biome-ignore lint/style/noNonNullAssertion: normalizeAgentFallbacks requires effort for every chain entry.
+                thinking: thinking!,
+                ...(optional !== undefined ? { optional } : {}),
+              })),
+            };
+      if (route.selectedFallback && route.modelSpec) {
         options.onModelFallback?.(
           route.modelSpec,
-          route.fallbackSpec,
+          route.selectedFallback.spec,
           "primary model is unavailable or unauthenticated",
         );
       }
       return agent.run(prompt, {
         ...options,
         model: selectedModel,
-        fallbackModel,
+        ...remainingFallbacks,
+        thinking: route.selectedFallback?.thinking ?? options.thinking,
         modelSelection: { model: selectedModel, thinking: route.thinking },
       });
     },

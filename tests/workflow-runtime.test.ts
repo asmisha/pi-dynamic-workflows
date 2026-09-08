@@ -1685,3 +1685,84 @@ return await agent('task', {tier: 'medium', fallbackModel: 'fixture/main'${expli
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("fallback configuration is validated before any agent dispatch", async () => {
+  for (const extra of [
+    "fallbacks: 'provider/model'",
+    "fallbacks: [null]",
+    "fallbacks: [,]",
+    "fallbacks: [{ model: 'short', thinking: 'high' }]",
+    "fallbacks: [{ model: 'provider/model' }]",
+    "fallbacks: [{ model: 'provider/model', thinking: 'invalid' }]",
+    "fallbacks: [{ model: 'provider/model', thinking: 'high', optional: 'yes' }]",
+    "fallbacks: [], fallbackModel: 'provider/backup'",
+  ]) {
+    const counter = countingAgent();
+    await assert.rejects(
+      () =>
+        runWorkflow(
+          `export const meta = { name: 'invalid_routes', description: 'invalid routes' }
+return await agent('task', { model: 'provider/primary', ${extra} })`,
+          {
+            agent: counter.runner,
+            persistLogs: false,
+          },
+        ),
+      (error: unknown) => (error as { code: string }).code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    );
+    assert.equal(counter.state.calls, 0);
+  }
+});
+
+test("ordered fallback changes invalidate resume; unchanged routes replay", async () => {
+  const routes = [
+    { model: "provider/middle", thinking: "high", optional: true },
+    { model: "provider/last", thinking: "xhigh" },
+  ];
+  const script = (fallbacks: unknown) => `export const meta = { name: 'fallback_hash', description: 'fallback hash' }
+return await agent('task', { model: 'provider/primary', thinking: 'xhigh', fallbacks: ${JSON.stringify(fallbacks)} })`;
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script(routes), {
+    agent: countingAgent().runner,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  for (const [next, expectedCalls] of [
+    [routes, 0],
+    [[{ ...routes[0], thinking: "low" }, routes[1]], 1],
+    [[{ ...routes[0], optional: false }, routes[1]], 1],
+    [[{ ...routes[0], model: "provider/other" }, routes[1]], 1],
+    [[routes[1], routes[0]], 1],
+    [[routes[1]], 1],
+  ] as const) {
+    const counter = countingAgent();
+    await runWorkflow(script(next), {
+      agent: counter.runner,
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    });
+    assert.equal(counter.state.calls, expectedCalls);
+  }
+});
+
+test("fallback arrays are snapshotted before a call waits in the queue", async () => {
+  const received: unknown[] = [];
+  await runWorkflow(
+    `export const meta = { name: 'route_snapshot', description: 'route snapshot' }
+const fallbacks = [{ model: 'provider/backup', thinking: 'high', optional: true }]
+const task = agent('task', { model: 'provider/primary', fallbacks })
+fallbacks[0].thinking = 'low'
+fallbacks.push({ model: 'provider/other', thinking: 'low' })
+return await task`,
+    {
+      persistLogs: false,
+      agent: {
+        async run(_prompt, opts) {
+          received.push(JSON.parse(JSON.stringify(opts.fallbacks)));
+          return "ok";
+        },
+      },
+    },
+  );
+  assert.deepEqual(received, [[{ model: "provider/backup", thinking: "high", optional: true }]]);
+});
