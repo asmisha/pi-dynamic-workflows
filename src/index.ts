@@ -1,4 +1,10 @@
-export type { AgentRunOptions, AgentRunResult, SubagentSessionSpec, WorkflowAgentOptions } from "./agent.js";
+export type {
+  AgentFallback,
+  AgentRunOptions,
+  AgentRunResult,
+  SubagentSessionSpec,
+  WorkflowAgentOptions,
+} from "./agent.js";
 export { forkSessionForSubagent, listAvailableModelSpecs, resolveSubagentSession, WorkflowAgent } from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";

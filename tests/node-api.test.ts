@@ -1141,3 +1141,60 @@ return await agent('task', { tier: 'medium'${route === "default" ? "" : ", fallb
     }
   }
 });
+
+for (const primary of ["fixture/main", "missing/model"]) {
+  test(`object API preserves ordered fallbacks and route effort from ${primary}`, async () => {
+    const { registerFauxProvider, fauxAssistantMessage } = await loadFaux();
+    const faux = registerFauxProvider({
+      provider: "fixture",
+      models: ["main", "middle", "last"].map((id) => ({
+        id,
+        name: id,
+        reasoning: true,
+        contextWindow: 4096,
+        maxTokens: 1024,
+      })),
+    });
+    for (const model of faux.models) model.thinkingLevelMap = { xhigh: "xhigh" };
+    const expected = [
+      ...(primary === "fixture/main" ? [["fixture/main", "xhigh"]] : []),
+      ["fixture/middle", "high"],
+      ["fixture/last", "xhigh"],
+    ];
+    const requests: string[][] = [];
+    faux.setResponses(
+      expected.map((_, index) => (_context, options, _state, model) => {
+        requests.push([`${model.provider}/${model.id}`, options?.reasoning ?? "off"]);
+        return index < expected.length - 1
+          ? fauxAssistantMessage("", { stopReason: "error", errorMessage: "Codex usage limit reached" })
+          : fauxAssistantMessage("finished");
+      }),
+    );
+    try {
+      await withNodeApiFixture(
+        async ({ cwd }) => {
+          const actual: unknown[] = [];
+          const result = await runWorkflow({
+            script: `export const meta = { name: 'chain_api', description: 'chain API' }
+return await agent('task', { model: '${primary}', thinking: 'xhigh',
+  fallbacks: [
+    { model: 'missing/optional', thinking: 'low', optional: true },
+    { model: 'fixture/middle', thinking: 'high', optional: true },
+    { model: 'fixture/last', thinking: 'xhigh' }
+  ]
+})`,
+            cwd,
+            persistLogs: false,
+            onAgentModel: (event) => actual.push([event.model, event.thinking]),
+          });
+          assert.equal(result.result, "finished");
+          assert.deepEqual(requests, expected);
+          assert.deepEqual(actual, expected);
+        },
+        { fixtureModels: faux.models },
+      );
+    } finally {
+      faux.unregister();
+    }
+  });
+}
