@@ -31,7 +31,7 @@ export interface WorkflowAgentSnapshot {
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
-  /** Reasoning effort requested for this agent, when the script set one. */
+  /** Actual session reasoning effort once resolved; requested effort while starting. */
   thinking?: string;
   /** Absolute persistent Pi session path used by this agent, when configured. */
   sessionPath?: string;

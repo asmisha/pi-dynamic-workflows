@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { saveModelTierConfig } from "../src/model-tier-config.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {
@@ -682,33 +687,48 @@ test("runWorkflow plumbs opts.tier through to the agent with correct precedence"
 });
 
 test("runWorkflow plumbs opts.thinking through to the agent and reports it for display", async () => {
-  const seen: Array<string | undefined> = [];
-  const started: Array<{ label: string; thinking?: string }> = [];
-  const capturingAgent = {
-    async run(_prompt: string, options: { thinking?: string }) {
-      seen.push(options.thinking);
-      return "ok";
-    },
-  };
+  const home = mkdtempSync(join(tmpdir(), "thinking-routing-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      saveModelTierConfig({
+        tiers: {
+          small: "openai-codex/gpt-5.6-luna",
+          medium: { model: "openai-codex/gpt-6-astra", thinking: "low" },
+          big: { model: "openai-codex/gpt-6-astra", thinking: "medium" },
+        },
+      });
+      const seen: Array<string | undefined> = [];
+      const started: Array<{ label: string; thinking?: string }> = [];
+      const capturingAgent = {
+        async run(_prompt: string, options: { thinking?: string }) {
+          seen.push(options.thinking);
+          return "ok";
+        },
+      };
 
-  const script = `export const meta = { name: 'thinking_routing', description: 'per-agent reasoning effort' }
-  await agent('cheap scan', { label: 'scan', thinking: 'low' })
-  await agent('hard call', { label: 'synthesis', tier: 'big', thinking: 'max' })
-  await agent('unset keeps the session default', { label: 'default' })
-  return {}`;
+      const script = `export const meta = { name: 'thinking_routing', description: 'per-agent reasoning effort' }
+      await agent('cheap scan', { label: 'scan', thinking: 'low' })
+      await agent('hard call', { label: 'synthesis', tier: 'big', thinking: 'max' })
+      await agent('unset keeps the session default', { label: 'default' })
+      return {}`;
 
-  await runWorkflow(script, {
-    agent: capturingAgent,
-    persistLogs: false,
-    onAgentStart: (e) => started.push({ label: e.label, thinking: e.thinking }),
-  });
+      await runWorkflow(script, {
+        agent: capturingAgent,
+        mainModel: "provider/session-model",
+        persistLogs: false,
+        onAgentStart: (e) => started.push({ label: e.label, thinking: e.thinking }),
+      });
 
-  assert.deepEqual(seen, ["low", "max", undefined], "the level reaches run() and stays unset when omitted");
-  assert.deepEqual(started, [
-    { label: "scan", thinking: "low" },
-    { label: "synthesis", thinking: "max" },
-    { label: "default", thinking: undefined },
-  ]);
+      assert.deepEqual(seen, ["low", "max", undefined], "the level reaches run() and stays unset when omitted");
+      assert.deepEqual(started, [
+        { label: "scan", thinking: "low" },
+        { label: "synthesis", thinking: "max" },
+        { label: "default", thinking: undefined },
+      ]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("an unknown opts.thinking level fails the script instead of silently downgrading", async () => {
@@ -1456,4 +1476,212 @@ return await parallel(['bad', 'slow-a', 'slow-b'].map((prompt) => () => agent(pr
     signals.every((signal) => !signal.aborted),
     "branch failure does not abort sibling attempt signals",
   );
+});
+
+test("effective tier thinking invalidates resume while unchanged tiers replay", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tier-resume-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const script = `export const meta = { name: 'tier_resume', description: 'tier resume' }
+return await agent('task', { tier: 'medium' })`;
+      const journal: JournalEntry[] = [];
+      saveModelTierConfig({ tiers: { medium: { model: "provider/astra", thinking: "low" } } });
+      await runWorkflow(script, {
+        agent: countingAgent().runner,
+        persistLogs: false,
+        onAgentJournal: (e) => journal.push(e),
+      });
+      const resumeJournal = new Map(journal.map((e) => [e.index, e]));
+      const replay = countingAgent();
+      await runWorkflow(script, { agent: replay.runner, persistLogs: false, resumeJournal });
+      assert.equal(replay.state.calls, 0);
+      saveModelTierConfig({ tiers: { medium: { model: "provider/other", thinking: "low" } } });
+      const rerouted = countingAgent();
+      await runWorkflow(script, { agent: rerouted.runner, persistLogs: false, resumeJournal });
+      assert.equal(rerouted.state.calls, 1);
+      saveModelTierConfig({ tiers: { medium: { model: "provider/astra", thinking: "medium" } } });
+      const rerun = countingAgent();
+      await runWorkflow(script, { agent: rerun.runner, persistLogs: false, resumeJournal });
+      assert.equal(rerun.state.calls, 1);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("queued tier calls keep the model and effort from one config snapshot", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tier-queue-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      saveModelTierConfig({ tiers: { medium: { model: "provider/old", thinking: "low" } } });
+      const seen: unknown[] = [];
+      await runWorkflow(
+        `export const meta = { name: 'queue_pair', description: 'queue pair' }
+return await Promise.all([agent('first', { tier: 'medium' }), agent('second', { tier: 'medium' })])`,
+        {
+          concurrency: 1,
+          persistLogs: false,
+          agent: {
+            async run(_prompt, options) {
+              seen.push(options?.modelSelection);
+              await Promise.resolve();
+              saveModelTierConfig({ tiers: { medium: { model: "provider/new", thinking: "medium" } } });
+              return "ok";
+            },
+          },
+        },
+      );
+      assert.deepEqual(seen, [
+        { model: "provider/old", thinking: "low" },
+        { model: "provider/old", thinking: "low" },
+      ]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("retries retain the original tier pair after configuration changes", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tier-retry-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      saveModelTierConfig({ tiers: { medium: { model: "provider/old", thinking: "low" } } });
+      const seen: unknown[] = [];
+      await runWorkflow(
+        `export const meta = {name: 'retry_pair', description: 'retry pair'}
+return await agent('task', {tier: 'medium'})`,
+        {
+          persistLogs: false,
+          agentRetries: 1,
+          agent: {
+            async run(_prompt, options) {
+              seen.push(options?.modelSelection);
+              if (seen.length === 1) {
+                saveModelTierConfig({ tiers: { medium: { model: "provider/new", thinking: "medium" } } });
+                throw new WorkflowError("retry", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: true });
+              }
+              return "ok";
+            },
+          },
+        },
+      );
+      assert.deepEqual(seen, [
+        { model: "provider/old", thinking: "low" },
+        { model: "provider/old", thinking: "low" },
+      ]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("base-version string-tier and host-model journals resume and retry without repeating completed work", async () => {
+  // Captured by executing e0105e95:src/workflow.ts, not this version's hasher.
+  const cases = [
+    {
+      tier: true,
+      hashes: [
+        "7843c7751824830e49fab1b518bc4ed387781c3f9ced00ccb9c8ab7d12628674",
+        "270bb039fd97bcde79efd362862ba43963bd0a3f80af58f9cbca8ca6d4011432",
+      ],
+    },
+    {
+      tier: false,
+      hashes: [
+        "c0df0a31c1d950bd19fecbd71fb6a84a7db6e87b9b24a329afba05090fc77e3b",
+        "ac5b7ff79f9adf1122eaa7fdfaa3c893cb44f16c8ec77aa7522e7a2eee000551",
+      ],
+    },
+  ];
+  const home = mkdtempSync(join(tmpdir(), "tier-legacy-journal-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      saveModelTierConfig({ tiers: { small: "fixture/legacy" } });
+      for (const { tier, hashes } of cases) {
+        for (const retry of [false, true]) {
+          const journal: JournalEntry[] = [
+            {
+              index: 0,
+              callId: "root/0",
+              kind: "agent",
+              status: "succeeded",
+              hash: hashes[0],
+              result: "completed-result",
+              attempt: 1,
+              retryable: true,
+              label: "agent 1",
+            },
+            {
+              index: 1,
+              callId: "root/1",
+              kind: "agent",
+              status: "failed",
+              hash: hashes[1],
+              error: {
+                message: "retry me",
+                code: WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+                recoverable: true,
+                agentLabel: "agent 2",
+              },
+              attempt: 1,
+              retryable: true,
+              label: "agent 2",
+            },
+          ];
+          const seen: string[] = [];
+          const result = await runWorkflow(
+            `export const meta = {name: 'legacy_pair', description: 'legacy pair'}
+return [await agent('completed'${tier ? ", {tier: 'small'}" : ""}), await agent('failed'${tier ? ", {tier: 'small'}" : ""})]`,
+            {
+              mainModel: "fixture/main",
+              persistLogs: false,
+              agentRetries: 0,
+              resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+              ...(retry ? { retryFailedCallIds: new Set(["root/1"]) } : {}),
+              agent: {
+                async run(prompt) {
+                  seen.push(prompt);
+                  return "retried-result";
+                },
+              },
+            },
+          );
+          assert.deepEqual(seen, ["failed"], `tier=${tier}, retry=${retry}`);
+          assert.deepEqual(Array.from(result.result as string[]), ["completed-result", "retried-result"]);
+        }
+      }
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("adding or removing explicit effort equal to tier effort invalidates resume", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tier-override-journal-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      saveModelTierConfig({ tiers: { medium: { model: "missing/model", thinking: "low" } } });
+      const script = (
+        explicit: boolean,
+      ) => `export const meta = {name: 'override_provenance', description: 'override provenance'}
+return await agent('task', {tier: 'medium', fallbackModel: 'fixture/main'${explicit ? ", thinking: 'low'" : ""}})`;
+      for (const explicit of [false, true]) {
+        const journal: JournalEntry[] = [];
+        await runWorkflow(script(explicit), {
+          agent: countingAgent().runner,
+          persistLogs: false,
+          onAgentJournal: (e) => journal.push(e),
+        });
+        const resumeJournal = new Map(journal.map((e) => [e.index, e]));
+        const same = countingAgent();
+        await runWorkflow(script(explicit), { agent: same.runner, persistLogs: false, resumeJournal });
+        assert.equal(same.state.calls, 0);
+        const changed = countingAgent();
+        await runWorkflow(script(!explicit), { agent: changed.runner, persistLogs: false, resumeJournal });
+        assert.equal(changed.state.calls, 1);
+      }
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

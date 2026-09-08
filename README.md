@@ -254,6 +254,32 @@ In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · 
 
 Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; persistent fork sessions live under `~/.pi/workflows/sessions/`; project-scoped run history, resume journals, locks, and full run outputs live under `~/.pi/workflows/projects/<project>/`. These managed artifacts survive temporary subagent cleanup; removing a run does not delete its child session. Older project-local `.pi/workflows/runs` data is still read as a fallback. Saved-workflow JSON is intentionally neither read nor mutated.
 
+### Tier thinking configuration
+
+`~/.pi/workflows/model-tiers.json` accepts existing model strings and objects with
+`model` and optional `thinking` (`low`, `medium`, `high`, `xhigh`, or `max`):
+
+```json
+{
+  "tiers": {
+    "small": "openai-codex/gpt-5.6-luna",
+    "medium": { "model": "openai-codex/gpt-6-astra", "thinking": "low" },
+    "big": { "model": "openai-codex/gpt-6-astra", "thinking": "medium" }
+  }
+}
+```
+
+Use exact model IDs available in your Pi registry; effort is not part of the model
+ID. `/workflows-models` shows and edits thinking separately and preserves it when
+changing a tier’s model. Choose “Session default” to remove a tier’s thinking.
+The implicit medium fallback inherits its thinking only when no session model is
+available. Each call snapshots its tier model and thinking together before it
+queues; queued calls and their retries keep that pair. When model resolution or a
+provider error selects a fallback, tier thinking is dropped with the tier model;
+an explicit per-agent thinking override still applies. Changes apply to subsequent
+calls. Tier-thinking configuration and explicit effort are separate resume inputs;
+legacy string routes retain their pre-upgrade journal identities.
+
 ## Reference
 
 The essentials:
@@ -271,7 +297,7 @@ The essentials:
 | --- | --- |
 | `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`). |
 | `model` | Exact `provider/modelId` (always wins over `tier`). |
-| `thinking` | Reasoning effort for one agent: `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"`. Independent of `model`/`tier` — each model translates the level through its own thinking-level map, so the same name works across providers. Omit it to keep the session default. Changing it invalidates that call's cached result on resume. |
+| `thinking` | Reasoning effort for one agent: `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"`. Independent of `model`/`tier` — each model translates the level through its own thinking-level map, so the same name works across providers. An explicit `thinking` wins over the selected tier’s thinking. Omit both to keep the session default. Tier thinking applies only when the tier supplies the model; an explicit model (including phase/agent-type routing) does not inherit tier thinking. Changing it invalidates that call's cached result on resume. |
 | `fallbackModel` | Exact backup model. If the primary is unauthenticated, hits a provider usage limit, or stops answering (gateway/overload errors after the SDK's own retries), the same subagent session continues on this model with its transcript and completed tool work intact. |
 | `agentType` | A named definition (`.pi/agents/<name>.md`) binding a tool allow/deny policy + model + role prompt. Under `readOnly`, its allowlist is final across built-in and extension tools after read-only hard denials. |
 | `cwd` | Run this agent in a different working directory (tools + session bind to it). |

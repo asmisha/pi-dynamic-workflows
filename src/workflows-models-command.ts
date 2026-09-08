@@ -8,7 +8,7 @@
  * see every provider Pi can reach, including extension-registered providers such
  * as `ollama-cloud`.
  *
- * Each tier holds exactly one model spec string.
+ * Each tier holds one model and optional thinking level.
  * When editing a tier, a single-select picker is used (like Pi's `/model`).
  */
 
@@ -22,10 +22,12 @@ import {
   Text,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { listAvailableModelSpecs } from "./agent.js";
+import { AGENT_THINKING_LEVELS, type AgentThinkingLevel, listAvailableModelSpecs } from "./agent.js";
 import {
   buildDefaultTierConfig,
   loadModelTierConfig,
+  type ModelTierConfig,
+  resolveTierModel,
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
@@ -58,8 +60,11 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
 
         menuOptions.push("─".repeat(30));
         for (const name of tiers) {
-          const model = config.tiers[name];
+          const entry = config.tiers[name];
+          const model = resolveTierModel(name, config);
+          const thinking = typeof entry === "string" ? undefined : entry.thinking;
           menuOptions.push(`${name} tier → ${model}`);
+          menuOptions.push(`${name} thinking → ${thinking ?? "Session default"}`);
         }
         menuOptions.push("─".repeat(30));
 
@@ -79,6 +84,17 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
             }
             break;
           }
+        }
+
+        for (const name of tiers) {
+          if (!choice.startsWith(`${name} thinking →`)) continue;
+          const level = await ctx.ui.select(`Thinking for "${name}"`, ["Session default", ...AGENT_THINKING_LEVELS]);
+          if (!level) break;
+          const current = config.tiers[name];
+          const model = typeof current === "string" ? current : current.model;
+          const entry = level === "Session default" ? model : { model, thinking: level as AgentThinkingLevel };
+          ensureFresh({ ...config, tiers: { ...config.tiers, [name]: entry } });
+          break;
         }
 
         if (choice === "Reset to defaults") {
@@ -117,11 +133,12 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
  */
 export async function editSingleTier(
   ctx: ExtensionCommandContext,
-  tiers: Record<string, string>,
+  tiers: ModelTierConfig["tiers"],
   tierName: string,
-): Promise<Record<string, string> | null> {
+): Promise<ModelTierConfig["tiers"] | null> {
   const available = listAvailableModelSpecs(ctx.modelRegistry);
-  const current = tiers[tierName];
+  const entry = tiers[tierName];
+  const current = typeof entry === "string" ? entry : entry?.model;
 
   // Build SelectItems: all available models as scrollable list
   const items: SelectItem[] = available.map((m) => ({ value: m, label: m }));
@@ -174,5 +191,5 @@ export async function editSingleTier(
   if (!result || result === current) return null;
 
   ctx.ui.notify(`"${tierName}" tier → ${result}`, "info");
-  return { ...tiers, [tierName]: result };
+  return { ...tiers, [tierName]: typeof entry === "object" ? { ...entry, model: result } : result };
 }

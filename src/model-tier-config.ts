@@ -1,8 +1,8 @@
 /**
  * Model tier configuration for workflow subagent model routing.
  *
- * A tier is a named slot (small/medium/big) holding exactly ONE model spec
- * string (e.g. "openai/gpt-4.1-mini"). When an agent() call specifies
+ * A tier is a named slot (small/medium/big) holding one model spec and optional thinking level
+ * (e.g. "openai/gpt-4.1-mini"). When an agent() call specifies
  * opts.tier, that single model is resolved and used as the subagent's model
  * (unless an explicit opts.model is given, which always wins — see agent.ts).
  *
@@ -15,7 +15,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { listAvailableModelSpecs } from "./agent.js";
+import { type AgentThinkingLevel, isAgentThinkingLevel, listAvailableModelSpecs } from "./agent.js";
 import { MODEL_TIERS_FILE } from "./config.js";
 
 // ---------------------------------------------------------------------------
@@ -24,10 +24,12 @@ import { MODEL_TIERS_FILE } from "./config.js";
 
 /**
  * Model tier configuration. Maps tier names (e.g. "small", "medium", "big")
- * to a single model spec string (e.g. "gpt-4.1-mini" or "openai/gpt-4.1-mini").
+ * to a model spec string or an object with a model and optional thinking level.
  */
+export type ModelTierEntry = string | { model: string; thinking?: AgentThinkingLevel };
+
 export interface ModelTierConfig {
-  tiers: Record<string, string>;
+  tiers: Record<string, ModelTierEntry>;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +79,16 @@ export function loadModelTierConfig(configPath?: string): ModelTierConfig | null
     if (!parsed || typeof parsed !== "object") return null;
     if (!parsed.tiers || typeof parsed.tiers !== "object") return null;
     for (const val of Object.values(parsed.tiers)) {
-      if (typeof val !== "string") return null;
+      if (typeof val === "string") continue;
+      if (
+        !val ||
+        typeof val !== "object" ||
+        Array.isArray(val) ||
+        !("model" in val) ||
+        typeof val.model !== "string" ||
+        ("thinking" in val && !isAgentThinkingLevel(val.thinking))
+      )
+        return null;
     }
     return parsed as ModelTierConfig;
   } catch {
@@ -106,7 +117,8 @@ export function saveModelTierConfig(config: ModelTierConfig, configPath?: string
  * is not configured.
  */
 export function resolveTierModel(tier: string, config: ModelTierConfig): string | undefined {
-  return config.tiers[tier];
+  const entry = config.tiers[tier];
+  return typeof entry === "string" ? entry : entry?.model;
 }
 
 /** Return all tier names sorted: small < medium < big, then alphabetically. */

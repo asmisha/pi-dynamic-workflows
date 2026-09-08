@@ -14,6 +14,7 @@ import {
   AGENT_THINKING_LEVELS,
   isAgentThinkingLevel,
   isExactModelSpec,
+  resolveAgentModelSelection,
   WorkflowAgent,
   type WorkflowAgentOptions,
 } from "./agent.js";
@@ -94,7 +95,7 @@ export interface SharedRuntime {
 
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
-  agent?: Pick<WorkflowAgent, "run">;
+  agent?: Pick<WorkflowAgent, "run"> & Partial<Pick<WorkflowAgent, "resolveModelSelection">>;
   /** The session's main model (provider/id), shown in /workflows for default agents. */
   mainModel?: string;
   /** Internal: persistent conversation commands restore the model recorded in sessionPath. */
@@ -174,11 +175,10 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onAgentHistory?: (event: { callId: string; label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
   onAgentUsage?: (event: { callId: string; label: string; phase?: string; tokens: number }) => void;
   /**
-   * The subagent's real model was resolved (tier/explicit spec) at session
-   * creation. Without this, live displays show the session default for
-   * tier-routed agents until the agent ends.
+   * The subagent's actual model and effort at session creation or fallback.
+   * Consumers replace both values together, including an absent effort.
    */
-  onAgentModel?: (event: { callId: string; label: string; phase?: string; model: string }) => void;
+  onAgentModel?: (event: { callId: string; label: string; phase?: string; model: string; thinking?: string }) => void;
   onTokenUsage?: (usage: {
     input: number;
     output: number;
@@ -233,7 +233,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   /**
    * Reasoning effort for this agent: "low" | "medium" | "high" | "xhigh" | "max".
    * Independent of `model`/`tier` — each model translates the level itself, so the
-   * same name works across providers. Omit it to keep the session default.
+   * same name works across providers. Omit it to use the selected tier’s thinking,
+   * otherwise the session default.
    */
   thinking?: AgentThinkingLevel;
   /**
@@ -592,11 +593,27 @@ export async function runWorkflow<T = unknown>(
     // spec, else the session's main model. The real resolved id overrides this via
     // onModelResolved once the subagent session is created.
     let displayModel = modelSpec ?? options.mainModel;
+    const selectionOptions = {
+      ...agentOptions,
+      model: modelSpec,
+      restoreSessionModel: options.restoreAgentSessionModel,
+    };
+    const modelSelection = agentRunner.resolveModelSelection
+      ? agentRunner.resolveModelSelection(selectionOptions)
+      : resolveAgentModelSelection(selectionOptions, options.mainModel);
+    const effectiveThinking = agentOptions.thinking ?? modelSelection.thinking;
 
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const { index: callIndex, callId } = nextCallIdentity();
-    const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
+    const callHash = hashAgentCall(
+      prompt,
+      modelSpec,
+      assignedPhase,
+      agentOptions,
+      agentDefinitionKey(agentDef),
+      modelSelection.thinking !== undefined ? modelSelection : undefined,
+    );
 
     // Count the logical agent synchronously before any asynchronous work begins.
     shared.agentCount++;
@@ -619,7 +636,7 @@ export async function runWorkflow<T = unknown>(
         phase: assignedPhase,
         prompt,
         model: displayModel,
-        thinking: agentOptions.thinking,
+        thinking: effectiveThinking,
         sessionPath: agentOptions.sessionPath,
       });
       options.onAgentEnd?.({
@@ -640,7 +657,7 @@ export async function runWorkflow<T = unknown>(
         phase: assignedPhase,
         prompt,
         model: displayModel,
-        thinking: agentOptions.thinking,
+        thinking: effectiveThinking,
         sessionPath: agentOptions.sessionPath,
       });
       const replayed = new WorkflowError(settledError.message, settledError.code, {
@@ -700,7 +717,7 @@ export async function runWorkflow<T = unknown>(
         phase: assignedPhase,
         prompt,
         model: displayModel,
-        thinking: agentOptions.thinking,
+        thinking: effectiveThinking,
         sessionPath: agentOptions.sessionPath,
       });
 
@@ -763,6 +780,7 @@ export async function runWorkflow<T = unknown>(
               fallbackModel: agentOptions.fallbackModel,
               tier: agentOptions.tier,
               thinking: agentOptions.thinking,
+              modelSelection,
               modelRegistry: options.modelRegistry,
               toolNames: agentDef?.tools,
               disallowedToolNames: agentDef?.disallowedTools,
@@ -771,9 +789,9 @@ export async function runWorkflow<T = unknown>(
               cwd: agentOptions.cwd ?? baseCwd,
               forkFrom: agentOptions.forkFrom,
               sessionPath: agentOptions.sessionPath,
-              onModelResolved: (id: string) => {
+              onModelResolved: (id: string, thinking?: string) => {
                 displayModel = id;
-                options.onAgentModel?.({ callId, label, phase: assignedPhase, model: id });
+                options.onAgentModel?.({ callId, label, phase: assignedPhase, model: id, thinking });
               },
               onModelFallback: (spec: string, fallbackSpec?: string, reason?: string) => {
                 // Make model handoffs and the legacy session-default degrade visible.
@@ -1420,6 +1438,7 @@ function hashAgentCall(
   phase: string | undefined,
   options: AgentOptions,
   agentDefKey: string | null,
+  tierSelection?: { model?: string; thinking?: AgentThinkingLevel },
 ): string {
   const identity = JSON.stringify({
     prompt,
@@ -1429,6 +1448,9 @@ function hashAgentCall(
     // Reasoning effort changes the answer, so raising it must invalidate a cached
     // result on resume instead of replaying the cheaper one.
     thinking: options.thinking ?? null,
+    // Preserve pre-tier-thinking journal bytes for legacy routes. Keep explicit
+    // effort separate: fallback treats an override differently from inheritance.
+    ...(tierSelection ? { tierSelection } : {}),
     phase: phase ?? null,
     agentType: options.agentType ?? null,
     // Resolved definition (tools/model/prompt) so editing an agent .md invalidates

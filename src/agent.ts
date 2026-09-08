@@ -25,7 +25,7 @@ import {
   WorkflowError,
   WorkflowErrorCode,
 } from "./errors.js";
-import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
+import { loadModelTierConfig, type ModelTierConfig } from "./model-tier-config.js";
 import { createReadOnlyBashSession } from "./read-only-bash.js";
 import { acquireSessionWriterLease } from "./session-writer-lease.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
@@ -436,15 +436,26 @@ export function resolveAgentModelSpec(
   mainModel: string | undefined,
   loadConfig: () => ModelTierConfig | null = loadModelTierConfig,
 ): string | undefined {
-  if (options.model) return options.model;
-  const config = loadConfig();
-  if (options.tier) {
-    return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
-  }
-  // An untagged agent stays on the host session model. The configured medium
-  // tier is only useful as a fallback when the host could not supply that model.
-  if (mainModel) return mainModel;
-  return config ? resolveTierModel("medium", config) || undefined : undefined;
+  return resolveAgentModelSelection(options, mainModel, loadConfig).model;
+}
+
+/** Snapshot a route and its tier effort together, before queueing or retries. */
+export function resolveAgentModelSelection(
+  options: { model?: string; tier?: string; restoreSessionModel?: boolean },
+  mainModel: string | undefined,
+  loadConfig: () => ModelTierConfig | null = loadModelTierConfig,
+): { model?: string; thinking?: AgentThinkingLevel } {
+  if (options.restoreSessionModel) return {};
+  if (options.model) return { model: options.model };
+  if (!options.tier && mainModel) return { model: mainModel };
+  const entry = loadConfig()?.tiers[options.tier || "medium"];
+  if (typeof entry === "string") return { model: options.tier ? entry : entry || undefined };
+  if (entry)
+    return {
+      model: options.tier ? entry.model : entry.model || undefined,
+      thinking: entry.model ? entry.thinking : undefined,
+    };
+  return { model: options.tier ? mainModel : undefined };
 }
 
 export interface WorkflowAgentOptions {
@@ -605,8 +616,7 @@ export interface AgentUsage {
  * These are the host SDK's thinking levels minus `off`/`minimal`: each model
  * translates the name through its own `thinkingLevelMap`, so `max` means "the
  * most this model will think" whether it is served by Anthropic or OpenAI.
- * Omitting the level keeps the session default, which is what every subagent
- * used before this option existed.
+ * Omitting the level uses the selected tier’s thinking, else the session default.
  */
 export const AGENT_THINKING_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
@@ -652,11 +662,14 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   /**
    * Reasoning effort for this subagent. Set at session creation rather than via
    * `AgentSession.setThinkingLevel()`, which would also overwrite the user's
-   * global default thinking level. When omitted, the session default applies.
+   * global default thinking level. When omitted, the selected tier’s
+   * thinking applies, otherwise the session default.
    */
   thinking?: AgentThinkingLevel;
-  /** Called with the resolved model id once known (for display/telemetry). */
-  onModelResolved?: (modelId: string) => void;
+  /** Route snapshot owned by the workflow call; tier effort is not an explicit override. */
+  modelSelection?: { model?: string; thinking?: AgentThinkingLevel };
+  /** Reports the actual session model and effort together at creation and handoff. */
+  onModelResolved?: (modelId: string, thinking?: string) => void;
   /** Called when the primary model falls back to another model or the session default. */
   onModelFallback?: (requestedSpec: string, fallbackSpec?: string, reason?: string) => void;
   /** Called with a compact snapshot of this subagent's message/tool history. */
@@ -723,6 +736,7 @@ interface AgentModelRoute {
   model?: Model<any>;
   fallbackModel?: Model<any>;
   usedFallback: boolean;
+  thinking?: AgentThinkingLevel;
 }
 
 function resolveModelFromRegistry(spec: string, registry?: ModelRegistry): Model<any> | undefined {
@@ -756,7 +770,8 @@ function resolveAgentModelRoute(
   registry: ModelRegistry | undefined,
   requireAvailable: boolean,
 ): AgentModelRoute {
-  const modelSpec = options.restoreSessionModel ? undefined : resolveAgentModelSpec(options, mainModel);
+  const selection = options.modelSelection ?? resolveAgentModelSelection(options, mainModel);
+  const modelSpec = selection.model;
   const fallbackSpec = options.fallbackModel?.trim();
   if (fallbackSpec && !modelSpec) {
     throw new WorkflowError("fallbackModel requires a primary model", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
@@ -778,12 +793,17 @@ function resolveAgentModelRoute(
   const primaryModel = resolveModelFromRegistry(modelSpec, registry);
   const primaryIsAvailable = Boolean(primaryModel && modelIsAvailableInRegistry(primaryModel, registry));
   if (primaryModel && (primaryIsAvailable || (!requireAvailable && !fallbackSpec))) {
-    options.onModelResolved?.(`${primaryModel.provider}/${primaryModel.id}`);
-    return { modelSpec, fallbackSpec, model: primaryModel, fallbackModel, usedFallback: false };
+    return {
+      modelSpec,
+      fallbackSpec,
+      model: primaryModel,
+      fallbackModel,
+      usedFallback: false,
+      thinking: selection.thinking,
+    };
   }
   if (fallbackModel && fallbackSpec) {
     options.onModelFallback?.(modelSpec, fallbackSpec, "primary model is unavailable or unauthenticated");
-    options.onModelResolved?.(`${fallbackModel.provider}/${fallbackModel.id}`);
     return { modelSpec, fallbackSpec, model: fallbackModel, fallbackModel, usedFallback: true };
   }
   if (requireAvailable) throw unavailableModelError(modelSpec, registry, options.label);
@@ -791,6 +811,27 @@ function resolveAgentModelRoute(
   console.warn(`[workflow] model "${modelSpec}" not found; using session default`);
   options.onModelFallback?.(modelSpec);
   return { modelSpec, fallbackSpec, usedFallback: false };
+}
+
+/**
+ * SDK 0.85 createAgentSession default-effort precedence. Its public session API
+ * can set an effort but cannot reset it to constructor defaults. Resolve before
+ * the tier effort is journaled, so a later handoff matches initial fallback.
+ */
+function fallbackSessionThinking(
+  model: Model<any>,
+  sessionOptions: Partial<CreateAgentSessionOptions>,
+  sessionManager: SessionManager,
+  settings: SettingsManager,
+): NonNullable<CreateAgentSessionOptions["thinkingLevel"]> {
+  if (sessionOptions.thinkingLevel !== undefined) return sessionOptions.thinkingLevel;
+  const saved = sessionManager.buildSessionContext();
+  if (saved.messages.length > 0) {
+    return sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change")
+      ? (saved.thinkingLevel as NonNullable<CreateAgentSessionOptions["thinkingLevel"]>)
+      : (settings.getDefaultThinkingLevel() ?? "medium");
+  }
+  return settings.getModelThinkingLevel(model.provider, model.id) ?? settings.getDefaultThinkingLevel() ?? "medium";
 }
 
 export class WorkflowAgent {
@@ -812,6 +853,11 @@ export class WorkflowAgent {
     this.mainModel = options.mainModel;
     this.sharedRegistry = options.modelRegistry;
     this.settingsManager = this.sessionOptions.settingsManager;
+  }
+
+  /** Capture the route before queueing, using this runner's configured defaults. */
+  resolveModelSelection(options: AgentRunOptions<any>): { model?: string; thinking?: AgentThinkingLevel } {
+    return resolveAgentModelSelection(options, this.mainModel);
   }
 
   /**
@@ -876,6 +922,7 @@ export class WorkflowAgent {
     );
 
     const modelRoute = resolveAgentModelRoute(options, this.mainModel, this.getRegistry(options.modelRegistry), false);
+    const thinking = options.thinking ?? modelRoute.thinking;
     const modelSpec = modelRoute.modelSpec;
     const fallbackSpec = modelRoute.fallbackSpec;
     let resolvedModel = modelRoute.model;
@@ -896,6 +943,15 @@ export class WorkflowAgent {
       readOnlyBash?.cleanup();
       throw error;
     });
+    const tierFallbackThinking =
+      modelRoute.thinking !== undefined && resolvedFallbackModel
+        ? fallbackSessionThinking(
+            resolvedFallbackModel,
+            this.sessionOptions,
+            this.sessionOptions.sessionManager ?? forked.sessionManager,
+            this.sessionOptions.settingsManager ?? this.settingsManager,
+          )
+        : undefined;
     let restoredThinkingLevel: CreateAgentSessionOptions["thinkingLevel"];
     try {
       if (options.restoreSessionModel) {
@@ -905,7 +961,6 @@ export class WorkflowAgent {
           : undefined;
         if (savedModel && this.modelIsAvailable(savedModel, options.modelRegistry)) {
           resolvedModel = savedModel;
-          options.onModelResolved?.(`${savedModel.provider}/${savedModel.id}`);
         } else if (saved.model) {
           options.onModelFallback?.(`${saved.model.provider}/${saved.model.modelId}`);
         }
@@ -935,18 +990,35 @@ export class WorkflowAgent {
           ...(resolvedModel ? { model: resolvedModel } : {}),
           // The SDK maps this level through the model's own thinking-level map
           // and clamps it to what that model supports.
-          ...(options.thinking || restoredThinkingLevel
-            ? { thinkingLevel: options.thinking ?? restoredThinkingLevel }
-            : {}),
+          ...(thinking || restoredThinkingLevel ? { thinkingLevel: thinking ?? restoredThinkingLevel } : {}),
           ...(options.readOnly ? { tools: readOnlyToolNames } : {}),
           ...(options.allowSubagents ? {} : { excludeTools: WORKFLOW_TOOL_NAMES }),
         });
         createdSession = created.session;
+        // The SDK restores messages but does not journal constructor overrides
+        // on an existing transcript. Persist the effective pair for continuation.
+        const savedRoute = createdSession.sessionManager.buildSessionContext();
+        const activeModel = createdSession.model;
+        if (
+          activeModel &&
+          (savedRoute.model?.provider !== activeModel.provider || savedRoute.model?.modelId !== activeModel.id)
+        ) {
+          createdSession.sessionManager.appendModelChange(activeModel.provider, activeModel.id);
+        }
+        if (savedRoute.thinkingLevel !== createdSession.thinkingLevel) {
+          createdSession.sessionManager.appendThinkingLevelChange(createdSession.thinkingLevel);
+        }
         // createAgentSession loads configured extensions, but hooks (including
         // compaction/autocontinue extensions and session_start tool setup) only run
         // after binding. Bind headlessly so workflow subagents participate in the
         // same extension lifecycle as normal sessions.
         await createdSession.bindExtensions({});
+        if (createdSession.model) {
+          options.onModelResolved?.(
+            `${createdSession.model.provider}/${createdSession.model.id}`,
+            createdSession.thinkingLevel,
+          );
+        }
         return createdSession;
       } catch (error) {
         // session_start may already have allocated extension-owned resources
@@ -1096,9 +1168,9 @@ export class WorkflowAgent {
         // would also overwrite the user's global default model.
         session.agent.state.model = fallbackModel;
         session.sessionManager.appendModelChange(fallbackModel.provider, fallbackModel.id);
-        session.setThinkingLevel(session.thinkingLevel);
+        session.setThinkingLevel(options.thinking ?? tierFallbackThinking ?? session.thinkingLevel);
         options.onModelFallback?.(modelSpec, fallbackSpec, reason);
-        options.onModelResolved?.(`${fallbackModel.provider}/${fallbackModel.id}`);
+        options.onModelResolved?.(`${fallbackModel.provider}/${fallbackModel.id}`, session.thinkingLevel);
 
         const structuredReminder = options.schema
           ? " Finish by calling structured_output exactly once with the required replacement result."
@@ -1194,7 +1266,12 @@ export function createFailClosedModelAgent(
           "primary model is unavailable or unauthenticated",
         );
       }
-      return agent.run(prompt, { ...options, model: selectedModel, fallbackModel });
+      return agent.run(prompt, {
+        ...options,
+        model: selectedModel,
+        fallbackModel,
+        modelSelection: { model: selectedModel, thinking: route.thinking },
+      });
     },
   };
 }

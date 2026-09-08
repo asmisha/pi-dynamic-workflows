@@ -35,6 +35,7 @@ interface NodeApiFixtureCustomization {
   extensionSource?: string;
   fixtureModels?: unknown[];
   defaultThinkingLevel?: string;
+  tiers?: import("../src/model-tier-config.js").ModelTierConfig["tiers"];
 }
 
 async function withNodeApiFixture<T>(
@@ -94,7 +95,10 @@ async function withNodeApiFixture<T>(
   );
   const workflowDir = join(home, ".pi", "workflows");
   mkdirSync(workflowDir, { recursive: true });
-  writeFileSync(join(workflowDir, "model-tiers.json"), JSON.stringify({ tiers: { small: "tier" } }));
+  writeFileSync(
+    join(workflowDir, "model-tiers.json"),
+    JSON.stringify({ tiers: customization.tiers ?? { small: "tier" } }),
+  );
 
   try {
     return await withFakeHomeAsync(home, () => fn({ cwd }));
@@ -686,4 +690,454 @@ return await agent('legacy prompt')`,
   assert.deepEqual(seen, ["legacy prompt"]);
   assert.equal(completed.result, "legacy-result");
   assert.equal(completed.meta.name, "legacy");
+});
+
+test("real SDK sessions receive tier effort, explicit overrides, and session defaults", async () => {
+  const { registerFauxProvider, fauxAssistantMessage } = await loadFaux();
+  const seen: unknown[] = [];
+  const faux = registerFauxProvider({
+    provider: "fixture",
+    models: ["main", "astra"].map((id) => ({ id, name: id, reasoning: true, contextWindow: 4096, maxTokens: 1024 })),
+  });
+  faux.setResponses(
+    Array.from({ length: 5 }, () => (_context: unknown, options: unknown) => {
+      seen.push((options as { reasoning?: string }).reasoning);
+      return fauxAssistantMessage("ok");
+    }),
+  );
+  try {
+    await withNodeApiFixture(
+      async ({ cwd }) => {
+        const started: unknown[] = [];
+        const models: string[] = [];
+        await runWorkflow({
+          script: `export const meta = { name: 'tier_effort', description: 'tier effort' }
+await agent('one', { tier: 'medium' })
+await agent('two', { tier: 'big' })
+await agent('three', { tier: 'medium', thinking: 'high' })
+await agent('four', { tier: 'medium', model: 'fixture/main' })
+await agent('five', { tier: 'small' })`,
+          cwd,
+          persistLogs: false,
+          onAgentStart: (event) => started.push(event.thinking),
+          onAgentModel: (event) => models.push(event.model),
+        });
+        assert.deepEqual(started, ["low", "medium", "high", undefined, undefined]);
+        assert.deepEqual(seen, ["low", "medium", "high", "high", "high"]);
+        assert.deepEqual(models, ["fixture/astra", "fixture/astra", "fixture/astra", "fixture/main", "fixture/main"]);
+      },
+      {
+        fixtureModels: faux.models,
+        defaultThinkingLevel: "high",
+        tiers: {
+          small: "fixture/main",
+          medium: { model: "fixture/astra", thinking: "low" },
+          big: { model: "fixture/astra", thinking: "medium" },
+        },
+      },
+    );
+  } finally {
+    faux.unregister();
+  }
+});
+
+test("real SDK tier fallback drops tier effort, retains explicit effort, and restores persisted pairs", async () => {
+  const { WorkflowAgent } = await import("../src/agent.js");
+  const { createAgentSessionServices, ModelRegistry, SessionManager } = await import("@earendil-works/pi-coding-agent");
+  const { registerFauxProvider, fauxAssistantMessage } = await loadFaux();
+  const seen: unknown[] = [];
+  const faux = registerFauxProvider({
+    provider: "fixture",
+    models: ["main", "astra"].map((id) => ({ id, name: id, reasoning: true, contextWindow: 4096, maxTokens: 1024 })),
+  });
+  faux.setResponses(
+    Array.from({ length: 6 }, () => (_context: unknown, options: unknown) => {
+      seen.push((options as { reasoning?: string }).reasoning);
+      return fauxAssistantMessage("ok");
+    }),
+  );
+  try {
+    await withNodeApiFixture(
+      async ({ cwd }) => {
+        const services = await createAgentSessionServices({ cwd });
+        const agent = new WorkflowAgent({
+          cwd,
+          modelRegistry: new ModelRegistry(services.modelRuntime),
+          session: { modelRuntime: services.modelRuntime, settingsManager: services.settingsManager },
+        });
+        const models: string[] = [];
+        await agent.run("default fallback", { tier: "medium" });
+        await agent.run("explicit fallback", { tier: "medium", thinking: "medium" });
+        await agent.run("backup fallback", { tier: "medium", fallbackModel: "fixture/main" });
+        const sessionPath = join(cwd, "saved.jsonl");
+        await agent.run("persist low", { sessionPath, modelSelection: { model: "fixture/main", thinking: "low" } });
+        await agent.run("continue medium", {
+          sessionPath,
+          modelSelection: { model: "fixture/astra", thinking: "medium" },
+        });
+        await agent.run("restore", {
+          sessionPath,
+          restoreSessionModel: true,
+          tier: "small",
+          onModelResolved: (model) => models.push(model),
+        });
+        const saved = SessionManager.open(sessionPath).buildSessionContext();
+        assert.equal(saved.model?.modelId, "astra");
+        assert.equal(saved.thinkingLevel, "medium");
+        assert.deepEqual(models, ["fixture/astra"]);
+        assert.deepEqual(seen, ["high", "medium", "high", "low", "medium", "medium"]);
+      },
+      {
+        fixtureModels: faux.models,
+        defaultThinkingLevel: "high",
+        tiers: { medium: { model: "missing/model", thinking: "low" } },
+      },
+    );
+  } finally {
+    faux.unregister();
+  }
+});
+
+test("queued real SDK calls use one tier pair despite a config edit", async () => {
+  const { saveModelTierConfig } = await import("../src/model-tier-config.js");
+  const { registerFauxProvider, fauxAssistantMessage } = await loadFaux();
+  const seen: unknown[] = [];
+  const faux = registerFauxProvider({
+    provider: "fixture",
+    models: ["main", "astra"].map((id) => ({ id, name: id, reasoning: true, contextWindow: 4096, maxTokens: 1024 })),
+  });
+  faux.setResponses(
+    Array.from({ length: 2 }, () => (_context: unknown, options: unknown) => {
+      seen.push((options as { reasoning?: string }).reasoning);
+      saveModelTierConfig({ tiers: { medium: { model: "fixture/main", thinking: "medium" } } });
+      return fauxAssistantMessage("ok");
+    }),
+  );
+  try {
+    await withNodeApiFixture(
+      async ({ cwd }) => {
+        const models: string[] = [];
+        await runWorkflow({
+          cwd,
+          concurrency: 1,
+          persistLogs: false,
+          script: `export const meta = {name: 'queued_sdk', description: 'queued sdk'}
+return await Promise.all([agent('first', {tier: 'medium'}), agent('second', {tier: 'medium'})])`,
+          onAgentModel: (event) => models.push(event.model),
+        });
+        assert.deepEqual(models, ["fixture/astra", "fixture/astra"]);
+        assert.deepEqual(seen, ["low", "low"]);
+      },
+      {
+        fixtureModels: faux.models,
+        defaultThinkingLevel: "high",
+        tiers: { medium: { model: "fixture/astra", thinking: "low" } },
+      },
+    );
+  } finally {
+    faux.unregister();
+  }
+});
+
+test("runtime tier fallback matches initial fallback effort and retains tool/transcript state", async () => {
+  const { WorkflowAgent } = await import("../src/agent.js");
+  const { saveModelTierConfig } = await import("../src/model-tier-config.js");
+  const { createAgentSessionServices, ModelRegistry, SessionManager } = await import("@earendil-works/pi-coding-agent");
+  const { readFileSync, copyFileSync } = await import("node:fs");
+  const { registerFauxProvider, fauxAssistantMessage, fauxToolCall } = await loadFaux();
+  const cases = [
+    { global: "high", expected: "high", error: "Codex usage limit reached (plus plan). Resets in ~3h." },
+    { expected: "medium", error: "401 unauthorized" },
+    { global: "high", perModel: "medium", expected: "medium", error: "503 Service Unavailable" },
+    { global: "high", explicit: "low", expected: "low", error: "Codex usage limit reached (plus plan)." },
+    { global: "high", session: "medium", expected: "medium", error: "401 unauthorized" },
+    { global: "medium", saved: "high", expected: "high", error: "401 unauthorized" },
+    { global: "medium", saved: "high", suppliedManager: true, expected: "high", error: "401 unauthorized" },
+  ] as const;
+  for (const scenario of cases) {
+    const config = scenario as {
+      global?: string;
+      perModel?: "medium";
+      explicit?: "low";
+      session?: "medium";
+      saved?: "high";
+      suppliedManager?: boolean;
+      expected: string;
+      error: string;
+    };
+    const faux = registerFauxProvider({
+      provider: "fixture",
+      models: ["main", "astra"].map((id) => ({ id, name: id, reasoning: true, contextWindow: 4096, maxTokens: 1024 })),
+    });
+    try {
+      await withNodeApiFixture(
+        async ({ cwd }) => {
+          const services = await createAgentSessionServices({ cwd });
+          services.settingsManager.setRetryEnabled(false);
+          if (config.perModel) services.settingsManager.setModelThinkingLevel("fixture", "main", config.perModel);
+          const makeAgent = (sessionManager?: InstanceType<typeof SessionManager>) =>
+            new WorkflowAgent({
+              cwd,
+              modelRegistry: new ModelRegistry(services.modelRuntime),
+              session: {
+                modelRuntime: services.modelRuntime,
+                settingsManager: services.settingsManager,
+                ...(config.session ? { thinkingLevel: config.session } : {}),
+                ...(sessionManager ? { sessionManager } : {}),
+              },
+            });
+          let agent = makeAgent();
+          const sessionPath = join(cwd, "handoff.jsonl");
+          const initialSessionPath = join(cwd, "initial.jsonl");
+          if (config.saved) {
+            faux.setResponses([fauxAssistantMessage("seed")]);
+            await agent.run("seed", { model: "fixture/main", thinking: config.saved, sessionPath });
+            copyFileSync(sessionPath, initialSessionPath);
+          }
+          let initialEffort: string | undefined;
+          faux.setResponses([
+            (_context: unknown, options: { reasoning?: string }) => {
+              initialEffort = options.reasoning;
+              return fauxAssistantMessage("initial");
+            },
+          ]);
+          const opts = {
+            tier: "medium",
+            fallbackModel: "fixture/main",
+            ...(config.explicit ? { thinking: config.explicit } : {}),
+          };
+          saveModelTierConfig({ tiers: { medium: { model: "missing/model", thinking: "low" } } });
+          const initialAgent = config.suppliedManager ? makeAgent(SessionManager.open(initialSessionPath)) : agent;
+          await initialAgent.run("task", { ...opts, ...(config.saved ? { sessionPath: initialSessionPath } : {}) });
+          if (config.suppliedManager) agent = makeAgent(SessionManager.open(sessionPath));
+          assert.equal(initialEffort, config.expected);
+          saveModelTierConfig({ tiers: { medium: { model: "fixture/astra", thinking: "low" } } });
+          const artifact = join(cwd, "completed-work.txt");
+          const requests: Array<{ model: string; thinking?: string }> = [];
+          let fallbackMessages: Array<{ role: string; toolName?: string }> = [];
+          const capture =
+            (response: unknown) =>
+            (_context: unknown, options: { reasoning?: string }, _state: unknown, model: { id: string }) => {
+              requests.push({ model: model.id, thinking: options.reasoning });
+              return response;
+            };
+          faux.setResponses([
+            capture(
+              fauxAssistantMessage(fauxToolCall("write", { path: artifact, content: "completed once" }), {
+                stopReason: "toolUse",
+              }),
+            ),
+            capture(fauxAssistantMessage("", { stopReason: "error", errorMessage: config.error })),
+            (
+              context: { messages: typeof fallbackMessages },
+              options: { reasoning?: string },
+              _state: unknown,
+              model: { id: string },
+            ) => {
+              requests.push({ model: model.id, thinking: options.reasoning });
+              fallbackMessages = context.messages;
+              return fauxAssistantMessage("continued");
+            },
+          ]);
+          assert.equal(
+            await agent.run("task", {
+              ...opts,
+              sessionPath: config.suppliedManager ? join(cwd, "unused.jsonl") : sessionPath,
+            }),
+            "continued",
+          );
+          assert.deepEqual(requests, [
+            { model: "astra", thinking: "low" },
+            { model: "astra", thinking: "low" },
+            { model: "main", thinking: initialEffort },
+          ]);
+          assert.equal(readFileSync(artifact, "utf8"), "completed once");
+          assert.equal(
+            fallbackMessages.filter((message) => message.role === "toolResult" && message.toolName === "write").length,
+            1,
+          );
+          const saved = SessionManager.open(sessionPath).buildSessionContext();
+          assert.equal(saved.model?.modelId, "main");
+          assert.equal(saved.thinkingLevel, initialEffort);
+        },
+        { fixtureModels: faux.models, defaultThinkingLevel: config.global },
+      );
+    } finally {
+      faux.unregister();
+    }
+  }
+});
+
+test("low-level injected runner retains its main model before implicit and missing tiers", async () => {
+  const { WorkflowAgent } = await import("../src/agent.js");
+  const { createAgentSessionServices, ModelRegistry } = await import("@earendil-works/pi-coding-agent");
+  const { registerFauxProvider, fauxAssistantMessage } = await loadFaux();
+  const faux = registerFauxProvider({
+    provider: "fixture",
+    models: ["main", "astra"].map((id) => ({ id, name: id, reasoning: true, contextWindow: 4096, maxTokens: 1024 })),
+  });
+  const requests: string[] = [];
+  faux.setResponses(
+    Array.from({ length: 3 }, () => (_context: unknown, _options: unknown, _state: unknown, model: { id: string }) => {
+      requests.push(model.id);
+      return fauxAssistantMessage("ok");
+    }),
+  );
+  try {
+    await withNodeApiFixture(
+      async ({ cwd }) => {
+        const services = await createAgentSessionServices({ cwd });
+        const agent = new WorkflowAgent({
+          cwd,
+          mainModel: "fixture/astra",
+          modelRegistry: new ModelRegistry(services.modelRuntime),
+          session: { modelRuntime: services.modelRuntime, settingsManager: services.settingsManager },
+        });
+        await runWorkflow(
+          `export const meta = { name: 'injected', description: 'injected routing' }
+await agent('untagged')
+await agent('missing', { tier: 'small' })
+await agent('explicit', { model: 'fixture/main' })`,
+          { cwd, agent, persistLogs: false },
+        );
+        assert.deepEqual(requests, ["astra", "astra", "main"]);
+      },
+      { fixtureModels: faux.models, tiers: { medium: "fixture/main" } },
+    );
+  } finally {
+    faux.unregister();
+  }
+});
+
+test("real SDK fallback display follows the effective pair through manager and navigator", async () => {
+  const { WorkflowAgent } = await import("../src/agent.js");
+  const { WorkflowManager } = await import("../src/workflow-manager.js");
+  const { NavigatorModel, openWorkflowNavigator } = await import("../src/workflow-ui.js");
+  const { createAgentSessionServices, ModelRegistry } = await import("@earendil-works/pi-coding-agent");
+  const { registerFauxProvider, fauxAssistantMessage } = await loadFaux();
+  for (const route of ["normal", "initial", "default", "runtime"] as const) {
+    for (const explicit of [false, true]) {
+      const faux = registerFauxProvider({
+        provider: "fixture",
+        models: ["main", "astra"].map((id) => ({
+          id,
+          name: id,
+          reasoning: true,
+          contextWindow: 4096,
+          maxTokens: 1024,
+        })),
+      });
+      try {
+        await withNodeApiFixture(
+          async ({ cwd }) => {
+            const services = await createAgentSessionServices({ cwd });
+            const registry = new ModelRegistry(services.modelRuntime);
+            const manager = new WorkflowManager({
+              cwd,
+              mainModel: "fixture/main",
+              modelRegistry: registry,
+              agent: new WorkflowAgent({
+                cwd,
+                mainModel: "fixture/main",
+                modelRegistry: registry,
+                session: { modelRuntime: services.modelRuntime, settingsManager: services.settingsManager },
+              }),
+            });
+            const navigator = new NavigatorModel(manager);
+            type Overlay = { render(width: number): string[]; handleInput(data: string): void; dispose(): void };
+            let component: Overlay | undefined;
+            let screen = "";
+            let startingScreen = "";
+            const requestRender = () => {
+              assert.ok(component);
+              screen = component.render(100).join("\n");
+            };
+            manager.once("agentStart", () => {
+              void openWorkflowNavigator({} as Parameters<typeof openWorkflowNavigator>[0], manager, {
+                custom(factory: (...args: unknown[]) => Overlay) {
+                  component = factory(
+                    { requestRender, terminal: { rows: 30 } },
+                    {
+                      fg: (_color: string, text: string) => text,
+                      bg: (_color: string, text: string) => text,
+                      bold: (text: string) => text,
+                    },
+                    {},
+                    () => {},
+                  );
+                  component.handleInput("\r");
+                  component.handleInput("\r");
+                  startingScreen = screen;
+                  return Promise.resolve();
+                },
+              } as unknown as Parameters<typeof openWorkflowNavigator>[2]);
+            });
+            const observed: Array<{ model: string; thinking?: string }> = [];
+            const capture =
+              (fail: boolean) =>
+              (
+                _context: unknown,
+                options: { reasoning?: string },
+                _state: unknown,
+                model: { provider: string; id: string },
+              ) => {
+                const actual = { model: `${model.provider}/${model.id}`, thinking: options.reasoning };
+                observed.push(actual);
+                // No input or direct render here: only manager notifications refresh the open overlay.
+                assert.ok(screen.includes(`${model.id} · ${options.reasoning}`), screen);
+                const run = manager.listRuns()[0];
+                const live = manager.getRun(run.runId);
+                assert.ok(live);
+                const snapshot = live.snapshot.agents[0];
+                assert.deepEqual({ model: snapshot.model, thinking: snapshot.thinking }, actual);
+                const row = navigator.agents(run.runId, "(no phase)")[0];
+                assert.deepEqual({ model: row.model, thinking: row.thinking }, actual);
+                const detail = navigator.agentDetail(run.runId, row.id);
+                assert.ok(detail);
+                assert.deepEqual({ model: detail.model, thinking: detail.thinking }, actual);
+                return fail
+                  ? fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 unauthorized" })
+                  : fauxAssistantMessage("ok");
+              };
+            faux.setResponses(route === "runtime" ? [capture(true), capture(false)] : [capture(false)]);
+            const run =
+              manager.startInBackground(`export const meta = { name: 'display_pair', description: 'display pair' }
+return await agent('task', { tier: 'medium'${route === "default" ? "" : ", fallbackModel: 'fixture/main'"}${explicit ? ", thinking: 'medium'" : ""} })`);
+            try {
+              await run.promise;
+              assert.ok(startingScreen.includes(`main · ${explicit ? "medium" : "low"}`), startingScreen);
+            } finally {
+              component?.dispose();
+            }
+            const tierPair = { model: "fixture/astra", thinking: explicit ? "medium" : "low" };
+            const fallbackPair = { model: "fixture/main", thinking: explicit ? "medium" : "high" };
+            assert.deepEqual(
+              observed,
+              route === "runtime"
+                ? [tierPair, fallbackPair]
+                : [route === "initial" || route === "default" ? fallbackPair : tierPair],
+            );
+            const persistedNavigator = new NavigatorModel({
+              listRuns: () => manager.listRuns(),
+              getRun: () => undefined,
+            });
+            const persisted = persistedNavigator.agents(run.runId, "(no phase)")[0];
+            assert.deepEqual({ model: persisted.model, thinking: persisted.thinking }, observed.at(-1));
+          },
+          {
+            fixtureModels: faux.models,
+            defaultThinkingLevel: "high",
+            tiers: {
+              medium: {
+                model: route === "initial" || route === "default" ? "missing/model" : "fixture/astra",
+                thinking: "low",
+              },
+            },
+          },
+        );
+      } finally {
+        faux.unregister();
+      }
+    }
+  }
 });
