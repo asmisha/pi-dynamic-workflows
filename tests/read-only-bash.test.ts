@@ -60,28 +60,35 @@ test("read-only bash supports Git reads and isolated temporary writes", macOnly,
   }
 });
 
-test("read-only bash persists shared /tmp artifacts that outlive the agent", macOnly, async () => {
-  const repo = mkdtempSync(join(tmpdir(), "readonly-bash-artifacts-"));
-  const shared = join("/tmp", `readonly-bash-artifacts-${process.pid}-${Date.now()}`);
-  try {
-    const sandbox = createReadOnlyBashSession(repo);
-    assert.ok(sandbox.tool);
+for (const [name, directory] of [
+  ["/tmp", "/tmp"],
+  ["host OS temp", tmpdir()],
+]) {
+  test(`read-only bash shares ${name} reports between agents after cleanup`, macOnly, async () => {
+    // The parent supplies this directory; it is not either worker's private $TMPDIR.
+    const shared = mkdtempSync(join(directory, "readonly-bash-artifacts-"));
     try {
-      // The incident shape: an agent creates a run-scoped directory under the
-      // shared /tmp and writes a report other agents and the host read later.
-      await runBash(
-        sandbox.tool,
-        `mkdir -p ${JSON.stringify(shared)} && printf "full report" > ${JSON.stringify(join(shared, "report.md"))}`,
-      );
+      const producer = createReadOnlyBashSession(shared);
+      assert.ok(producer.tool);
+      try {
+        await runBash(producer.tool, 'mkdir reports && printf "full report" > reports/report.md');
+      } finally {
+        producer.cleanup();
+      }
+      assert.equal(readFileSync(join(shared, "reports/report.md"), "utf8"), "full report");
+
+      const consumer = createReadOnlyBashSession(shared);
+      assert.ok(consumer.tool);
+      try {
+        assert.equal(await runBash(consumer.tool, "cat reports/report.md"), "full report");
+      } finally {
+        consumer.cleanup();
+      }
     } finally {
-      sandbox.cleanup();
+      rmSync(shared, { recursive: true, force: true });
     }
-    assert.equal(readFileSync(join(shared, "report.md"), "utf8"), "full report");
-  } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(shared, { recursive: true, force: true });
-  }
-});
+  });
+}
 
 test("read-only bash allows shell network access", macOnly, async () => {
   const repo = mkdtempSync(join(tmpdir(), "readonly-bash-network-"));
@@ -116,8 +123,8 @@ test("read-only bash allows shell network access", macOnly, async () => {
   }
 });
 
-test("read-only bash blocks repository writes from shells, Python, Node, and symlinks", macOnly, async () => {
-  const repo = mkdtempSync(join(tmpdir(), "readonly-bash-deny-"));
+test("read-only bash blocks non-temp writes from shells, Python, Node, and symlinks", macOnly, async () => {
+  const repo = mkdtempSync(join(homedir(), "readonly-bash-deny-"));
   try {
     execFileSync("git", ["init", "-q", repo]);
     const sandbox = createReadOnlyBashSession(repo);

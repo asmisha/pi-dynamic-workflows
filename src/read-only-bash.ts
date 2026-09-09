@@ -35,7 +35,8 @@ function shellQuote(value: string): string {
 }
 
 function createSandboxPaths(): SandboxPaths {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-readonly-bash-")));
+  const hostTemp = realpathSync(tmpdir());
+  const root = mkdtempSync(join(hostTemp, "pi-readonly-bash-"));
   const temp = join(root, "tmp");
   const profile = join(root, "sandbox.sb");
   mkdirSync(temp);
@@ -51,14 +52,14 @@ function createSandboxPaths(): SandboxPaths {
       // The guarantee is "no durable host writes", not isolation: reads and
       // network stay open so remote-log commands (ssh, curl, kubectl) and the
       // toolchain work with the user's real HOME. Writes are confined to
-      // /dev/null, the per-agent sandbox directory (which backs $TMPDIR), and
-      // the shared /tmp so agents can persist temporary artifacts that other
-      // agents or the host read after this agent finishes.
+      // /dev/null, shared /tmp, and the host OS temp directory (which also
+      // contains private $TMPDIR). Parent-created temp directories must stay
+      // writable so reports survive worker cleanup and reach other agents.
       "(allow network*)",
       "(allow file-read*)",
       '(allow file-write* (literal "/dev/null"))',
       '(allow file-write* (subpath "/private/tmp"))',
-      `(allow file-write* (subpath ${JSON.stringify(root)}))`,
+      `(allow file-write* (subpath ${JSON.stringify(hostTemp)}))`,
       "",
     ].join("\n"),
   );
@@ -67,10 +68,10 @@ function createSandboxPaths(): SandboxPaths {
 
 /**
  * Build a bash tool whose child process can read the filesystem and reach the
- * network, but can write only to /dev/null, the shared /tmp, and its per-agent
- * scratch directory, and is always time-bounded. Unsupported platforms fail
- * closed by returning no tool instead of exposing Pi's unrestricted built-in
- * bash.
+ * network, but can write only to /dev/null, shared /tmp, and the host OS temp
+ * directory (including per-agent scratch), and is always time-bounded.
+ * Unsupported platforms fail closed by returning no tool instead of exposing
+ * Pi's unrestricted built-in bash.
  */
 export function createReadOnlyBashSession(
   cwd: string,
@@ -107,7 +108,7 @@ export function createReadOnlyBashSession(
     },
   };
   const tool = createBashToolDefinition(cwd, { operations });
-  tool.description = `${tool.description} Reads and network access work normally (ssh, curl, remote logs). Writes are confined to shared /tmp (including a checkout located there), private $TMPDIR, and /dev/null; $HOME and paths outside those temporary areas are not writable. $TMPDIR is deleted when this agent finishes. Put full research artifacts that the host or other agents must read afterward under /tmp; they survive agent cleanup but remain OS-temporary. A command without its own timeout is killed after ${defaultTimeoutSeconds} seconds.`;
+  tool.description = `${tool.description} Reads and network access work normally (ssh, curl, remote logs). Writes are confined to shared /tmp, the host OS temp directory, private $TMPDIR, and /dev/null, including checkouts in those temporary areas; paths outside those areas, including ordinary $HOME paths, are not writable. Private $TMPDIR is deleted when this agent finishes. Put research artifacts needed afterward under /tmp or in a parent-created OS temp directory; they survive agent cleanup but remain OS-temporary. A command without its own timeout is killed after ${defaultTimeoutSeconds} seconds.`;
 
   return {
     tool: tool as unknown as ToolDefinition,
