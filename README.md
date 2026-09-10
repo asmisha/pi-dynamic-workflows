@@ -221,7 +221,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 | Claude Code dynamic workflows | pi-dynamic-workflows (on Pi) |
 | --- | --- |
 | Code-mode orchestration — the model writes a script that drives subagents | A JS `workflow` tool running inline scripts in a VM or trusted file-backed workflows as native ESM |
-| Subagents with isolated context | Fresh in-memory Pi sessions; results held in script variables, not the chat |
+| Subagents with isolated context | Fresh persistent Pi sessions; results held in script variables, not the chat |
 | Structured outputs | JSON-Schema `schema` → a validated object, with bounded repair if the model misses |
 | Background runs | Non-blocking by default, a live task panel, and auto-continue delivery |
 | Resume | **Journaled + replayable** — survives restarts and replays the unchanged prefix |
@@ -252,7 +252,7 @@ In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · 
 
 ## Storage
 
-Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; persistent fork sessions live under `~/.pi/workflows/sessions/`; project-scoped run history, resume journals, locks, and full run outputs live under `~/.pi/workflows/projects/<project>/`. These managed artifacts survive temporary subagent cleanup; removing a run does not delete its child session. Older project-local `.pi/workflows/runs` data is still read as a fallback. Saved-workflow JSON is intentionally neither read nor mutated.
+Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; default subagent sessions live under `~/.pi/workflows/sessions/`; project-scoped run history, resume journals, locks, and full run outputs live under `~/.pi/workflows/projects/<project>/`. These managed artifacts survive subagent cleanup; removing a run does not delete its child session. Older project-local `.pi/workflows/runs` data is still read as a fallback. Saved-workflow JSON is intentionally neither read nor mutated.
 
 ### Tier thinking configuration
 
@@ -302,7 +302,7 @@ The essentials:
 | `fallbacks` | Ordered `{ model, thinking, optional? }` backups, mutually exclusive with `fallbackModel`. Each entry requires an exact `provider/modelId` and explicit reasoning level. `optional: true` skips an entry absent from the authenticated catalog; otherwise an unavailable backup fails before launch. |
 | `agentType` | A named definition (`.pi/agents/<name>.md`) binding a tool allow/deny policy + model + role prompt. Under `readOnly`, its allowlist is final across built-in and extension tools after read-only hard denials. |
 | `cwd` | Run this agent in a different working directory (tools + session bind to it). |
-| `forkFrom` | Fork an existing Pi session file (JSONL) as starting context. The source file is never mutated; without `sessionPath`, the fork is temporary. |
+| `forkFrom` | Fork an existing Pi session file (JSONL) as starting context. The source file is never mutated; without `sessionPath`, the fork gets a fresh path under `~/.pi/workflows/sessions/`. |
 | `sessionPath` | Persist/continue this agent's working session. Existing files are continued; missing files are created. Relative paths resolve under `~/.pi/workflows/sessions/`. Combined with `forkFrom`, the target must not already exist. |
 | `schema` | JSON Schema → the subagent returns a validated object. |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
@@ -312,7 +312,11 @@ The essentials:
 
 A live `checkpoint()` never guesses or supplies a default. The manager persists its prompt, call index, and hash, releases the run lease, and asks the parent conversation. The host `workflow({ resumeRunId: "...", reply: ... })` tool call validates the reply, journals it, and resumes the same run ID. The script executes from the top, but the unchanged completed prefix is replayed without rerunning agents or shell commands. Workflows may pause at multiple sequential checkpoints; each reply continues the same run until the next checkpoint or completion. `/workflows resume` is for paused/interrupted runs; `/workflows retry` is for runs paused by retryable agent failures. Ordinary failed runs remain terminal.
 
-Subagent sessions are temporary by default. Use `sessionPath` only when a reviewer/worker should keep context across runs; use `forkFrom` when it should start from an existing Pi conversation. Persistent-session writers are serialized across runs and processes, so a second writer waits until the current AgentSession finishes cleanup. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle applies normally.
+Every subagent session is persisted as ordinary Pi JSONL. By default, each invocation gets a fresh SDK-generated filename under `~/.pi/workflows/sessions/` (including `forkFrom`-only calls); it never continues a previous invocation implicitly.
+
+Transcripts and assistant usage remain on disk after cleanup, including completed responses before a later failure or cancellation. The SDK may defer creating the file until the first assistant response. Session consumers can enumerate that directory and read standard session headers/messages; explicit absolute paths may live elsewhere. No separate usage journal is written. Direct SDK and legacy `runWorkflow` callers can still supply a persistent `session.sessionManager`. An explicitly supplied in-memory manager is rejected before provider execution; omit it for automatic persistent storage.
+
+Use `sessionPath` when a reviewer/worker should continue the same context across runs; use `forkFrom` when it should start from an existing Pi conversation. Persistent-session writers are serialized across runs and processes, so a second writer waits until the current AgentSession finishes cleanup. Workflow subagents bind extensions headlessly, so the configured compaction/autocontinue extension lifecycle applies normally.
 
 By default, workflows do not set a per-agent hard timeout. Use the `workflow` tool's `agentTimeoutMs` or per-agent `timeoutMs` only when you want an explicit time bound. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 

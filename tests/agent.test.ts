@@ -29,6 +29,7 @@ import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { acquireSessionWriterLease } from "../src/session-writer-lease.js";
 import { runWorkflow } from "../src/workflow.js";
+import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
@@ -878,7 +879,7 @@ test("forkSessionForSubagent inherits the source context and never mutates the s
     assert.ok(sourcePath, "source session should persist to a file");
     const sourceBytes = readFileSync(sourcePath as string, "utf-8");
 
-    const { sessionManager, cleanup } = forkSessionForSubagent(sourcePath as string, root);
+    const { sessionManager, cleanup } = withFakeHome(root, () => forkSessionForSubagent(sourcePath as string, root));
     try {
       const context = sessionManager.buildSessionContext();
       const text = JSON.stringify(context.messages);
@@ -894,7 +895,10 @@ test("forkSessionForSubagent inherits the source context and never mutates the s
       const forkPath = sessionManager.getSessionFile();
       assert.ok(forkPath && forkPath !== sourcePath, "fork lives in its own file");
       cleanup();
-      assert.equal(existsSync(forkPath as string), false, "cleanup removes the fork");
+      assert.equal(existsSync(forkPath as string), true, "cleanup retains the fork");
+      assert.ok(
+        JSON.stringify(SessionManager.open(forkPath as string).buildSessionContext()).includes("subagent-only message"),
+      );
     } finally {
       cleanup();
     }
@@ -915,13 +919,26 @@ test("forkSessionForSubagent throws a recoverable WorkflowError for a missing fi
   );
 });
 
-test("resolveSubagentSession defaults to an in-memory temp session", async () => {
+test("resolveSubagentSession defaults to a persistent session", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-matrix-"));
   try {
-    const { sessionManager, cleanup } = await resolveSubagentSession({}, root);
+    const { sessionManager, cleanup } = await withFakeHomeAsync(root, () => resolveSubagentSession({}, root));
     try {
-      assert.equal(sessionManager.isPersisted(), false);
-      assert.equal(sessionManager.getSessionFile(), undefined);
+      const others = await withFakeHomeAsync(root, () =>
+        Promise.all(Array.from({ length: 8 }, () => resolveSubagentSession({}, root))),
+      );
+      assert.equal(
+        new Set(
+          [sessionManager, ...others.map((entry) => entry.sessionManager)].map((manager) => manager.getSessionFile()),
+        ).size,
+        9,
+      );
+      for (const other of others) {
+        assert.equal(other.sessionManager.buildSessionContext().messages.length, 0);
+        other.cleanup();
+      }
+      assert.equal(sessionManager.isPersisted(), true);
+      assert.ok(sessionManager.getSessionFile()?.startsWith(join(root, ".pi", "workflows", "sessions")));
     } finally {
       cleanup();
     }
