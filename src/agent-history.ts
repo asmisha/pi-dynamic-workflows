@@ -64,8 +64,7 @@ export function compactAgentHistory(messages: unknown[], options: AgentHistoryOp
     }
 
     // Extension-injected messages (pi.sendMessage) can start an extra turn whose
-    // reply is not the agent's answer. Subagent sessions are in-memory by default,
-    // so this preview is the only place that turn stays visible after the run.
+    // reply is not the agent's answer; include it in the visible history preview.
     if (role === "custom") {
       const text = textFromContent(message.content);
       if (text.trim()) {

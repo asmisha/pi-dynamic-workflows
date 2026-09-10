@@ -266,7 +266,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   cwd?: string;
   /**
    * Fork this Pi session file (JSONL) as the agent's starting context. The source
-   * file is never mutated. Without `sessionPath`, the fork is temporary.
+   * file is never mutated. Without `sessionPath`, the fork gets a fresh path in workflow storage.
    */
   forkFrom?: string;
   /**

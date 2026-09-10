@@ -1,6 +1,5 @@
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { dirname } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
   type AgentSession,
@@ -29,7 +28,7 @@ import { loadModelTierConfig, type ModelTierConfig } from "./model-tier-config.j
 import { createReadOnlyBashSession } from "./read-only-bash.js";
 import { acquireSessionWriterLease } from "./session-writer-lease.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
-import { resolveWorkflowSessionPath } from "./workflow-paths.js";
+import { resolveWorkflowSessionPath, workflowSessionsDir } from "./workflow-paths.js";
 
 /**
  * Subagents do not orchestrate by default. A nested workflow run lives outside
@@ -462,7 +461,7 @@ export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the subagent in addition to the structured output tool. */
   tools?: ToolDefinition[];
-  /** Override any createAgentSession option (model, authStorage, resourceLoader, etc.). */
+  /** Override SDK options. A supplied sessionManager must be persistent; in-memory managers are rejected. */
   session?: Partial<CreateAgentSessionOptions>;
   /** Extra system guidance prepended to every subagent task. */
   instructions?: string;
@@ -498,26 +497,15 @@ export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
 }
 
 /**
- * Fork a Pi session file into a throwaway session dir so a subagent can start
- * with the source conversation's context without ever mutating the source.
- * Returns the forked manager and a cleanup that removes the temp dir.
+ * Fork a Pi session file into persistent workflow storage without mutating the source.
  */
 export function forkSessionForSubagent(
   sessionFile: string,
   cwd: string,
 ): { sessionManager: SessionManager; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflow-session-fork-"));
-  const cleanup = () => {
-    try {
-      rmSync(dir, { recursive: true, force: true });
-    } catch {
-      // best-effort temp cleanup
-    }
-  };
   try {
-    return { sessionManager: SessionManager.forkFrom(sessionFile, cwd, dir), cleanup };
+    return { sessionManager: SessionManager.forkFrom(sessionFile, cwd, workflowSessionsDir()), cleanup: () => {} };
   } catch (error) {
-    cleanup();
     throw new WorkflowError(
       `Cannot fork session file "${sessionFile}": ${error instanceof Error ? error.message : error}`,
       WorkflowErrorCode.AGENT_EXECUTION_ERROR,
@@ -536,8 +524,8 @@ export interface SubagentSessionSpec {
 
 /**
  * Resolve the session manager for a subagent run:
- *   - neither arg          → temp in-memory session (default; nothing persisted)
- *   - forkFrom only        → fork into a throwaway temp dir (cleaned up after)
+ *   - neither arg          → new persistent session in workflow storage
+ *   - forkFrom only        → new persistent fork in workflow storage
  *   - sessionPath, exists  → continue that persisted session (appends to it)
  *   - sessionPath, new     → create a new persisted session at that exact path
  *   - both, path new       → fork forkFrom and persist the fork at sessionPath
@@ -549,16 +537,10 @@ export async function resolveSubagentSession(
   cwd: string,
   signal?: AbortSignal,
 ): Promise<{ sessionManager: SessionManager; cleanup: () => void }> {
-  const noop = () => {};
-  const target = spec.sessionPath ? resolveWorkflowSessionPath(spec.sessionPath) : undefined;
-
-  if (!spec.forkFrom && !target) {
-    return { sessionManager: SessionManager.inMemory(cwd), cleanup: noop };
-  }
-  if (spec.forkFrom && !target) {
-    return forkSessionForSubagent(spec.forkFrom, cwd);
-  }
-  if (!target) throw new Error("unreachable");
+  // Reserve the generated destination before publishing any session content so
+  // continuations of default/fork-only sessions use the same writer lease.
+  const fresh = spec.sessionPath ? undefined : SessionManager.create(cwd, workflowSessionsDir());
+  const target = spec.sessionPath ? resolveWorkflowSessionPath(spec.sessionPath) : (fresh?.getSessionFile() as string);
 
   const lease = await acquireSessionWriterLease(target, signal);
   const cleanup = () => lease.release();
@@ -586,7 +568,7 @@ export async function resolveSubagentSession(
     }
     // New persisted session at the exact requested path (the SDK's --session flow:
     // create in the parent dir, then pin the explicit file path).
-    const manager = SessionManager.create(cwd, dirname(target));
+    const manager = fresh ?? SessionManager.create(cwd, dirname(target));
     manager.setSessionFile(target);
     return { sessionManager: manager, cleanup };
   } catch (error) {
@@ -689,7 +671,7 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   /**
    * Fork this Pi session file (JSONL) so the subagent starts with that
    * conversation's full context. The source file is never mutated. Without
-   * `sessionPath` the fork lives in a throwaway temp dir; with it, the fork is
+   * `sessionPath` the fork gets a fresh path in workflow storage; with it, the fork is
    * persisted at that path.
    */
   forkFrom?: string;
@@ -942,6 +924,13 @@ export class WorkflowAgent {
     prompt: string,
     options: AgentRunOptions<TSchemaDef> = {},
   ): Promise<AgentRunResult<TSchemaDef>> {
+    if (this.sessionOptions.sessionManager && !this.sessionOptions.sessionManager.isPersisted()) {
+      throw new WorkflowError(
+        "An in-memory sessionManager is not supported. Supply a persistent SessionManager or omit it for automatic persistence.",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
     const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
     // Per-call cwd (e.g. a worktree) needs coding tools bound to that directory,
     // since tools and resource loaders capture their cwd and can't be relocated.
@@ -981,28 +970,33 @@ export class WorkflowAgent {
     // compaction, and extension settings (inMemory() would miss ~/.pi/settings.json
     // and could route to an unauthed model). Built once per run, not once per subagent.
     this.settingsManager ??= SettingsManager.create(this.cwd, agentDir);
-    // Session source/persistence matrix: temp in-memory by default; forkFrom
-    // inherits another session's context; sessionPath persists/continues one.
-    const forked = await resolveSubagentSession(
-      { forkFrom: options.forkFrom, sessionPath: options.sessionPath },
-      runCwd,
-      options.signal,
-    ).catch((error) => {
-      readOnlyBash?.cleanup();
-      throw error;
-    });
+    // A supplied persistent manager needs no unused default storage. Explicit
+    // path/fork requests retain their existing resolution and validation.
+    let sessionManager = this.sessionOptions.sessionManager;
+    let forked: Awaited<ReturnType<typeof resolveSubagentSession>> | undefined;
+    if (!sessionManager || options.forkFrom || options.sessionPath) {
+      forked = await resolveSubagentSession(
+        { forkFrom: options.forkFrom, sessionPath: options.sessionPath },
+        runCwd,
+        options.signal,
+      ).catch((error) => {
+        readOnlyBash?.cleanup();
+        throw error;
+      });
+      sessionManager ??= forked.sessionManager;
+    }
     const tierFallbackThinking =
       modelRoute.thinking !== undefined && options.fallbacks === undefined && pendingFallbacks[0]
         ? fallbackSessionThinking(
             pendingFallbacks[0].model,
             this.sessionOptions,
-            this.sessionOptions.sessionManager ?? forked.sessionManager,
+            sessionManager,
             this.sessionOptions.settingsManager ?? this.settingsManager,
           )
         : undefined;
     let restoredThinkingLevel: CreateAgentSessionOptions["thinkingLevel"];
     try {
-      if (options.restoreSessionModel) {
+      if (options.restoreSessionModel && forked) {
         const saved = forked.sessionManager.buildSessionContext();
         const savedModel = saved.model
           ? this.resolveModel(`${saved.model.provider}/${saved.model.modelId}`, options.modelRegistry)
@@ -1016,7 +1010,7 @@ export class WorkflowAgent {
       }
     } catch (error) {
       readOnlyBash?.cleanup();
-      forked.cleanup();
+      forked?.cleanup();
       throw error;
     }
     const session = await (async () => {
@@ -1025,7 +1019,6 @@ export class WorkflowAgent {
         const created = await createAgentSession({
           cwd: runCwd,
           agentDir,
-          sessionManager: forked.sessionManager,
           settingsManager: this.settingsManager,
           customTools,
           // Per-run modelRegistry wins over the constructor's shared registry, same
@@ -1034,6 +1027,8 @@ export class WorkflowAgent {
             ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
             : {}),
           ...this.sessionOptions,
+          // Session lifetime is package-owned, including for untyped Node callers.
+          sessionManager,
           // Per-call model wins over any sessionOptions.model.
           ...(resolvedModel ? { model: resolvedModel } : {}),
           // The SDK maps this level through the model's own thinking-level map
@@ -1080,7 +1075,7 @@ export class WorkflowAgent {
           }
         }
         readOnlyBash?.cleanup();
-        forked.cleanup();
+        forked?.cleanup();
         throw error;
       }
     })();

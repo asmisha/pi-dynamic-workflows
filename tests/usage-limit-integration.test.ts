@@ -9,7 +9,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -26,6 +26,7 @@ import type { AgentRegistry } from "../src/agent-registry.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import { runWorkflow } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { workflowSessionsDir } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 import { loadFaux } from "./helpers/load-faux.js";
 
@@ -1233,3 +1234,219 @@ test("an all-optional unavailable chain cannot silently use the session default"
     );
     assert.equal(deepseekCallCount(), 0);
   }));
+
+for (const entrypoint of ["direct", "legacy"] as const) {
+  test(`${entrypoint} uses supplied persistent storage without a usable default session directory`, () =>
+    withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage, deepseekCallCount }) => {
+      const sessionManager = SessionManager.create(cwd, join(cwd, "caller-sessions"));
+      sessionManager.appendMessage(fauxAssistantMessage("Saved caller context"));
+      const sessionPath = sessionManager.getSessionFile();
+      assert.ok(sessionPath);
+      // A file blocking the parent directory makes default storage unusable
+      // deterministically, even when tests run with permission to bypass chmod.
+      const blockedParent = join(workflowSessionsDir(), "..");
+      writeFileSync(blockedParent, "not a directory");
+      setResponses([fauxAssistantMessage("Persisted caller answer")]);
+      const options = { cwd, modelRegistry, session: { model: model as never, sessionManager } };
+      const answer =
+        entrypoint === "direct"
+          ? await new WorkflowAgent(options).run("task")
+          : (
+              await runWorkflow(
+                `export const meta = { name: 'caller_storage', description: 'Use supplied persistent storage' };
+return await agent('task');`,
+                { ...options, persistLogs: false },
+              )
+            ).result;
+      assert.equal(answer, "Persisted caller answer");
+      assert.equal(deepseekCallCount(), 1);
+      const messages = SessionManager.open(sessionPath).buildSessionContext().messages;
+      assert.match(JSON.stringify(messages), /Saved caller context/);
+      assert.match(JSON.stringify(messages), /Persisted caller answer/);
+      const response = messages.at(-1);
+      assert.ok(response?.role === "assistant" && response.usage.totalTokens > 0);
+      assert.equal(readFileSync(blockedParent, "utf8"), "not a directory");
+    }));
+
+  for (const populated of [false, true]) {
+    test(`${entrypoint} rejects ${populated ? "populated" : "empty"} in-memory session overrides before provider execution`, () =>
+      withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage, deepseekCallCount }) => {
+        const sessionManager = SessionManager.inMemory(cwd);
+        if (populated) {
+          sessionManager.appendMessage({ role: "user", content: "Keep my supplied context", timestamp: Date.now() });
+          sessionManager.appendMessage(fauxAssistantMessage("Prior answer"));
+          sessionManager.appendThinkingLevelChange("high");
+          sessionManager.appendModelChange("deepseek", "faux-deepseek");
+        }
+        const before = structuredClone(sessionManager.getEntries());
+        setResponses([fauxAssistantMessage("Must not execute")]);
+        const options = { cwd, modelRegistry, session: { model: model as never, sessionManager } };
+        await assert.rejects(
+          () =>
+            entrypoint === "direct"
+              ? new WorkflowAgent(options).run("task")
+              : runWorkflow(
+                  `export const meta = { name: 'memory_override', description: 'Reject ephemeral sessions' };
+return await agent('task');`,
+                  { ...options, persistLogs: false },
+                ),
+          /in-memory sessionManager.*not supported.*persistent/i,
+        );
+        assert.equal(deepseekCallCount(), 0);
+        assert.deepEqual(sessionManager.getEntries(), before, "rejection leaves supplied history and settings intact");
+        assert.equal(sessionManager.isPersisted(), false);
+      }));
+  }
+}
+
+for (const ending of ["success", "failure", "cancellation"] as const) {
+  test(`default and fork-only sessions retain completed usage after ${ending}`, () =>
+    withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage, fauxToolCall }) => {
+      let controller = new AbortController();
+      let returnedUsage: AgentUsage | undefined;
+      const completed = fauxAssistantMessage([fauxToolCall("finish", {})], { stopReason: "toolUse" });
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry,
+        session: { model: model as never },
+        tools: [
+          defineTool({
+            name: "finish",
+            description: "Controlled completion",
+            parameters: Type.Object({}),
+            async execute() {
+              if (ending === "cancellation") controller.abort();
+              return { content: [{ type: "text", text: "finished" }] };
+            },
+          }),
+        ],
+      });
+      const queue = () =>
+        setResponses([
+          completed,
+          ending === "failure"
+            ? fauxAssistantMessage("", { stopReason: "error", errorMessage: "controlled failure" })
+            : fauxAssistantMessage("done", { stopReason: "stop" }),
+        ]);
+      const paths = () =>
+        readdirSync(workflowSessionsDir())
+          .filter((p) => p.endsWith(".jsonl"))
+          .map((p) => join(workflowSessionsDir(), p));
+      const run = async (forkFrom?: string) => {
+        controller = new AbortController();
+        returnedUsage = undefined;
+        queue();
+        const promise = agent.run("synthetic persistence task", {
+          forkFrom,
+          signal: controller.signal,
+          onUsageUpdate: (usage) => {
+            returnedUsage ??= { ...usage };
+          },
+        });
+        if (ending === "success") assert.equal(await promise, "done");
+        else await assert.rejects(promise);
+      };
+      await run();
+      const [source] = paths();
+      assert.ok(source);
+      const bytes = readFileSync(source, "utf8");
+      const entries = bytes
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.equal(entries[0].cwd, cwd);
+      const response = entries.find((entry) => entry.type === "message" && entry.message.stopReason === "toolUse");
+      assert.ok(response.message.usage.input > 0);
+      assert.equal(response.message.usage.input, returnedUsage?.input);
+      assert.equal(response.message.usage.output, returnedUsage?.output);
+      assert.equal(response.message.usage.cacheRead, returnedUsage?.cacheRead);
+      assert.equal(response.message.usage.cacheWrite, returnedUsage?.cacheWrite);
+      assert.equal(response.message.usage.cost.total, returnedUsage?.cost);
+      assert.equal(response.message.provider, (model as { provider: string }).provider);
+      assert.equal(response.message.model, (model as { id: string }).id);
+      assert.ok(SessionManager.open(source).buildSessionContext().messages.length > 0);
+      {
+        await run(source);
+        const fork = paths().find((path) => path !== source);
+        assert.ok(fork);
+        assert.equal(readFileSync(source, "utf8"), bytes);
+        assert.equal(SessionManager.open(fork).getHeader()?.parentSession, source);
+        assert.equal(
+          SessionManager.open(fork)
+            .buildSessionContext()
+            .messages.filter((message) => message.role === "assistant" && message.stopReason === "toolUse").length,
+          2,
+        );
+      }
+      if (ending === "success") {
+        await run();
+        const fresh = paths().find((path) => path !== source && !SessionManager.open(path).getHeader()?.parentSession);
+        assert.ok(fresh);
+        assert.equal(
+          SessionManager.open(fresh)
+            .buildSessionContext()
+            .messages.filter((message) => message.role === "assistant" && message.stopReason === "toolUse").length,
+          1,
+        );
+      }
+    }));
+}
+
+for (const fork of [false, true]) {
+  test(`${fork ? "fork-only" : "default"} session continuation waits through original writer shutdown`, () =>
+    withFauxSession(async ({ cwd, modelRegistry, model, setResponses, deepseekCallCount, fauxAssistantMessage }) => {
+      let announceShutdown!: () => void;
+      const shutdownStarted = new Promise<void>((resolve) => {
+        announceShutdown = resolve;
+      });
+      let allowShutdown!: () => void;
+      const shutdownGate = new Promise<void>((resolve) => {
+        allowShutdown = resolve;
+      });
+      const agentDir = getAgentDir();
+      const resourceLoader = new DefaultResourceLoader({
+        cwd,
+        agentDir,
+        settingsManager: SettingsManager.create(cwd, agentDir),
+        extensionFactories: [
+          (pi) => {
+            pi.on("session_shutdown", async () => {
+              announceShutdown();
+              await shutdownGate;
+            });
+          },
+        ],
+      });
+      await resourceLoader.reload();
+      const source = SessionManager.create(cwd, join(cwd, "source"));
+      source.appendMessage(fauxAssistantMessage("inherited source"));
+      setResponses([fauxAssistantMessage("original completed answer"), fauxAssistantMessage("continued answer")]);
+      const firstAgent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never, resourceLoader } });
+      const nextAgent = new WorkflowAgent({ cwd, modelRegistry, session: { model: model as never } });
+      const sourcePath = source.getSessionFile();
+      assert.ok(sourcePath);
+      const first = firstAgent.run("original task", fork ? { forkFrom: sourcePath } : {});
+      try {
+        await shutdownStarted;
+        const [file] = readdirSync(workflowSessionsDir()).filter((path) => path.endsWith(".jsonl"));
+        assert.ok(file);
+        const sessionPath = join(workflowSessionsDir(), file);
+        const waiting = nextAgent.run("cancelled waiter", { sessionPath, signal: AbortSignal.timeout(100) });
+        await assert.rejects(waiting);
+        assert.equal(deepseekCallCount(), 1, "a waiting continuation must not call the provider during shutdown");
+        const continuation = nextAgent.run("continue", { sessionPath });
+        allowShutdown();
+        assert.equal(await first, "original completed answer");
+        assert.equal(await continuation, "continued answer");
+        const messages = SessionManager.open(sessionPath).buildSessionContext().messages;
+        const transcript = JSON.stringify(messages);
+        assert.match(transcript, /original completed answer/);
+        assert.match(transcript, /continued answer/);
+        assert.doesNotMatch(transcript, /cancelled waiter/);
+        assert.equal(deepseekCallCount(), 2);
+      } finally {
+        allowShutdown();
+        await first;
+      }
+    }));
+}
