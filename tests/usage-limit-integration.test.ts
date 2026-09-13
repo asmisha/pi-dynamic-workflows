@@ -979,6 +979,59 @@ test("excluding OM leaves native compaction and other compaction hooks working",
     }
   }));
 
+test("the workflow subagent flag is session-local and available before extension hooks", () =>
+  withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
+    const observations: Array<boolean | string | undefined> = [];
+    const agentDir = getAgentDir();
+    const sessionOptions = async () => {
+      const resourceLoader = new DefaultResourceLoader({
+        cwd,
+        agentDir,
+        settingsManager: SettingsManager.create(cwd, agentDir),
+        extensionFactories: [
+          (pi) => {
+            pi.registerFlag("pi-dynamic-workflows-subagent", { type: "boolean", default: false });
+            pi.on("session_start", () => {
+              observations.push(pi.getFlag("pi-dynamic-workflows-subagent"));
+            });
+            pi.on("input", () => {
+              observations.push(pi.getFlag("pi-dynamic-workflows-subagent"));
+              return { action: "continue" };
+            });
+          },
+        ],
+      });
+      await resourceLoader.reload();
+      return { model: model as never, resourceLoader };
+    };
+
+    // Include an absolute path outside workflow storage and its continuation:
+    // the context must not depend on where a transcript is stored.
+    const customPath = join(cwd, "custom-session.jsonl");
+    for (const options of [
+      { readOnly: true },
+      { sessionPath: customPath, allowSubagents: true },
+      { sessionPath: customPath },
+      { forkFrom: customPath },
+    ]) {
+      const agent = new WorkflowAgent({ cwd, modelRegistry, session: await sessionOptions() });
+      setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
+      assert.equal(await agent.run("do the task", options), "ok");
+    }
+    assert.deepEqual(observations, [true, true, true, true, true, true, true, true]);
+    observations.length = 0;
+
+    const { session } = await createAgentSession({ cwd, ...(await sessionOptions()) });
+    try {
+      await session.bindExtensions({});
+      setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
+      await session.prompt("normal headless session");
+      assert.deepEqual(observations, [false, false], "a normal session in the same process is not a subagent");
+    } finally {
+      session.dispose();
+    }
+  }));
+
 test("a real subagent completes the extension lifecycle it starts", () =>
   withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
     let sessionStartRan = false;
