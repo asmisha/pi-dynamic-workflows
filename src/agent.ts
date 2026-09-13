@@ -1065,6 +1065,7 @@ export class WorkflowAgent {
         }
         // Hooks only run after binding. Bind the permitted extensions headlessly
         // so their compaction/autocontinue and session_start setup still run.
+        createdSession.extensionRunner.setFlagValue("pi-dynamic-workflows-subagent", true);
         await createdSession.bindExtensions({});
         if (createdSession.model) {
           options.onModelResolved?.(
