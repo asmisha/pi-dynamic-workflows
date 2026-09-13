@@ -6,6 +6,7 @@ import {
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
+  DefaultResourceLoader,
   getAgentDir,
   type ModelRegistry,
   SessionManager,
@@ -28,6 +29,7 @@ import { loadModelTierConfig, type ModelTierConfig } from "./model-tier-config.j
 import { createReadOnlyBashSession } from "./read-only-bash.js";
 import { acquireSessionWriterLease } from "./session-writer-lease.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import { subagentResourceLoader } from "./subagent-resource-loader.js";
 import { resolveWorkflowSessionPath, workflowSessionsDir } from "./workflow-paths.js";
 
 /**
@@ -1016,7 +1018,7 @@ export class WorkflowAgent {
     const session = await (async () => {
       let createdSession: AgentSession | undefined;
       try {
-        const created = await createAgentSession({
+        const sessionOptions: CreateAgentSessionOptions = {
           cwd: runCwd,
           agentDir,
           settingsManager: this.settingsManager,
@@ -1036,7 +1038,17 @@ export class WorkflowAgent {
           ...(thinking || restoredThinkingLevel ? { thinkingLevel: thinking ?? restoredThinkingLevel } : {}),
           ...(options.readOnly ? { tools: readOnlyToolNames } : {}),
           ...(options.allowSubagents ? {} : { excludeTools: WORKFLOW_TOOL_NAMES }),
-        });
+        };
+        const loader =
+          sessionOptions.resourceLoader ??
+          new DefaultResourceLoader({
+            cwd: sessionOptions.cwd ?? sessionManager.getCwd(),
+            agentDir: sessionOptions.agentDir ?? agentDir,
+            settingsManager: sessionOptions.settingsManager,
+          });
+        if (!sessionOptions.resourceLoader) await loader.reload();
+        sessionOptions.resourceLoader = subagentResourceLoader(loader);
+        const created = await createAgentSession(sessionOptions);
         createdSession = created.session;
         // The SDK restores messages but does not journal constructor overrides
         // on an existing transcript. Persist the effective pair for continuation.
@@ -1051,10 +1063,8 @@ export class WorkflowAgent {
         if (savedRoute.thinkingLevel !== createdSession.thinkingLevel) {
           createdSession.sessionManager.appendThinkingLevelChange(createdSession.thinkingLevel);
         }
-        // createAgentSession loads configured extensions, but hooks (including
-        // compaction/autocontinue extensions and session_start tool setup) only run
-        // after binding. Bind headlessly so workflow subagents participate in the
-        // same extension lifecycle as normal sessions.
+        // Hooks only run after binding. Bind the permitted extensions headlessly
+        // so their compaction/autocontinue and session_start setup still run.
         await createdSession.bindExtensions({});
         if (createdSession.model) {
           options.onModelResolved?.(
