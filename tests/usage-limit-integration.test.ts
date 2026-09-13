@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  createAgentSession,
   DefaultResourceLoader,
   defineTool,
   getAgentDir,
@@ -24,6 +25,7 @@ import { Type } from "typebox";
 import { type AgentUsage, WorkflowAgent } from "../src/agent.js";
 import type { AgentRegistry } from "../src/agent-registry.js";
 import { WorkflowErrorCode } from "../src/errors.js";
+import { subagentResourceLoader } from "../src/subagent-resource-loader.js";
 import { runWorkflow } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowSessionsDir } from "../src/workflow-paths.js";
@@ -840,6 +842,141 @@ test("a real subagent provider turn receives the configured system prompt", () =
       new RegExp(marker),
       "the provider-facing system prompt must include the subagent's configured SYSTEM.md",
     );
+  }));
+
+for (const suppliedLoader of [false, true]) {
+  test(`subagents exclude OM without changing parent resources (supplied loader: ${suppliedLoader})`, () =>
+    withFauxSession(async ({ cwd, modelRegistry, model, setResponses, fauxAssistantMessage }) => {
+      const agentDir = getAgentDir();
+      const extensionDir = join(agentDir, "extensions");
+      mkdirSync(extensionDir);
+      // Use arbitrary filenames: OM's public commands, not its install path,
+      // identify the extension. Hooks stand in for its paid background work.
+      writeFileSync(
+        join(extensionDir, "memory.js"),
+        `export default function(pi) {
+          pi.registerCommand("om:status", { handler: async () => {} });
+          pi.registerCommand("om:view", { handler: async () => {} });
+          pi.on("agent_start", () => pi.appendEntry("fixture-om-work", {}));
+          pi.on("session_before_compact", () => ({ cancel: true }));
+        }`,
+      );
+      writeFileSync(
+        join(extensionDir, "other.js"),
+        `export default function(pi) {
+          pi.on("session_start", () => pi.appendEntry("fixture-other-start", {}));
+          pi.on("session_shutdown", () => pi.appendEntry("fixture-other-shutdown", {}));
+        }`,
+      );
+      const resourceLoader = new DefaultResourceLoader({ cwd, agentDir });
+      await resourceLoader.reload();
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry,
+        session: { model: model as never, ...(suppliedLoader ? { resourceLoader } : {}) },
+      });
+      const childPath = join(cwd, "child.jsonl");
+      const forkPath = join(cwd, "fork.jsonl");
+      for (const options of [
+        { sessionPath: childPath },
+        { sessionPath: childPath },
+        { sessionPath: forkPath, forkFrom: childPath },
+      ]) {
+        // Pi invalidates extension runtimes on disposal; a caller reusing a
+        // supplied loader must reload it before creating another session.
+        if (suppliedLoader) await resourceLoader.reload();
+        const originalExtensions = [...resourceLoader.getExtensions().extensions];
+        setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
+        assert.equal(await agent.run("do the task", options), "ok");
+        assert.deepEqual(
+          resourceLoader.getExtensions().extensions,
+          originalExtensions,
+          "the caller's extension list must not be filtered in place",
+        );
+        const entries = SessionManager.open(options.sessionPath, undefined, cwd).getEntries();
+        const customTypes = entries.filter((entry) => entry.type === "custom").map((entry) => entry.customType);
+        assert.ok(!customTypes.includes("fixture-om-work"), "OM must not run on fresh, continued, or forked children");
+        assert.ok(customTypes.includes("fixture-other-start"), "other extension startup must still run");
+        assert.ok(customTypes.includes("fixture-other-shutdown"), "other extension cleanup must still run");
+      }
+
+      // The same supplied loader still enables OM for a normal parent session.
+      // This also demonstrates that global extension configuration is untouched.
+      await resourceLoader.reload();
+      const parent = await createAgentSession({ cwd, agentDir, model: model as never, resourceLoader });
+      try {
+        await parent.session.bindExtensions({});
+        setResponses([fauxAssistantMessage("parent ok", { stopReason: "stop" })]);
+        await parent.session.prompt("parent task");
+        assert.ok(
+          parent.session.sessionManager
+            .getEntries()
+            .some((entry) => entry.type === "custom" && entry.customType === "fixture-om-work"),
+          "a normal parent must retain OM even after workflow use of its loader",
+        );
+      } finally {
+        await parent.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        parent.session.dispose();
+      }
+    }));
+}
+
+test("excluding OM leaves native compaction and other compaction hooks working", () =>
+  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+    const agentDir = getAgentDir();
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true, keepRecentTokens: 100 } });
+    let otherCompactionHookRan = false;
+    const loader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager,
+      extensionFactories: [
+        (pi) => {
+          pi.registerCommand("om:status", { handler: async () => {} });
+          pi.registerCommand("om:view", { handler: async () => {} });
+          pi.on("session_before_compact", () => ({ cancel: true }));
+        },
+        (pi) => {
+          pi.on("session_before_compact", () => {
+            otherCompactionHookRan = true;
+          });
+        },
+      ],
+    });
+    await loader.reload();
+    const sessionManager = SessionManager.create(cwd, join(cwd, "native-compaction"));
+    for (let i = 0; i < 3; i++) {
+      sessionManager.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "earlier task context ".repeat(100) }],
+        timestamp: Date.now(),
+      });
+      sessionManager.appendMessage(fauxAssistantMessage("earlier answer ".repeat(100)));
+    }
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir,
+      model: model as never,
+      settingsManager,
+      sessionManager,
+      resourceLoader: subagentResourceLoader(loader),
+    });
+    try {
+      await session.bindExtensions({});
+      setResponses([
+        fauxAssistantMessage("native summary", { stopReason: "stop" }),
+        fauxAssistantMessage("retained turn summary", { stopReason: "stop" }),
+      ]);
+      const result = await session.compact();
+      assert.ok(result.summary.includes("native summary"));
+      assert.equal(otherCompactionHookRan, true);
+      const compaction = sessionManager.getEntries().find((entry) => entry.type === "compaction");
+      assert.ok(compaction, "the native compaction must be persisted");
+      assert.equal(compaction.fromHook, false, "the summary must come from Pi, not the excluded OM hook");
+    } finally {
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+    }
   }));
 
 test("a real subagent completes the extension lifecycle it starts", () =>
