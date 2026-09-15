@@ -1,18 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import {
-  cpSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { join, relative, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -27,16 +17,6 @@ function copyPackageSource(destination: string): void {
       return !COPY_EXCLUSIONS.has(topLevel);
     },
   });
-}
-
-function linkHostPeer(packagePath: string, specifier: string): void {
-  const segments = specifier.split("/");
-  const source = join(REPOSITORY_ROOT, "node_modules", ...segments);
-  const destination = join(packagePath, "node_modules", ...segments);
-  assert.ok(existsSync(source), `test host peer is installed: ${specifier}`);
-  if (existsSync(destination)) return;
-  mkdirSync(dirname(destination), { recursive: true });
-  symlinkSync(source, destination, process.platform === "win32" ? "junction" : "dir");
 }
 
 function childFailure(result: ReturnType<typeof spawnSync>): string {
@@ -94,7 +74,20 @@ test("source-only production and packed installs expose the awaited Node API to 
     writeFileSync(join(consumerPath, "package.json"), JSON.stringify({ private: true, type: "module" }));
     const consumerInstall = spawnSync(
       process.platform === "win32" ? "npm.cmd" : "npm",
-      ["install", "--omit=dev", "--cache", npmCache, "--legacy-peer-deps", "--no-audit", "--no-fund", packageArchive],
+      [
+        "install",
+        "--omit=dev",
+        "--cache",
+        npmCache,
+        "--no-audit",
+        "--no-fund",
+        packageArchive,
+        "@earendil-works/pi-coding-agent@0.85.0",
+        "@earendil-works/pi-tui@0.85.0",
+        // SDK 0.85.0 imports this undeclared dependency even under native Node ESM.
+        "@earendil-works/pi-server@0.85.0",
+        "typebox@1.3.19",
+      ],
       {
         cwd: consumerPath,
         encoding: "utf8",
@@ -108,9 +101,8 @@ test("source-only production and packed installs expose the awaited Node API to 
     const installedPackage = join(consumerPath, "node_modules", "@quintinshaw", "pi-dynamic-workflows");
     assert.equal(existsSync(join(installedPackage, "dist")), false, "the packed source install has no dist");
 
-    // Pi and embedded hosts supply these peers. Link this checkout's installed peers so the smoke test stays offline.
-    for (const peer of ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"]) {
-      linkHostPeer(consumerPath, peer);
+    for (const devTool of ["typescript", "@biomejs/biome"]) {
+      assert.equal(existsSync(join(consumerPath, "node_modules", devTool)), false, `${devTool} is not needed`);
     }
 
     mkdirSync(projectPath, { recursive: true });
@@ -120,7 +112,10 @@ test("source-only production and packed installs expose the awaited Node API to 
 
     writeFileSync(
       join(projectPath, "finish.mjs"),
-      `export function finish(args, cwd) {
+      `import { createRequire } from 'node:module'
+const fs = createRequire(import.meta.url)('fs')
+export function finish(args, cwd) {
+  if (!fs.existsSync(cwd)) throw new Error('builtin fs unavailable')
   return { imported: 'relative-helper', value: args.value, cwd }
 }
 `,
@@ -145,6 +140,11 @@ export async function run({ args, cwd }) {
 import { runWorkflow } from '@quintinshaw/pi-dynamic-workflows/node-api'
 
 const [mode, projectPath, outputPath] = process.argv.slice(2)
+const legacy = await runWorkflow(
+  'export const meta = { name: "legacy", description: "Retained low-level API" }; return args.value',
+  { args: { value: 'legacy-result' }, persistLogs: false },
+)
+if (legacy.result !== 'legacy-result') throw new Error('low-level signature lost')
 if (mode === 'failure') {
   const completed = await runWorkflow({
     scriptPath: './workflow.mjs',

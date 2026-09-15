@@ -40,7 +40,7 @@ npm install \
   @earendil-works/pi-coding-agent @earendil-works/pi-tui typebox
 ```
 
-Import the stable one-shot API through the public `node-api` subpath. It is a plain-JavaScript entrypoint that loads the package's shipped TypeScript through its own `tsx` runtime dependency. The caller runs plain `node`: it does not need a TypeScript loader, a build step, or knowledge of the package's `src/` layout. Loading is anchored to the installed package, not the calling process's current directory.
+Import the stable one-shot API through the public `node-api` subpath. It is a plain-JavaScript entrypoint that loads the package's shipped TypeScript through its own local asynchronous `jiti` runtime loader. The caller runs plain `node`: it does not need a TypeScript loader, a build step, or knowledge of the package's `src/` layout. Loading is anchored to the installed package, not the calling process's current directory.
 
 The object form of `runWorkflow` loads Pi's agent directory, settings, model catalog, and authentication, then waits for the workflow's real terminal `WorkflowRunResult`:
 
