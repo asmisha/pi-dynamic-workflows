@@ -1,8 +1,6 @@
-import { tsImport } from "tsx/esm/api";
+import { createJiti } from "jiti";
 
-const { runWorkflow } = await tsImport("./src/node-api.ts", {
-  parentURL: import.meta.url,
-  tsconfig: false,
-});
+const jiti = createJiti(import.meta.url, { moduleCache: false });
+const { runWorkflow } = await jiti.import("./src/node-api.ts");
 
 export { runWorkflow };

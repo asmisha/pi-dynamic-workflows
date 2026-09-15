@@ -1,7 +1,7 @@
 {
   "name": "@quintinshaw/pi-dynamic-workflows",
   "version": "2.10.0",
-  "description": "Claude-Code-style dynamic workflows for Pi — fan a task out across 100s of subagents with real model routing, token/cost accounting, resume, and an interactive /workflows TUI.",
+  "description": "Claude-Code-style dynamic workflows for Pi \u2014 fan a task out across 100s of subagents with real model routing, token/cost accounting, resume, and an interactive /workflows TUI.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -68,7 +68,7 @@
   "license": "MIT",
   "dependencies": {
     "acorn": "^8.16.0",
-    "tsx": "^4.23.13"
+    "jiti": "^2.7.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.82.0",
@@ -82,6 +82,7 @@
     "@earendil-works/pi-server": "0.85.0",
     "@earendil-works/pi-tui": "0.85.0",
     "typebox": "latest",
-    "typescript": "latest"
+    "typescript": "latest",
+    "tsx": "^4.23.13"
   }
 }
