@@ -1342,7 +1342,7 @@ export class WorkflowManager extends EventEmitter {
         errorCount: 0,
       },
       controller: new AbortController(),
-      startedAt: new Date(),
+      startedAt: new Date(persisted.startedAt),
       script: persisted.script,
       workflowModulePath: persisted.workflowModulePath,
       args: persisted.args,

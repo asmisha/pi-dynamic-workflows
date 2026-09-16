@@ -126,6 +126,14 @@ function savePausedRun(manager: WorkflowManager, runId: string, sessionId?: stri
   });
 }
 
+function backdateRun(manager: WorkflowManager, runId: string): string {
+  const persisted = manager.getPersistence().load(runId);
+  assert.ok(persisted);
+  const startedAt = "2020-01-01T00:00:00.000Z";
+  manager.getPersistence().save({ ...persisted, startedAt });
+  return startedAt;
+}
+
 /** Run each manager test with isolated cwd and HOME so workflow state is isolated. */
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
@@ -695,6 +703,7 @@ test(
       1,
     );
 
+    const originalStartedAt = backdateRun(manager, paused.runId);
     assert.equal(await manager.retry(paused.runId), true);
     assert.equal(
       manager
@@ -712,6 +721,7 @@ test(
 
     assert.deepEqual(calls, { writer: 1, good: 1, bad: 2, synth: 1 });
     assert.equal(completed.runId, paused.runId);
+    assert.equal(completed.startedAt, originalStartedAt);
     assert.deepEqual(completed.result, { writer: "draft", reviews: ["good", { ok: true }], synth: "final" });
     assert.equal(completed.journal?.find((entry) => entry.label === "bad")?.attempt, 2);
   }),
@@ -3357,9 +3367,12 @@ test(
     assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
+    const originalStartedAt = backdateRun(manager, runId);
+
     // First resume should succeed
     const firstResume = await manager.resume(runId);
     assert.equal(firstResume, true, "first resume should succeed");
+    assert.equal(manager.getRun(runId)?.startedAt.toISOString(), originalStartedAt);
 
     // The resumed run is now running; second resume should return false
     const secondResume = await manager.resume(runId);
@@ -3834,6 +3847,7 @@ return { before, reply, after }`;
       manager.setSessionId("checkpoint-session-b");
       assert.equal(await manager.resumeWithReply(runId, "accept"), false, "another parent session cannot reply");
       manager.setSessionId("checkpoint-session-a");
+      const originalStartedAt = backdateRun(manager, runId);
       const originalSave = manager.getPersistence().save;
       manager.getPersistence().save = () => {
         throw new Error("reply save failed");
@@ -3868,6 +3882,7 @@ return { before, reply, after }`;
       assert.equal(result.after, "ran:after:accept");
       assert.equal(calls, 2, "the completed pre-checkpoint agent is replayed rather than rerun");
       const final = manager.getPersistence().load(runId);
+      assert.equal(final?.startedAt, originalStartedAt);
       assert.equal(final?.pendingCheckpoint, undefined);
       assert.equal(final?.pauseReason, undefined);
       assert.ok((final?.tokenUsage?.total ?? 0) > usageBeforeReply, "resumed usage includes the pre-checkpoint total");
