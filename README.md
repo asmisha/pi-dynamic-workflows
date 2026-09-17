@@ -23,6 +23,24 @@ pi install npm:@quintinshaw/pi-dynamic-workflows
 
 Then `/reload` in Pi. You get the `workflow` tool plus the `/workflows` management commands.
 
+### Launch directly from another extension's command
+
+The `workflow:run` event starts a workflow through the current session's existing workflow tool and manager, without prompting the parent agent. Pass the normal workflow-tool arguments and the command context. The listener synchronously supplies the start promise through `respond`; an absent response means the workflow extension is not loaded or needs updating.
+
+```ts
+let started: Promise<{ details: { runId: string } }> | undefined;
+pi.events.emit("workflow:run", {
+  params: { scriptPath: "/absolute/path/workflow.mjs", args: { topic: "example" } },
+  ctx,
+  respond: (result: typeof started) => { started = result; },
+});
+if (!started) throw new Error("Workflow command launching is unavailable");
+const { details: { runId } } = await started;
+ctx.ui.notify(`Started ${runId}`, "info");
+```
+
+This uses the same argument preparation, session scope, model registry, task panel, controls, persistence, and terminal delivery as a normal workflow-tool call. The promise resolves when the run starts, not when it finishes; launch errors reject it. It adds no launch message or parent-agent turn.
+
 ### Use from Node
 
 For a Node ESM application, install the library and its Pi SDK peers:

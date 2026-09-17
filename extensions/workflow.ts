@@ -22,6 +22,22 @@ export default function extension(pi: ExtensionAPI) {
   const manager = new WorkflowManager();
 
   const workflowTool = createWorkflowTool({ manager });
+  // Commands can launch through this session's existing tool/manager without
+  // sending a message to the agent. Respond synchronously with the start promise.
+  pi.events.on("workflow:run", (data) => {
+    const request = data as {
+      params: Parameters<typeof workflowTool.execute>[1];
+      ctx: ExtensionContext;
+      respond: (result: ReturnType<typeof workflowTool.execute>) => void;
+    };
+    request.respond(
+      (async () => {
+        // biome-ignore lint/style/noNonNullAssertion: createWorkflowTool always supplies argument preparation.
+        const params = workflowTool.prepareArguments!(request.params);
+        return workflowTool.execute("workflow-command", params, undefined, undefined, request.ctx);
+      })(),
+    );
+  });
   const workflowStatusTool = createWorkflowStatusTool(manager);
   const workflowPauseTool = createWorkflowPauseTool(manager);
   const workflowResumeTool = createWorkflowResumeTool(manager);
