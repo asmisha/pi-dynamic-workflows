@@ -221,7 +221,7 @@ export async function audit({ agent, checkpoint }, target) {
 }
 ```
 
-Pass `workflow.mjs` through `scriptPath`. The exported `run(context)` receives the same `agent`, `parallel`, `pipeline`, `phase`, `bash`, `checkpoint`, `log`, `args`, `cwd`, and `runId` APIs available as globals in inline workflows. Native modules execute as trusted Node.js code; keep the entry and imported source files unchanged while a run remains resumable.
+Pass `workflow.mjs` through `scriptPath`. The exported `run(context)` receives the same `agent`, `parallel`, `pipeline`, `phase`, `bash`, `checkpoint`, `setCompletionNotification`, `log`, `args`, `cwd`, and `runId` APIs available as globals in inline workflows. Native modules execute as trusted Node.js code; keep the entry and imported source files unchanged while a run remains resumable.
 
 ## Highlights
 
@@ -264,7 +264,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows-models           map the small / medium / big tiers to real models
 ```
 
-Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, `workflow_resume`, `workflow_retry`, and `workflow_stop` tools; the slash commands remain available for manual control. `workflow_status` is for one-off checks only — the tool contract tells the model never to poll it or `sleep` while waiting, because completion, failure, and checkpoint delivery wakes the conversation on its own. A background completion notification stays one line and points to `<runId>.stdout`, which contains the complete untruncated workflow return value.
+Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, `workflow_resume`, `workflow_retry`, and `workflow_stop` tools; the slash commands remain available for manual control. `workflow_status` is for one-off checks only — the tool contract tells the model never to poll it or `sleep` while waiting, because notifications are delivered automatically. Completion wakes the conversation by default; a workflow can choose silent completion delivery. Failures and checkpoint pauses still wake it. A background completion notification stays one line and points to `<runId>.stdout`, which contains the complete untruncated workflow return value.
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `d` remove · `r` restart · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
@@ -300,6 +300,17 @@ legacy string routes retain their pre-upgrade journal identities.
 
 ## Reference
 
+Completion delivery can depend on the workflow's results, not just its launch configuration:
+
+```js
+export const meta = { name: 'background_check', description: 'Check without interrupting unless needed' }
+const result = await agent('Check for issues. Reply exactly "clear" if there are none.')
+setCompletionNotification(result === 'clear' ? 'silent' : 'wake')
+return result
+```
+
+Make result-dependent notification decisions after parallel work joins. Resume and retry reconstruct the choice by replaying workflow code; completed delivery policy is stored in the durable notification outbox. Existing conversation-fork delivery stays silent and branch-affine.
+
 The essentials:
 
 | Global | What it does |
@@ -309,6 +320,7 @@ The essentials:
 | `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`; branch errors reject the pipeline unless caught inside that branch/stage. Do not catch only the aggregate while continuing with more workflow work. |
 | `bash(cmd, { cwd?, timeoutMs? })` | Run a shell command; returns `{ pid, exitCode, stdoutFile, stderrFile }`. Full stdout/stderr are written to those files and journaled like `agent()`, so resume replays paths without re-running. Pass file paths to `agent()` for analysis. |
 | `phase(title)` | Group agents in the live view. |
+| `setCompletionNotification(mode)` | Choose `"wake"` (default) or `"silent"` from running workflow code. Silent completion appends the usual result message when the parent is idle without starting a turn. The last call wins; failures and checkpoint pauses are unaffected. |
 | `runId` | This run's id — the one naming its persisted state, log, and bash artifacts. Assigned once and unchanged by resume/retry, so use it (never an id invented in the script, which would change on replay and break journal identity) when a run needs its own artifact or `sessionPath` values. |
 | `checkpoint(question)` | Always pauses the run and transfers a durable question to the parent conversation. Continue the same run with the host `workflow({ resumeRunId, reply })` tool call; completed steps replay from the journal. |
 | Agent option | Description |

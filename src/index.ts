@@ -60,6 +60,7 @@ export { createStructuredOutputTool } from "./structured-output.js";
 export { installTaskPanel, type TaskPanelOptions } from "./task-panel.js";
 export type {
   AgentOptions,
+  CompletionNotificationMode,
   JournalEntry,
   SharedRuntime,
   WorkflowBashResult,

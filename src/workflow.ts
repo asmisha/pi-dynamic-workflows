@@ -190,9 +190,13 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   }) => void;
 }
 
+export type CompletionNotificationMode = "wake" | "silent";
+
 export interface WorkflowRunResult<T = unknown> {
   meta: WorkflowMeta;
   result: T;
+  /** Successful completion delivery policy. Omitted on legacy results; defaults to wake. */
+  completionNotification?: CompletionNotificationMode;
   logs: string[];
   phases: string[];
   agentCount: number;
@@ -299,6 +303,8 @@ export interface WorkflowRuntimeContext {
     ...stages: Array<(previous: unknown, original: unknown, index: number) => unknown>
   ) => Promise<unknown[]>;
   checkpoint: (question: string) => unknown;
+  /** Choose successful completion delivery at runtime. Default: wake; last call wins. */
+  setCompletionNotification: (mode: CompletionNotificationMode) => void;
   log: (message: string) => void;
   phase: (title: string) => void;
   args: unknown;
@@ -1121,12 +1127,22 @@ export async function runWorkflow<T = unknown>(
     });
   };
 
+  let completionNotification: CompletionNotificationMode = "wake";
+  const setCompletionNotification = (mode: CompletionNotificationMode): void => {
+    throwIfAborted();
+    if (mode !== "wake" && mode !== "silent") {
+      throw new TypeError('setCompletionNotification() requires "wake" or "silent"');
+    }
+    completionNotification = mode;
+  };
+
   const workflowContext: WorkflowRuntimeContext = Object.freeze({
     agent,
     bash,
     parallel,
     pipeline,
     checkpoint,
+    setCompletionNotification,
     log,
     phase,
     args: options.args,
@@ -1177,6 +1193,7 @@ export async function runWorkflow<T = unknown>(
   return {
     meta,
     result: result as T,
+    completionNotification,
     logs: state.logs,
     phases: state.phases,
     agentCount: shared.agentCount,

@@ -22,10 +22,10 @@ import { loadWorkflowSettings } from "./workflow-settings.js";
 export const WORKFLOW_CONTRACT = [
   "Use it for decomposable work — repo inspection, independent checks, multi-perspective review, fan-out/fan-in synthesis — or when the user or a skill asks for it; not for a single quick read/edit.",
   "An inline script is plain deterministic sandboxed JavaScript: no Markdown fences, prose, TypeScript, import/require, filesystem or network APIs, Date.now(), new Date(), or Math.random(). `export const meta = { name, description, phases? }` must be its first statement, and it must call agent() at least once.",
-  "Inline globals, also available as fields of a native run(context): agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), bash(cmd, opts), checkpoint(question), log, args, cwd, runId. Use runId, never an invented id, when a run needs its own artifact or session paths.",
+  "Inline globals, also available as fields of a native run(context): agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), bash(cmd, opts), checkpoint(question), setCompletionNotification(mode), log, args, cwd, runId. Use runId, never an invented id, when a run needs its own artifact or session paths.",
   "Subagents inherit no parent context: every prompt must carry its own task, paths, and expected output. Set opts.readOnly = true for reviewers and searchers, and opts.retryable = false for any agent that can duplicate side effects. Subagents cannot launch nested workflow runs unless the call sets opts.allowSubagents = true.",
   "parallel() and pipeline() reject on branch failure: for best effort catch inside the branch, never on the aggregate. bash() returns {pid, exitCode, stdoutFile, stderrFile}; pass those paths to agents instead of pasting output through results.",
-  "Runs always execute in the background — the call returns a run ID, and every completion, failure, and checkpoint is delivered back into this conversation and wakes you automatically. Never wait for a run: no workflow_status polling, no sleep, no idle turns. Do other useful work or end the turn.",
+  'Runs always execute in the background — the call returns a run ID. Completion wakes you automatically by default; workflow code can call setCompletionNotification("silent") to append the completion message when the parent is idle without starting a turn, or "wake" to restore the default. The last call wins; make result-dependent decisions after parallel work joins. Failures and checkpoint pauses still wake you. Never wait for a run: no workflow_status polling, no sleep, no idle turns. Do other useful work or end the turn.',
 ];
 
 /**
@@ -157,7 +157,7 @@ export function createWorkflowStatusTool(
     description:
       "Get the current status and compact progress of a workflow run in the current session. " +
       "Use it for a one-off state check, e.g. when the user asks how a run is doing — not to wait for a run: " +
-      "completion, failure, and checkpoint pauses all wake this conversation on their own.",
+      "completion wakes this conversation unless the workflow selects silent delivery; failures and checkpoint pauses still wake it.",
     promptSnippet: "Inspect a workflow run's current status, phase, agent counts, token usage, and terminal error.",
     promptGuidelines: [
       "Pass the exact runId returned by the workflow tool.",
@@ -443,7 +443,7 @@ function resolveWorkflowToolDefaults(
 /**
  * The tool result returned when a workflow starts in the background. It both
  * informs the model and tells it to reassure the user: the run continues on its
- * own and the conversation will resume automatically when it finishes, so the
+ * own (with optional silent completion delivery), so the
  * user can just wait here (or go do something else).
  *
  * Facts and commands only. Conduct — not polling, what to tell the user —

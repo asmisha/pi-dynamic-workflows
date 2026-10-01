@@ -1047,7 +1047,11 @@ export class WorkflowManager extends EventEmitter {
       status,
       managed.sessionId,
       deliveryContent,
-      conversation ? { deliveryMode: "no-trigger", parentLeafId: conversation.parentLeafId } : {},
+      conversation
+        ? { deliveryMode: "no-trigger", parentLeafId: conversation.parentLeafId }
+        : status === "completed" && managed.result?.completionNotification === "silent"
+          ? { deliveryMode: "no-trigger" }
+          : {},
     );
     return terminalDeliveryId(managed.runId, status);
   }
