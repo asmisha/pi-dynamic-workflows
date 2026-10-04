@@ -258,7 +258,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   retries?: number;
   /** Whether automatic and durable failure recovery may rerun this agent. Defaults to true. */
   retryable?: boolean;
-  /** Exclude code-writing tools and default this call to one automatic recoverable retry. */
+  /** Restrict tools and Bash filesystem writes (see WORKFLOW_CONTRACT); default to at least one recoverable retry. */
   readOnly?: boolean;
   /**
    * Allow this agent to launch nested workflow runs. The workflow orchestration
