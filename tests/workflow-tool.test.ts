@@ -785,6 +785,22 @@ test("createWorkflowTool prepareArguments accepts only run ID and reply for cont
   );
 });
 
+test("createWorkflowTool prepareArguments treats null optional fields as omitted", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as (args: unknown) => Record<string, unknown>;
+  const script = "export const meta = { name: 't', description: 't' }";
+  const unused = { cwd: null, agentRetries: null, agentTimeoutMs: null };
+
+  assert.deepEqual(prepare({ script, scriptPath: null, resumeRunId: null, reply: null, ...unused, args: null }), {
+    script,
+    args: null,
+  });
+  assert.deepEqual(prepare({ resumeRunId: "run-1", reply: "accept", script: null, scriptPath: null, ...unused }), {
+    resumeRunId: "run-1",
+    reply: "accept",
+  });
+});
+
 test("scriptPath rejects files above the workflow source size limit", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "workflow-tool-large-source-"));
   try {
