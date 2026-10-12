@@ -466,9 +466,9 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
   if (!args || typeof args !== "object") {
     throw new Error("workflow requires an object argument");
   }
-  // Models send null for optional arguments they don't use, and Pi drops such
-  // nulls only after prepareArguments runs. `args` accepts any JSON value, so
-  // Pi passes its null through, and so does this.
+  // Models may send null for optional arguments they don't use. Pi removes those
+  // nulls, but only after prepareArguments runs, so remove them here first.
+  // `args` accepts any JSON value, so Pi keeps `args: null`, and so does this.
   const value = Object.fromEntries(
     Object.entries(args).filter(([field, fieldValue]) => fieldValue !== null || field === "args"),
   );
