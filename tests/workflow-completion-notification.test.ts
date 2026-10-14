@@ -94,6 +94,29 @@ for (const { name, body, expected } of [
     }));
 }
 
+test("a bash-only run with no agents wakes the parent on completion", () =>
+  withState(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        run: async () => {
+          throw new Error("no agent should run");
+        },
+      },
+    });
+    const host = deliveryHost(manager, cwd);
+    const { runId, promise } = manager.startInBackground(
+      `${meta}\nconst waited = await bash('echo ready')\nreturn waited.exitCode`,
+    );
+    const result = await promise;
+    assert.equal(result.agentCount, 0);
+    assert.equal(result.result, 0);
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    assert.equal(host.sent.length, 1);
+    assert.deepEqual(host.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
+    assert.match(String(host.sent[0].content), /finished \(0 agents/);
+  }));
+
 test("silent delivery stays pending while busy and survives manager restart", () =>
   withState(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: { run: async () => "clear" } });
