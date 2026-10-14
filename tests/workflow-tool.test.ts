@@ -46,7 +46,7 @@ test("backgroundStartedText carries only facts and commands", () => {
 test("WORKFLOW_CONTRACT forbids polling or sleeping to await a background run", () => {
   const contract = WORKFLOW_CONTRACT.join(" ");
   assert.match(contract, /wakes you automatically/i);
-  assert.match(contract, /never wait for a run/i);
+  assert.match(contract, /never wait in the foreground, whether for a run/i);
   assert.match(contract, /no workflow_status polling/i);
   assert.match(contract, /no sleep/i);
 });
