@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
 import {
@@ -908,8 +909,8 @@ test("createWorkflowTool parses stringified JSON args into the value scripts exp
   const script = "export const meta = { name: 't', description: 't' }";
 
   assert.deepEqual(prepare({ script, args: '{"task":"review","n":1}' }).args, { task: "review", n: 1 });
-  assert.deepEqual(prepare({ script, args: "[1, 2]" }).args, [1, 2]);
-  // A plain string stays a string, and so does unparseable JSON.
+  // Anything but a JSON object stays verbatim for schema validation to reject.
+  assert.equal(prepare({ script, args: "[1, 2]" }).args, "[1, 2]");
   assert.equal(prepare({ script, args: "hello" }).args, "hello");
   assert.equal(prepare({ script, args: "{oops" }).args, "{oops");
   assert.deepEqual(prepare({ script, args: { task: "review" } }).args, { task: "review" });
@@ -917,6 +918,20 @@ test("createWorkflowTool parses stringified JSON args into the value scripts exp
 
   const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
   assert.match(parameters.properties?.args?.description ?? "", /not stringified JSON/);
+});
+
+test("workflow tool schema accepts an args object with any fields and rejects other args shapes", () => {
+  const tool = createWorkflowTool();
+  const script = "export const meta = { name: 't', description: 't' }";
+  const validate = (args: unknown) => () =>
+    validateToolArguments(tool as any, { type: "toolCall", id: "c", name: "workflow", arguments: { script, args } });
+
+  assert.doesNotThrow(validate({ name: "RVR-1", ticket: { id: "RVR-1" } }));
+  assert.doesNotThrow(validate({ task: "review" }));
+  assert.throws(validate("hello"));
+  assert.throws(validate([1, 2]));
+  assert.throws(validate({ name: { label: "x" } }));
+  assert.throws(validate({ name: "x".repeat(81) }));
 });
 
 test("createWorkflowTool rejects removed run limits and budgets", () => {
