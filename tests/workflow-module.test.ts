@@ -77,6 +77,43 @@ export async function run(context) {
   }
 });
 
+test("scriptPath module runLabel names the run unless args.name is given", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-native-label-"));
+  const home = mkdtempSync(join(tmpdir(), "workflow-native-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const scriptPath = join(cwd, "workflow.mjs");
+      writeFileSync(
+        scriptPath,
+        `export const meta = { name: 'labelled', description: 'labelled workflow' }
+export const runLabel = (args) => args.ticket.id
+export async function run({ agent }) { return await agent('go') }
+`,
+      );
+      const manager = new WorkflowManager({ cwd, agent: { run: async () => "ok" } });
+      const names: string[] = [];
+      for (const args of [{ ticket: { id: "RVR-7" } }, { ticket: { id: "RVR-7" }, name: "explicit" }]) {
+        const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
+        const result = await executeTool(manager, cwd)(
+          "label",
+          { scriptPath, cwd, args },
+          new AbortController().signal,
+          () => {},
+          {
+            hasUI: false,
+          },
+        );
+        await completed;
+        names.push(manager.getRun(result.details.runId)?.snapshot.name ?? "");
+      }
+      assert.deepEqual(names, ["labelled: RVR-7", "labelled: explicit"]);
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("awaited checkpoint in an imported native module replays its answer after manager restart", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "workflow-native-checkpoint-"));
   const home = mkdtempSync(join(tmpdir(), "workflow-native-home-"));
@@ -217,6 +254,11 @@ test("scriptPath requires native ESM meta and run exports", async () => {
     for (const [name, source, message] of [
       ["missing-meta", "export async function run() {}", /export.*meta/i],
       ["missing-run", "export const meta = { name: 'missing_run', description: 'missing run' }", /export.*run/i],
+      [
+        "bad-run-label",
+        "export const meta = { name: 'bad_label', description: 'bad label' }\nexport const runLabel = 'x'\nexport function run() {}",
+        /runLabel.*function/,
+      ],
     ] as const) {
       const scriptPath = join(cwd, `${name}.mjs`);
       writeFileSync(scriptPath, source);

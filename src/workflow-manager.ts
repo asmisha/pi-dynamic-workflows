@@ -47,15 +47,16 @@ import {
 import { resolveWorkflowSessionPath } from "./workflow-paths.js";
 
 /**
- * Display name for a run: meta.name plus the launcher-supplied `args.name`
- * label, so two runs of the same workflow script are distinguishable in run
- * listings. Resumes inherit the persisted name and stay consistent.
+ * Display name for a run: meta.name plus a label, so two runs of the same
+ * workflow script are distinguishable in run listings. The label is the
+ * launcher-supplied `args.name`, else the module's `runLabel(args)`.
+ * Resumes inherit the persisted name and stay consistent.
  */
-function runDisplayName(metaName: string, args: unknown): string {
-  const label =
-    args && typeof args === "object" && !Array.isArray(args) && typeof (args as { name?: unknown }).name === "string"
-      ? (args as { name: string }).name.trim().slice(0, 80)
-      : "";
+function runDisplayName(metaName: string, args: unknown, runLabel?: (args: unknown) => unknown): string {
+  const named =
+    args && typeof args === "object" && !Array.isArray(args) ? (args as { name?: unknown }).name : undefined;
+  const raw = typeof named === "string" && named.trim() ? named : runLabel?.(args);
+  const label = typeof raw === "string" ? raw.trim().slice(0, 80) : "";
   return label ? `${metaName}: ${label}` : metaName;
 }
 
@@ -503,7 +504,7 @@ export class WorkflowManager extends EventEmitter {
       runId,
       status: "running",
       snapshot: {
-        name: runDisplayName(parsed.meta.name, args),
+        name: runDisplayName(parsed.meta.name, args, exec.workflowModule?.runLabel),
         description: parsed.meta.description,
         phases: parsed.meta.phases?.map((p) => p.title) ?? [],
         logs: [],
