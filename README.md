@@ -221,7 +221,7 @@ export async function audit({ agent, checkpoint }, target) {
 }
 ```
 
-Pass `workflow.mjs` through `scriptPath`. The exported `run(context)` receives the same `agent`, `parallel`, `pipeline`, `phase`, `bash`, `checkpoint`, `setCompletionNotification`, `log`, `args`, `cwd`, and `runId` APIs available as globals in inline workflows. Native modules execute as trusted Node.js code; keep the entry and imported source files unchanged while a run remains resumable.
+Pass `workflow.mjs` through `scriptPath`. The exported `run(context)` receives the same `agent`, `parallel`, `pipeline`, `phase`, `bash`, `checkpoint`, `setCompletionNotification`, `log`, `args`, `cwd`, and `runId` APIs available as globals in inline workflows. A module may also export `runLabel(args)`, returning the label shown after `meta.name` in run listings when the launch passes no `args.name`. Native modules execute as trusted Node.js code; keep the entry and imported source files unchanged while a run remains resumable.
 
 ## Highlights
 

@@ -321,6 +321,8 @@ export interface WorkflowRuntimeContext {
 export interface WorkflowModuleDefinition {
   meta: WorkflowMeta;
   run: (context: WorkflowRuntimeContext) => unknown | Promise<unknown>;
+  /** Optional `runLabel(args)` export naming a run from its launch args when `args.name` is absent. */
+  runLabel?: (args: unknown) => unknown;
 }
 
 /** Persisted identity of the checkpoint currently awaiting a parent-chat reply. */
@@ -1298,10 +1300,14 @@ export async function loadWorkflowModule(modulePath: string): Promise<WorkflowMo
   if (typeof loaded.run !== "function") {
     throw new Error(`Workflow module ${modulePath} must export function \`run(context)\``);
   }
+  if (loaded.runLabel !== undefined && typeof loaded.runLabel !== "function") {
+    throw new Error(`Workflow module ${modulePath} export \`runLabel\` must be a function of args`);
+  }
 
   return {
     meta: loaded.meta,
     run: loaded.run as WorkflowModuleDefinition["run"],
+    ...(loaded.runLabel ? { runLabel: loaded.runLabel as WorkflowModuleDefinition["runLabel"] } : {}),
   };
 }
 
