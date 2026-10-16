@@ -104,10 +104,22 @@ const workflowToolSchema = Type.Object({
     }),
   ),
   args: Type.Optional(
-    Type.Any({
-      description:
-        "Optional JSON object exposed to the workflow script as global `args`. Pass an object, not stringified JSON. A string `args.name` also labels the run: status, listings and notifications show `meta.name: name`. Give concurrent launches of one script different names.",
-    }),
+    Type.Object(
+      {
+        name: Type.Optional(
+          Type.String({
+            maxLength: 80,
+            description:
+              "Run label: status, listings and notifications show `meta.name: name`. Give concurrent launches of one script different names. A scriptPath module exporting runLabel(args) names the run itself when this is omitted.",
+          }),
+        ),
+      },
+      {
+        additionalProperties: true,
+        description:
+          "JSON object exposed to the workflow script as global `args`; the script defines its other fields. Pass an object, not stringified JSON.",
+      },
+    ),
   ),
   agentRetries: Type.Optional(
     Type.Number({
@@ -129,7 +141,7 @@ export type WorkflowToolInput = {
   script?: string;
   scriptPath?: string;
   cwd?: string;
-  args?: unknown;
+  args?: { name?: string; [key: string]: unknown };
   agentRetries?: number;
   agentTimeoutMs?: number;
 };
@@ -502,20 +514,19 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
   if (value.cwd !== undefined) validateAbsolutePath(value.cwd, "cwd");
   return {
     ...value,
-    ...(Object.hasOwn(value, "args") ? { args: parseJsonArgs(value.args) } : {}),
+    ...(Object.hasOwn(value, "args") ? { args: parseJsonArgs(value.args) as WorkflowToolInput["args"] } : {}),
     ...(typeof value.script === "string" ? { script: normalizeWorkflowScript(value.script) } : {}),
   } as WorkflowToolInput;
 }
 
 /**
- * `args` is intentionally untyped, so callers routinely hand it stringified JSON.
- * Parse that back into the object/array the script expects; anything else stays
- * verbatim, because a workflow may legitimately want a plain string.
+ * Models sometimes hand `args` over as stringified JSON. Parse a JSON object back
+ * before schema validation; anything else stays verbatim and fails validation.
  */
 function parseJsonArgs(args: unknown): unknown {
   if (typeof args !== "string") return args;
   const trimmed = args.trim();
-  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return args;
+  if (!trimmed.startsWith("{")) return args;
   try {
     return JSON.parse(trimmed);
   } catch {
