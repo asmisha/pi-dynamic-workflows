@@ -106,7 +106,7 @@ const workflowToolSchema = Type.Object({
   args: Type.Optional(
     Type.Any({
       description:
-        "Optional JSON object exposed to the workflow script as global `args`. Pass an object, not stringified JSON. A string `args.name` also labels the run: status, listings and notifications show it as `meta.name: name`, so give each concurrent launch of one script its own name.",
+        "Optional JSON object exposed to the workflow script as global `args`. Pass an object, not stringified JSON. A string `args.name` also labels the run: status, listings and notifications show `meta.name: name`. Give concurrent launches of one script different names.",
     }),
   ),
   agentRetries: Type.Optional(
