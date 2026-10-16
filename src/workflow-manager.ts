@@ -1345,6 +1345,10 @@ export class WorkflowManager extends EventEmitter {
         runningCount: 0,
         doneCount: 0,
         errorCount: 0,
+        // A resumed segment that replays and pauses again before any new usage
+        // event would otherwise persist no total, and the next resume would
+        // start counting from zero.
+        tokenUsage: persisted.tokenUsage ? { ...persisted.tokenUsage } : undefined,
       },
       controller: new AbortController(),
       startedAt: new Date(persisted.startedAt),
