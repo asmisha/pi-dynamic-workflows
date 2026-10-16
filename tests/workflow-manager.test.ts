@@ -3892,6 +3892,44 @@ return { before, reply, after }`;
   }
 });
 
+test("a resumed segment that pauses before any new agent usage keeps the run's token total", async () => {
+  const home = mkdtempSync(join(tmpdir(), "workflow-checkpoint-usage-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const manager = new WorkflowManager({ cwd: process.cwd(), agent: fakeAgent({ input: 100, total: 100 }) });
+      manager.setSessionId("checkpoint-usage-session");
+      const script = `export const meta = { name: 'checkpoint_usage', description: 'two checkpoints in a row' }
+await agent('before', { label: 'before' })
+const first = await checkpoint('First?')
+const second = await checkpoint('Second?')
+await agent('after:' + first + second, { label: 'after' })
+return 'done'`;
+      const nextPause = () => new Promise<void>((resolve) => manager.once("paused", () => resolve()));
+
+      let paused = nextPause();
+      const { runId } = manager.startInBackground(script);
+      await paused;
+      assert.equal(manager.getPersistence().load(runId)?.tokenUsage?.total, 100);
+
+      paused = nextPause();
+      assert.equal(await manager.resumeWithReply(runId, "a"), true);
+      await paused;
+      assert.equal(
+        manager.getPersistence().load(runId)?.tokenUsage?.total,
+        100,
+        "a segment that only replays and pauses keeps the earlier total",
+      );
+
+      const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
+      assert.equal(await manager.resumeWithReply(runId, "b"), true);
+      await completed;
+      assert.equal(manager.getPersistence().load(runId)?.tokenUsage?.total, 200);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test(
   "bash steps land in the snapshot as bash nodes without inflating agent counts",
   withTempCwd(async (cwd) => {
