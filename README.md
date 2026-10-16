@@ -266,6 +266,8 @@ The same model — on Pi, plus the production pieces a real run needs:
 
 Agents can inspect and control current-session runs directly with the `workflow_status`, `workflow_pause`, `workflow_resume`, `workflow_retry`, and `workflow_stop` tools; the slash commands remain available for manual control. `workflow_status` is for one-off checks only — the tool contract tells the model never to poll it or `sleep` while waiting, because notifications are delivered automatically. Completion wakes the conversation by default; a workflow can choose silent completion delivery. Failures and checkpoint pauses still wake it. A background completion notification stays one line and points to `<runId>.stdout`, which contains the complete untruncated workflow return value.
 
+A run's display name is the script's `meta.name`. When `args` is an object with a string `name`, the name becomes `meta.name: name` (trimmed, at most 80 characters of the label). The navigator, `/workflows`, `workflow_status` and completion notifications all show this display name, so two concurrent launches of one script are told apart only by their `args.name`.
+
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `d` remove · `r` restart · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
 ## Storage
