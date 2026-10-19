@@ -89,12 +89,11 @@ export function isProviderUnavailable(error: unknown): boolean {
 
 /**
  * Whether the provider accepts the login but refuses the selected model for that
- * account, as Codex does when the ChatGPT plan behind the login does not include
- * the model ("The 'gpt-6.1-sol' model is not supported when using Codex with a
- * ChatGPT account."). Same practical consequence as missing auth: this model
- * cannot serve the call until the account changes, so a configured fallback
- * should take over. Parameter-level "not supported with this model" errors are
- * request problems and stay out.
+ * account, as in Codex's "The 'gpt-6.1-sol' model is not supported when using
+ * Codex with a ChatGPT account." The effect is the same as missing auth: this
+ * model can't serve the call for this account, so a configured fallback should
+ * take over. Parameter errors like "'temperature' is not supported with this
+ * model" are request problems and don't match.
  */
 export function isProviderModelRefused(error: unknown): boolean {
   return /\bmodel is not supported when using [\w-]+ with an? [\w-]+ account\b/i.test(errorMessage(error));
