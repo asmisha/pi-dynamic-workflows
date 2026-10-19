@@ -19,8 +19,10 @@ import { applyToolPolicy } from "./agent-registry.js";
 import {
   classifyProviderLimit,
   isProviderAuthFailure,
+  isProviderModelRefused,
   isProviderUnavailable,
   isProviderUsageLimit,
+  isWorkflowError,
   WorkflowError,
   WorkflowErrorCode,
 } from "./errors.js";
@@ -190,6 +192,36 @@ export function throwIfAssistantExecutionError(messages: unknown[], label?: stri
       recoverable: true,
       agentLabel: label,
     },
+  );
+}
+
+/**
+ * When a provider error doesn't qualify for handoff but a fallback to another
+ * model is configured, say so in the error. Otherwise the caller sees only the
+ * provider's text and has to read the route to learn that a backup existed and
+ * was skipped. Only the provider's own stop gets the note; task, schema and
+ * empty-output failures keep their message.
+ */
+function withUntriedFallbackNote(
+  error: unknown,
+  messages: unknown[],
+  fallback: ResolvedFallback | undefined,
+  label: string | undefined,
+): unknown {
+  const providerStop = lastAssistantError(messages);
+  if (
+    !fallback ||
+    !isWorkflowError(error) ||
+    error.code !== WorkflowErrorCode.AGENT_EXECUTION_ERROR ||
+    providerStop?.stopReason !== "error" ||
+    providerStop.errorMessage !== error.message
+  ) {
+    return error;
+  }
+  return new WorkflowError(
+    `${error.message} Configured fallback ${fallback.spec} was not tried: handoff covers only provider authentication, model access, availability and usage-limit failures, and this error matched none of them.`,
+    error.code,
+    { recoverable: error.recoverable, agentLabel: error.agentLabel ?? label, details: error, callId: error.callId },
   );
 }
 
@@ -636,8 +668,9 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   restoreSessionModel?: boolean;
   /**
    * Continue the same subagent session on this model when the primary model is
-   * unavailable, unauthenticated, or reaches a provider usage limit. This is a
-   * model handoff, not a fresh agent retry, so completed tool work is preserved.
+   * unavailable, unauthenticated, refused for the signed-in account, or reaches
+   * a provider usage limit. This is a model handoff, not a fresh agent retry, so
+   * completed tool work is preserved.
    */
   fallbackModel?: string;
   /** Ordered backup routes; mutually exclusive with fallbackModel. */
@@ -1190,18 +1223,19 @@ export class WorkflowAgent {
           return await completeTurn();
         } catch (error) {
           if (options.signal?.aborted) throw abortError();
+          const isOtherModel = (candidate: ResolvedFallback) =>
+            resolvedModel?.provider !== candidate.model.provider || resolvedModel?.id !== candidate.model.id;
           if (
             !modelSpec ||
-            (!isProviderUsageLimit(error) && !isProviderAuthFailure(error) && !isProviderUnavailable(error))
+            (!isProviderUsageLimit(error) &&
+              !isProviderAuthFailure(error) &&
+              !isProviderModelRefused(error) &&
+              !isProviderUnavailable(error))
           ) {
-            throw error;
+            throw withUntriedFallbackNote(error, session.messages, pendingFallbacks.find(isOtherModel), options.label);
           }
           let fallback = pendingFallbacks.shift();
-          while (
-            fallback &&
-            resolvedModel?.provider === fallback.model.provider &&
-            resolvedModel.id === fallback.model.id
-          ) {
+          while (fallback && !isOtherModel(fallback)) {
             fallback = pendingFallbacks.shift();
           }
           if (!resolvedModel || !fallback) throw error;
@@ -1213,7 +1247,9 @@ export class WorkflowAgent {
             ? `${provider} usage limit`
             : isProviderAuthFailure(error)
               ? `${provider} authentication failed`
-              : `${provider} is not answering`;
+              : isProviderModelRefused(error)
+                ? `${provider} refused this model for the signed-in account`
+                : `${provider} is not answering`;
           resolvedModel = fallback.model;
           // Keep one AgentSession, transcript, tool state, and usage accumulator.
           // setModel() would also overwrite the user's global default model.

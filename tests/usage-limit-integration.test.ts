@@ -32,6 +32,8 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 import { loadFaux } from "./helpers/load-faux.js";
 
 const USAGE_LIMIT_MSG = "Codex usage limit reached (plus plan). Resets in ~3h.";
+const MODEL_REFUSED_MSG =
+  "Codex error: The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.";
 
 /**
  * Run `fn` with isolated Pi settings and a dummy provider key so
@@ -1143,6 +1145,14 @@ for (const scenario of [
     ],
   },
   {
+    name: "model refused for the signed-in account",
+    errors: [MODEL_REFUSED_MSG],
+    expected: [
+      [primary, "xhigh"],
+      [middle, "high"],
+    ],
+  },
+  {
     name: "unavailable primary then failed backup",
     primary: "missing/model",
     errors: ["401 Unauthorized"],
@@ -1256,6 +1266,30 @@ for (const scenario of [
         );
       },
     ));
+}
+
+for (const scenario of [
+  { name: "names the configured backup", fallbackModel: middle, note: true },
+  { name: "leaves the message alone without a backup", fallbackModel: undefined, note: false },
+]) {
+  test(`an unrecognized provider error ${scenario.name}`, () =>
+    withFauxSession(async ({ cwd, modelRegistry, setResponses, fauxAssistantMessage }) => {
+      SettingsManager.create(cwd, getAgentDir()).setRetryEnabled(false);
+      const providerError = "Codex error: Unrecognized account state.";
+      setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: providerError })]);
+      const agent = new WorkflowAgent({ cwd, modelRegistry });
+
+      await assert.rejects(
+        () => agent.run("task", { model: primary, fallbackModel: scenario.fallbackModel }),
+        (error: unknown) => {
+          const { code, message } = error as { code: string; message: string };
+          assert.equal(code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+          assert.ok(message.startsWith(providerError), message);
+          assert.equal(message.includes(`Configured fallback ${middle} was not tried`), scenario.note, message);
+          return true;
+        },
+      );
+    }));
 }
 
 test("required unavailable fallback still fails before a healthy primary starts", () =>
