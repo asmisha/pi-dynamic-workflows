@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   classifyProviderLimit,
   isProviderAuthFailure,
+  isProviderModelRefused,
   isProviderUnavailable,
   isProviderUsageLimit,
   WorkflowError,
@@ -108,6 +109,25 @@ describe("isProviderAuthFailure", () => {
     }
     assert.equal(isProviderAuthFailure(new Error("503 overloaded_error")), false);
     assert.equal(isProviderAuthFailure(new Error("schema validation failed")), false);
+  });
+});
+
+describe("isProviderModelRefused", () => {
+  it("matches a provider refusing the model for the signed-in account, not request or content problems", () => {
+    assert.equal(
+      isProviderModelRefused(
+        new Error("Codex error: The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."),
+      ),
+      true,
+    );
+    for (const message of [
+      "Unsupported parameter: 'temperature' is not supported with this model.",
+      "Codex error: This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request.",
+      "schema validation failed",
+      "503 Service Unavailable",
+    ]) {
+      assert.equal(isProviderModelRefused(new Error(message)), false, message);
+    }
   });
 });
 
